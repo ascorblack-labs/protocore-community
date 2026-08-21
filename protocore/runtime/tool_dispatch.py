@@ -48,7 +48,7 @@ import contextlib
 import hashlib
 import json
 import re
-from collections.abc import AsyncIterator, Callable, Iterable, Mapping
+from collections.abc import AsyncIterator, Callable, Iterable, Mapping, MutableMapping
 from dataclasses import dataclass
 from enum import StrEnum
 from typing import Any, Final
@@ -489,6 +489,42 @@ _STRING_TYPE_CANONICAL_MARKER: str = "string_type"
 # BEFORE the generic ``tool_dispatch_consecutive_error_cap`` (default 4)
 # wraps the error with vague guidance.
 _DEFAULT_STRING_TYPE_TERMINAL_CAP: int = 3
+
+#: The helper-bag entries this module keeps for the life of ONE run: the streaks
+#: whose caps are documented per-run, and the one-shot signal that goes with
+#: them. An engine that re-arms has to clear these, or the next turn opens with
+#: the previous turn's streak already counted and its one-shot already spent —
+#: an agent that repeats one failing call each turn would cross a per-run cap
+#: that no single turn ever reached.
+#:
+#: Everything else in the bag belongs to the host — the cancel event, the
+#: constants snapshot, the shared lock, the error counter, the soft-cap *limits*
+#: as opposed to their counts — and a re-arm must leave all of it alone.
+RUN_SCOPED_HELPER_KEYS: Final[frozenset[str]] = frozenset(
+    {
+        _CONSECUTIVE_ERROR_STATE_KEY,
+        _SANDBOX_DOWN_STREAK_STATE_KEY,
+        _SANDBOX_DOWN_INJECTION_PENDING_KEY,
+        _STRING_TYPE_STREAK_STATE_KEY,
+        TOOL_CALL_SOFT_CAP_STATE_HELPER_KEY,
+    }
+)
+
+
+def clear_run_scoped_helpers(helpers: Any) -> int:
+    """Drop this module's per-run cells from ``helpers``; return how many went.
+
+    Accepts anything so the caller does not have to know what the host put on
+    the engine: a bag that is not a mutable mapping simply has nothing to clear.
+    """
+    if not isinstance(helpers, MutableMapping):
+        return 0
+    removed = 0
+    for key in RUN_SCOPED_HELPER_KEYS:
+        if key in helpers:
+            del helpers[key]
+            removed += 1
+    return removed
 
 # Normalisation regexes — strip variable identifiers (uuid-shaped call ids,
 # absolute paths, line numbers, the dispatcher's own ``after Ns`` timeout

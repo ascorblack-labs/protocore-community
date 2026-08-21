@@ -17,6 +17,7 @@ from __future__ import annotations
 import ast
 import inspect
 import textwrap
+from pathlib import Path
 
 import pytest
 
@@ -32,6 +33,7 @@ from protocore.contracts.verification import VerificationState
 from protocore.runtime.loop_state import LoopState
 from protocore.runtime.query import _block_identical_tools, _dispatch_tool
 from protocore.runtime.query_engine import QueryEngine
+from protocore.runtime.tool_dispatch import RUN_SCOPED_HELPER_KEYS
 
 from ._tool_fixtures import MockTool
 
@@ -168,6 +170,52 @@ def _constructor_attributes() -> list[str]:
 
 class _Poison:
     """A value no engine attribute can legitimately still hold after a re-arm."""
+
+
+def _attached_attributes() -> set[str]:
+    """Attribute names the package puts on an engine outside ``__init__``.
+
+    The constructor is not the only writer. The host attaches its helper bag and
+    the run loop caches things on first use, and none of that is visible to
+    ``vars()`` of a freshly built engine — which is exactly why a re-arm that
+    copies from a fresh engine cannot reach them. Finding them means reading the
+    package, so that is what this does: every ``engine.x = ...`` and
+    ``setattr(engine, "x", ...)`` in the source.
+    """
+    package = Path(inspect.getfile(QueryEngine)).parent.parent
+    found: set[str] = set()
+    for path in sorted(package.rglob("*.py")):
+        try:
+            tree = ast.parse(path.read_text(encoding="utf-8"))
+        except (SyntaxError, UnicodeDecodeError):  # pragma: no cover - defensive
+            continue
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Assign):
+                targets = node.targets
+            elif isinstance(node, ast.AnnAssign | ast.AugAssign):
+                targets = [node.target]
+            elif (
+                isinstance(node, ast.Call)
+                and isinstance(node.func, ast.Name)
+                and node.func.id == "setattr"
+                and len(node.args) >= 2
+                and isinstance(node.args[0], ast.Name)
+                and node.args[0].id == "engine"
+                and isinstance(node.args[1], ast.Constant)
+                and isinstance(node.args[1].value, str)
+            ):
+                found.add(node.args[1].value)
+                continue
+            else:
+                continue
+            for target in targets:
+                if (
+                    isinstance(target, ast.Attribute)
+                    and isinstance(target.value, ast.Name)
+                    and target.value.id == "engine"
+                ):
+                    found.add(target.attr)
+    return found - set(_constructor_attributes())
 
 
 def _spend_a_turn(engine: QueryEngine) -> None:
@@ -357,3 +405,66 @@ async def test_a_long_life_of_turns_stays_the_agent_it_was(engine_factory) -> No
         assert engine.tool_call_ledger == []
 
     assert len(engine.history) >= 100, "the agent's life is one history"
+
+
+def test_every_attached_attribute_is_classified() -> None:
+    """What the host and the loop attach later is classified too, or it escapes.
+
+    An attribute the constructor never sets is invisible to the re-arm's copy
+    from a fresh engine, and invisible to the inventory above. Both blind spots
+    are the same one, and this is the test that closes it.
+    """
+    attached = _attached_attributes()
+    classified = QueryEngine._REARM_ATTACHED_DROPPED | QueryEngine._REARM_ATTACHED_KEPT
+
+    unclassified = attached - classified
+    assert not unclassified, (
+        "these names are attached to an engine outside __init__ and classified "
+        f"nowhere: {sorted(unclassified)}. Decide whether a re-arm drops each "
+        "one (QueryEngine._REARM_ATTACHED_DROPPED) or the host owns it "
+        "(QueryEngine._REARM_ATTACHED_KEPT). A field left out here survives "
+        "every re-arm in silence."
+    )
+    overlap = QueryEngine._REARM_ATTACHED_DROPPED & QueryEngine._REARM_ATTACHED_KEPT
+    assert not overlap, f"an attribute cannot be both dropped and kept: {sorted(overlap)}"
+
+
+def test_rearm_drops_what_the_loop_cached_on_the_engine(engine_factory) -> None:
+    """A cache and a fire-once latch do not survive into the next turn."""
+    engine = engine_factory()
+    _spend_a_turn(engine)
+    engine._tool_dispatcher = _Poison()
+    engine._outbound_system_normalized_warned = True
+
+    engine.rearm()
+
+    assert not hasattr(engine, "_tool_dispatcher"), (
+        "the cached dispatcher survived; it holds a tool-error counter read out "
+        "of a helper bag the host may since have replaced"
+    )
+    assert not getattr(engine, "_outbound_system_normalized_warned", False), (
+        "the fire-once warning latch stayed raised, so the warning it guards "
+        "fires once per engine instead of once per run"
+    )
+
+
+def test_rearm_clears_the_helper_bag_of_run_scoped_state_only(engine_factory) -> None:
+    """The bag is the host's; the per-run cells inside it are not."""
+    engine = engine_factory()
+    _spend_a_turn(engine)
+    host_entries = {"rc": object(), "cancel_event": object(), "root_run_id": "r-1"}
+    bag: dict[str, object] = dict(host_entries)
+    bag.update({key: {"count": 99} for key in RUN_SCOPED_HELPER_KEYS})
+    engine._helpers = bag
+
+    engine.rearm()
+
+    assert engine._helpers is bag, "the bag itself belongs to the host and must survive"
+    left = sorted(key for key in RUN_SCOPED_HELPER_KEYS if key in bag)
+    assert not left, (
+        f"last turn's per-run cells are still on the helper bag: {left}. An agent "
+        "that repeats one failing call each turn crosses a per-run cap no single "
+        "turn ever reached."
+    )
+    for key, value in host_entries.items():
+        assert bag[key] is value, f"a re-arm took the host's {key!r} with it"
