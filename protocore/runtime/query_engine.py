@@ -57,6 +57,7 @@ from protocore.runtime.loop_state import (
     assert_transition,
     is_terminal,
 )
+from protocore.runtime.tool_dispatch import clear_run_scoped_helpers
 from protocore.runtime.usage import TokenUsage
 
 if TYPE_CHECKING:
@@ -462,6 +463,35 @@ class QueryEngine:
             "_live_reasoning_effort",
         }
     )
+
+    #: Attributes attached to an engine AFTER construction — by the host, or by
+    #: the run loop on first use. ``vars()`` of a freshly built engine cannot see
+    #: them, so :meth:`rearm` would leave every one of them in place and the
+    #: inventory test, which reads ``__init__``, would never notice. They are
+    #: therefore classified here by hand, and the test checks this list against
+    #: what the package actually attaches.
+    #:
+    #: Dropped: rebuilt on next use, or a latch that belongs to one run.
+    _REARM_ATTACHED_DROPPED: ClassVar[frozenset[str]] = frozenset(
+        {
+            # Caches a tool-error counter read out of the helper bag when it was
+            # first built. Rebuilt on demand, and rebuilding is what keeps that
+            # counter from going stale under a bag the host has since replaced.
+            "_tool_dispatcher",
+            # Fire-once warning latch. Left raised, the warning it guards is
+            # emitted once in the life of the engine rather than once per run.
+            "_outbound_system_normalized_warned",
+        }
+    )
+
+    #: Kept: the host owns it. The bag itself survives, but the per-run cells
+    #: this package keeps inside it do not — see
+    #: :data:`~protocore.runtime.tool_dispatch.RUN_SCOPED_HELPER_KEYS`.
+    #:
+    #: ``run_work_ledger`` is deliberately NOT among those cleared: it is the run
+    #: *tree's* ledger, shared with subagents that may still be reading it, so
+    #: emptying it from the leader would be a decision about their budget too.
+    _REARM_ATTACHED_KEPT: ClassVar[frozenset[str]] = frozenset({"_helpers"})
 
     def __init__(
         self,
@@ -1462,6 +1492,17 @@ class QueryEngine:
         for name, value in vars(fresh).items():
             if name not in self._REARM_PRESERVED_ATTRS:
                 setattr(self, name, value)
+
+        # The constructor is not the only thing that puts state on an engine, and
+        # ``vars(fresh)`` only knows what the constructor did. What the host and
+        # the run loop attach afterwards has to be handled by name.
+        for name in self._REARM_ATTACHED_DROPPED:
+            if hasattr(self, name):
+                delattr(self, name)
+
+        # The helper bag stays — the host owns it — but the per-run streaks and
+        # one-shot signals kept inside it are allowances like any other.
+        clear_run_scoped_helpers(getattr(self, "_helpers", None))
 
     def transition_to(self, new_state: LoopState) -> None:
         """Validate then apply a state transition.

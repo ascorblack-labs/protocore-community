@@ -6,6 +6,25 @@ All notable changes to this project are recorded here. The format follows
 
 ## [Unreleased]
 
+### Fixed
+
+- `QueryEngine.rearm()` now also restarts the state that is attached to an
+  engine *after* it is constructed. The re-arm rebuilds from a fresh engine, and
+  `vars()` of a fresh engine cannot see what the host or the run loop attaches
+  later, so three things survived every re-arm in silence: the cached tool
+  dispatcher, which holds a tool-error counter read out of a helper bag the host
+  may since have replaced; the fire-once warning latch for a normalised outbound
+  system prompt, which made its warning fire once per engine rather than once
+  per run; and the per-run streaks the dispatcher keeps inside the helper bag —
+  the consecutive same-tool-same-error cell, the sandbox-down streak and its
+  one-shot injection flag, the string-type streak, and the subagent soft-cap
+  counts. An agent that repeats one failing call at the start of each turn could
+  cross a cap documented as per-run that no single turn ever reached. The bag
+  itself belongs to the host and is left alone, as is the run tree's shared work
+  ledger. A test now reads the package for every `engine.x = ...` and
+  `setattr(engine, "x", ...)` outside the constructor and fails when one is
+  classified as neither dropped nor kept.
+
 ## [2.0.0a3]
 
 Supersedes 2.0.0a2, whose files were removed from the index. That build carried
