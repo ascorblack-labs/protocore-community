@@ -1,0 +1,66 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+      - master
+
+jobs:
+  test-lint-typecheck:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python-version: ["3.12", "3.13", "3.14"]
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Install uv
+        run: python -m pip install --upgrade uv
+
+      - name: Install dependencies
+        run: uv sync --extra dev
+
+      - name: Run contract unit gate
+        id: contracts
+        run: uv run pytest tests/unit/contracts -q --no-cov
+
+      - name: Run full test suite
+        id: tests
+        run: uv run pytest . --cov=protocore --cov-fail-under=90
+
+      - name: Run lint gate
+        id: lint
+        run: uv run ruff check .
+
+      - name: Run strict typing gate
+        id: typing
+        # No path argument on purpose: a path on the command line REPLACES the
+        # configured `files` list, which silently drops the test tree and
+        # leaves every test double unchecked.
+        run: uv run mypy --strict
+
+      - name: Run security audit
+        id: security
+        run: uv run bandit -r protocore -q -c pyproject.toml
+
+      - name: Publish quality gate summary
+        if: always()
+        run: |
+          {
+            echo "## Quality Gate Summary"
+            echo ""
+            echo "- contract unit tests: ${{ steps.contracts.outcome }}"
+            echo "- full test suite: ${{ steps.tests.outcome }}"
+            echo "- lint: ${{ steps.lint.outcome }}"
+            echo "- strict typing: ${{ steps.typing.outcome }}"
+            echo "- security: ${{ steps.security.outcome }}"
+          } >> "$GITHUB_STEP_SUMMARY"

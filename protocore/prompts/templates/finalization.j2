@@ -1,0 +1,9 @@
+{# forced finalization prompt.
+
+ Appended to the conversation when the agent exhausts its tool-call budget and
+ must produce a terminal answer based on whatever data it already has.
+
+ This template is intentionally context-free: every run that exceeds
+ the budget gets the same instruction.
+#}
+You have reached the maximum number of tool calls for this session. Provide your FINAL answer now based on available data, even if incomplete. Do not attempt any more tool calls.

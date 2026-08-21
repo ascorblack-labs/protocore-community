@@ -1,0 +1,74 @@
+{# shared Jinja2 macros.
+
+ This file is the ONLY template that other prompt templates are allowed
+ to ``{%- import %}`` / ``{%- from %}``. The bundled provider's
+ ``SandboxedEnvironment`` is configured with a fixed include-allowlist
+ (see ``protocore.prompts.jinja_provider`` →
+ ``_BUNDLED_INCLUDE_ALLOWLIST``) so a template body can never pull in a
+ file outside this set.
+
+ Each macro is intentionally side-effect-free — emits a string, does not
+ mutate context. Keep macros short; large interpolations should be
+ inlined in the template to keep prompt prose grep-able.
+#}
+
+{#- agent_descriptions_block: render available subagents as a markdown list.
+
+ Context:
+ agent_descriptions: dict[str, str] | None — subagent_id → one-line
+ capability description. Empty/None → emit nothing.
+ header: str — label prefixed before the list.
+-#}
+{%- macro agent_descriptions_block(agent_descriptions, header="Available subagents") -%}
+{%- if agent_descriptions %}
+{{ header }}:
+{%- for agent_id, description in agent_descriptions.items() %}
+- {{ agent_id }}: {{ description }}
+{%- endfor %}
+{%- endif -%}
+{%- endmacro -%}
+
+
+{#- capability_line: render the optional capability hints for the leader.
+
+ Context:
+ capabilities: dict[str, Any] | None — leader engine capability
+ flags (``delegation``, ``delegation_max``, ``planning``).
+ Empty/None → emit nothing.
+-#}
+{%- macro capability_line(capabilities) -%}
+{%- if capabilities -%}
+{%- if capabilities.delegation and capabilities.delegation_max and capabilities.delegation_max > 0 -%}
+Maximum concurrent delegations: {{ capabilities.delegation_max }}.
+{% endif -%}
+{%- if capabilities.planning -%}
+Use a short plan when it clarifies execution.
+{% endif -%}
+{%- endif -%}
+{%- endmacro -%}
+
+
+{#- mcp_sets_block: advertise tenant MCP tool SETS as discoverable capabilities.
+
+ Context:
+ mcp_sets: list[{name, description, tool_names}] | None — one entry per
+ MCP set the tenant exposes. Empty/None → emit nothing (byte-identical
+ prompt for tenants without MCP — same additive contract as
+ agent_descriptions_block).
+
+ Semantics: these are CAPABILITIES the agent can DISCOVER (some tool names may
+ be clipped from the per-turn payload), NOT a guaranteed-callable list — the
+ header text tells the model to reach them via ToolSearch. The host side
+ caps the name count, wraps descriptions as bounded data, and passes only
+ policy-visible names; this macro just renders what it is given. Defensive:
+ a set missing ``description``/``tool_names`` still renders without raising.
+-#}
+{%- macro mcp_sets_block(mcp_sets) -%}
+{%- if mcp_sets %}
+## Available tool sets (MCP)
+These tool sets expand your capabilities. Their tools are NOT all in your visible set — call `ToolSearch` to discover and load a tool from a set before using it.
+{% for tool_set in mcp_sets -%}
+- {{ tool_set.get("name", "") }}: {{ tool_set.get("description", "") or "(no description)" }}. Tools: {{ tool_set.get("tool_names", []) | join(", ") }}
+{% endfor -%}
+{%- endif -%}
+{%- endmacro -%}

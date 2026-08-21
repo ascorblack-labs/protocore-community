@@ -1,0 +1,47 @@
+# --- Python ---
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+
+# --- Virtualenvs ---
+.venv/
+venv/
+.python-version
+
+# --- Tool caches ---
+.mypy_cache/
+.pytest_cache/
+.ruff_cache/
+.tox/
+.nox/
+
+# --- Coverage ---
+.coverage
+.coverage.*
+coverage.xml
+htmlcov/
+
+# --- Build output ---
+build/
+dist/
+
+# --- Lockfile ---
+# Protocore is a library: pinning a resolution here would push it onto every
+# consumer. The dependency floors in pyproject.toml are the contract.
+uv.lock
+
+# --- Editors ---
+.idea/
+.vscode/
+*.iml
+*.swp
+
+# --- OS ---
+.DS_Store
+Thumbs.db
+
+# Repository rules for agents. Never committed: the file describes what must
+# not reach the public, so publishing it would publish the list.
+AGENTS.md
+CLAUDE.md
