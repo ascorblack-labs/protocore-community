@@ -1,0 +1,42 @@
+Protocore
+Copyright (c) 2026 Aleksandr Tikhonov (Ascorblack Labs)
+
+This product includes software developed as the Protocore agent runtime core.
+
+Licensed under the Mozilla Public License, Version 2.0. You may obtain a copy
+of the License in the LICENSE file distributed with this source, or at
+https://mozilla.org/MPL/2.0/.
+
+--------------------------------------------------------------------------
+Attribution
+--------------------------------------------------------------------------
+
+The MPL requires that this notice, and the license notices in the source
+files it covers, be preserved in any distribution of this Source Code Form
+or of a Larger Work that includes it. Concretely, if you ship a product built
+on Protocore:
+
+  * keep this NOTICE file and the LICENSE file with the source you
+    distribute, and
+  * make the source of any Protocore file you modified available under the
+    MPL, as Section 3.2 requires.
+
+You are not required to open-source your own code that merely uses Protocore
+— the MPL is a file-level copyleft, so your application, adapters, and
+services around this core remain yours under whatever terms you choose.
+
+If you would also like to credit the project in your product's about screen,
+documentation, or release notes, the maintainers appreciate it. A line such
+as "Powered by Protocore (MPL-2.0)" is plenty. This is a request, not a
+license condition.
+
+--------------------------------------------------------------------------
+Source Code Form notice (MPL-2.0 Exhibit A)
+--------------------------------------------------------------------------
+
+  This Source Code Form is subject to the terms of the Mozilla Public
+  License, v. 2.0. If a copy of the MPL was not distributed with this
+  file, You can obtain one at https://mozilla.org/MPL/2.0/.
+
+This notice applies to every file in the `protocore/` package and the
+`tests/` tree of this distribution.

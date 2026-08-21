@@ -1,0 +1,63 @@
+{# environment capabilities manifest.
+
+ Reflects the sandbox / execution capabilities the agent has in this run.
+ Context:
+ environment_capabilities: dict[str, Any] — capability flags.
+ Required keys:
+ file_read: bool
+ file_write: bool
+ shell_profile: str (e.g. "disabled" / "restricted" / "default")
+ network_allowed: bool
+ package_install: bool
+ server_hosting: bool
+ long_running_processes: bool
+#}
+<environment>
+AVAILABLE capabilities in this execution environment:
+{%- if environment_capabilities.file_read %}
+- File read (workspace)
+{%- endif %}
+{%- if environment_capabilities.file_write %}
+- File write (workspace)
+{%- endif %}
+{%- if environment_capabilities.shell_profile != "disabled" %}
+- Shell execution (profile: {{ environment_capabilities.shell_profile }})
+{%- endif %}
+{%- if environment_capabilities.network_allowed %}
+- Network access
+{%- endif %}
+{%- if environment_capabilities.package_install %}
+- Package installation
+{%- endif %}
+{%- if environment_capabilities.server_hosting %}
+- Server hosting / port binding
+{%- endif %}
+{%- if environment_capabilities.long_running_processes %}
+- Long-running processes
+{%- endif %}
+
+NOT AVAILABLE (permanently denied — do NOT attempt):
+{%- if not environment_capabilities.file_read %}
+- File read
+{%- endif %}
+{%- if not environment_capabilities.file_write %}
+- File write
+{%- endif %}
+{%- if environment_capabilities.shell_profile == "disabled" %}
+- Shell execution (entirely disabled)
+{%- endif %}
+{%- if not environment_capabilities.network_allowed %}
+- Network access (curl, wget, API calls)
+{%- endif %}
+{%- if not environment_capabilities.package_install %}
+- Package installation (pip install, npm install, apt-get)
+{%- endif %}
+{%- if not environment_capabilities.server_hosting %}
+- Server hosting / port binding
+{%- endif %}
+{%- if not environment_capabilities.long_running_processes %}
+- Long-running processes (daemons, servers, watchers)
+{%- endif %}
+
+Do NOT attempt or retry denied actions. If the user's task requires an unavailable capability, create code/files but state that running requires user execution outside the sandbox.
+</environment>
