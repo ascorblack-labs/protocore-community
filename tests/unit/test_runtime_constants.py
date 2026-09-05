@@ -891,7 +891,53 @@ def test_autonomous_rc_defaults_match_autonomous_worker() -> None:
     assert rc.autonomous_http_timeout_seconds == 30
     assert rc.autonomous_notify_max_attempts == 3
     assert rc.autonomous_notify_backoff_base_seconds == 2
+    assert rc.autonomous_dispatch_retry_after_min_seconds == 5
+    assert rc.autonomous_dispatch_retry_after_max_seconds == 120
+    assert rc.autonomous_dispatch_max_requeues == 6
+    assert rc.autonomous_delegated_credential_retry_attempts == 2
+    assert rc.autonomous_owner_resolution_backoff_base_seconds == 5.0
+    assert rc.autonomous_owner_resolution_backoff_max_seconds == 60.0
     assert rc.autonomous_archive_after_days == 7
+    assert rc.autonomous_excluded_interactive_tools == ["AskUser"]
+    assert rc.autonomous_artifact_max_files == 50
+    assert rc.autonomous_artifact_max_file_bytes == 10_485_760
+    assert rc.autonomous_metrics_settle_attempts == 3
+    assert rc.autonomous_metrics_settle_interval_seconds == 2.0
+    assert rc.autonomous_tool_surface_cache_ttl_seconds == 300.0
+    assert rc.autonomous_scope_config_cache_ttl_seconds == 30.0
+    assert rc.autonomous_model_catalog_cache_ttl_seconds == 300.0
+    assert rc.autonomous_currency_rate_cache_ttl_seconds == 900.0
+    assert rc.autonomous_budget_check_interval_seconds == 30.0
+    assert rc.autonomous_scheduler_max_catchup_fires == 24
+    assert rc.autonomous_scheduler_event_retention_days == 30
+    assert rc.autonomous_transcript_max_frames == 2000
+    assert rc.autonomous_transcript_max_frame_bytes == 65_536
+    assert rc.autonomous_file_download_max_bytes == 26_214_400
+    assert rc.autonomous_file_zip_max_bytes == 104_857_600
+    assert rc.autonomous_memory_max_tokens == 4000
+    assert rc.autonomous_memory_max_bytes == 32_768
+    assert rc.autonomous_memory_retention_days == 30
+    assert rc.autonomous_memory_index_max_entries == 500
+    assert rc.autonomous_memory_result_max_bytes == 262_144
+    assert rc.autonomous_memory_tool_max_read_bytes == 262_144
+    assert rc.autonomous_memory_tool_max_write_bytes == 262_144
+    assert rc.autonomous_memory_tool_max_entries == 500
+    assert rc.autonomous_task_memory_max_bytes == 32_768
+    assert rc.autonomous_task_memory_max_age_days == 30
+    # The autonomous concurrency lane must admit as many runs as the
+    # dispatching service starts in parallel by default; a smaller number
+    # here refuses work the service was configured to attempt.
+    assert rc.max_active_autonomous_runs_per_user == 20
+    assert rc.autonomous_delegated_run_token_ttl_seconds == 60
+
+
+def test_autonomous_delegated_run_token_ttl_is_strictly_bounded() -> None:
+    assert RuntimeConstants(autonomous_delegated_run_token_ttl_seconds=30)
+    assert RuntimeConstants(autonomous_delegated_run_token_ttl_seconds=300)
+    with pytest.raises(ValidationError):
+        RuntimeConstants(autonomous_delegated_run_token_ttl_seconds=29)
+    with pytest.raises(ValidationError):
+        RuntimeConstants(autonomous_delegated_run_token_ttl_seconds=301)
 
 
 def test_autonomous_rc_are_overridable() -> None:
@@ -906,7 +952,39 @@ def test_autonomous_rc_are_overridable() -> None:
         autonomous_http_timeout_seconds=60,
         autonomous_notify_max_attempts=5,
         autonomous_notify_backoff_base_seconds=3,
+        autonomous_dispatch_retry_after_min_seconds=10,
+        autonomous_dispatch_retry_after_max_seconds=600,
+        autonomous_dispatch_max_requeues=20,
+        autonomous_delegated_credential_retry_attempts=4,
+        autonomous_owner_resolution_backoff_base_seconds=2.5,
+        autonomous_owner_resolution_backoff_max_seconds=90.0,
         autonomous_archive_after_days=30,
+        autonomous_excluded_interactive_tools=["AskUser", "RequestApproval"],
+        autonomous_artifact_max_files=10,
+        autonomous_artifact_max_file_bytes=1_048_576,
+        autonomous_metrics_settle_attempts=5,
+        autonomous_metrics_settle_interval_seconds=0.5,
+        autonomous_tool_surface_cache_ttl_seconds=60.0,
+        autonomous_scope_config_cache_ttl_seconds=5.0,
+        autonomous_model_catalog_cache_ttl_seconds=60.0,
+        autonomous_currency_rate_cache_ttl_seconds=3600.0,
+        autonomous_budget_check_interval_seconds=5.0,
+        autonomous_scheduler_max_catchup_fires=3,
+        autonomous_scheduler_event_retention_days=7,
+        autonomous_transcript_max_frames=500,
+        autonomous_transcript_max_frame_bytes=16_384,
+        autonomous_file_download_max_bytes=1_048_576,
+        autonomous_file_zip_max_bytes=5_242_880,
+        autonomous_memory_max_tokens=1000,
+        autonomous_memory_max_bytes=8_192,
+        autonomous_memory_retention_days=90,
+        autonomous_memory_index_max_entries=50,
+        autonomous_memory_result_max_bytes=65_536,
+        autonomous_memory_tool_max_read_bytes=65_536,
+        autonomous_memory_tool_max_write_bytes=65_536,
+        autonomous_memory_tool_max_entries=25,
+        autonomous_task_memory_max_bytes=4_096,
+        autonomous_task_memory_max_age_days=0,
     )
     assert rc.autonomous_task_poll_interval_seconds == 5
     assert rc.autonomous_task_timeout_seconds == 7200
@@ -917,7 +995,41 @@ def test_autonomous_rc_are_overridable() -> None:
     assert rc.autonomous_http_timeout_seconds == 60
     assert rc.autonomous_notify_max_attempts == 5
     assert rc.autonomous_notify_backoff_base_seconds == 3
+    assert rc.autonomous_dispatch_retry_after_min_seconds == 10
+    assert rc.autonomous_dispatch_retry_after_max_seconds == 600
+    assert rc.autonomous_dispatch_max_requeues == 20
+    assert rc.autonomous_delegated_credential_retry_attempts == 4
+    assert rc.autonomous_owner_resolution_backoff_base_seconds == 2.5
+    assert rc.autonomous_owner_resolution_backoff_max_seconds == 90.0
     assert rc.autonomous_archive_after_days == 30
+    assert rc.autonomous_excluded_interactive_tools == ["AskUser", "RequestApproval"]
+    assert rc.autonomous_artifact_max_files == 10
+    assert rc.autonomous_artifact_max_file_bytes == 1_048_576
+    assert rc.autonomous_metrics_settle_attempts == 5
+    assert rc.autonomous_metrics_settle_interval_seconds == 0.5
+    assert rc.autonomous_tool_surface_cache_ttl_seconds == 60.0
+    assert rc.autonomous_scope_config_cache_ttl_seconds == 5.0
+    assert rc.autonomous_model_catalog_cache_ttl_seconds == 60.0
+    assert rc.autonomous_currency_rate_cache_ttl_seconds == 3600.0
+    assert rc.autonomous_budget_check_interval_seconds == 5.0
+    assert rc.autonomous_scheduler_max_catchup_fires == 3
+    assert rc.autonomous_scheduler_event_retention_days == 7
+    assert rc.autonomous_transcript_max_frames == 500
+    assert rc.autonomous_transcript_max_frame_bytes == 16_384
+    assert rc.autonomous_file_download_max_bytes == 1_048_576
+    assert rc.autonomous_file_zip_max_bytes == 5_242_880
+    assert rc.autonomous_memory_max_tokens == 1000
+    assert rc.autonomous_memory_max_bytes == 8_192
+    assert rc.autonomous_memory_retention_days == 90
+    assert rc.autonomous_memory_index_max_entries == 50
+    assert rc.autonomous_memory_result_max_bytes == 65_536
+    assert rc.autonomous_memory_tool_max_read_bytes == 65_536
+    assert rc.autonomous_memory_tool_max_write_bytes == 65_536
+    assert rc.autonomous_memory_tool_max_entries == 25
+    assert rc.autonomous_task_memory_max_bytes == 4_096
+    # ``0`` is the documented way to switch the age check off, so it must be
+    # a settable value rather than a rejected one.
+    assert rc.autonomous_task_memory_max_age_days == 0
 
 
 def test_autonomous_rc_reject_non_positive() -> None:
@@ -931,7 +1043,31 @@ def test_autonomous_rc_reject_non_positive() -> None:
         "autonomous_loop_max_iterations",
         "autonomous_http_timeout_seconds",
         "autonomous_notify_max_attempts",
+        "autonomous_dispatch_retry_after_min_seconds",
+        "autonomous_dispatch_retry_after_max_seconds",
+        "autonomous_dispatch_max_requeues",
         "autonomous_archive_after_days",
+        "autonomous_artifact_max_files",
+        "autonomous_artifact_max_file_bytes",
+        "autonomous_metrics_settle_attempts",
+        "autonomous_metrics_settle_interval_seconds",
+        "autonomous_tool_surface_cache_ttl_seconds",
+        "autonomous_scope_config_cache_ttl_seconds",
+        "autonomous_model_catalog_cache_ttl_seconds",
+        "autonomous_currency_rate_cache_ttl_seconds",
+        "autonomous_budget_check_interval_seconds",
+        "autonomous_scheduler_max_catchup_fires",
+        "autonomous_scheduler_event_retention_days",
+        "autonomous_transcript_max_frames",
+        "autonomous_memory_max_tokens",
+        "autonomous_memory_max_bytes",
+        "autonomous_memory_retention_days",
+        "autonomous_memory_index_max_entries",
+        "autonomous_memory_result_max_bytes",
+        "autonomous_memory_tool_max_read_bytes",
+        "autonomous_memory_tool_max_write_bytes",
+        "autonomous_memory_tool_max_entries",
+        "autonomous_task_memory_max_bytes",
     ):
         with pytest.raises(ValidationError):
             RuntimeConstants(**{field: 0})
@@ -946,6 +1082,56 @@ def test_autonomous_rc_reject_non_positive() -> None:
         RuntimeConstants(autonomous_notify_backoff_base_seconds=-1)
     rc = RuntimeConstants(autonomous_notify_backoff_base_seconds=1)
     assert rc.autonomous_notify_backoff_base_seconds == 1
+
+    # Four knobs read zero as a value rather than as a mistake, because the
+    # code behind each of them guards on it: the dispatcher only compares an
+    # age when the value is above zero, the transcript recorder only truncates
+    # a frame when the bound is above zero, and the file routes only refuse a
+    # size when a limit is set. So zero means "no bound" for these, and an
+    # operator has to be able to express it. A negative value still has no
+    # reading at all.
+    for field in (
+        "autonomous_task_memory_max_age_days",
+        "autonomous_transcript_max_frame_bytes",
+        "autonomous_file_download_max_bytes",
+        "autonomous_file_zip_max_bytes",
+    ):
+        assert getattr(RuntimeConstants(**{field: 0}), field) == 0
+        with pytest.raises(ValidationError):
+            RuntimeConstants(**{field: -1})
+
+
+def test_autonomous_plan_ceilings_are_clamps_not_grants() -> None:
+    """The platform's side of the autonomous entitlement.
+
+    Every one of these clamps a number an access plan states. They are
+    ``ge=0`` rather than ``gt=0`` on purpose: zero is the operator's way to
+    close a capability off for the whole scope regardless of what any tier
+    was sold, and for the interval floor zero means "no floor at all".
+    """
+    rc = RuntimeConstants()
+    assert rc.autonomous_plan_max_tasks_ceiling == 100
+    assert rc.autonomous_plan_max_workflows_ceiling == 50
+    assert rc.autonomous_plan_max_enabled_schedules_ceiling == 50
+    assert rc.autonomous_plan_executions_per_day_ceiling == 1000
+    assert rc.autonomous_plan_executions_per_month_ceiling == 20_000
+    assert rc.autonomous_plan_min_interval_seconds_floor == 60
+    assert rc.autonomous_plan_max_timeout_seconds_ceiling == 86_400
+    assert rc.autonomous_plan_max_nodes_ceiling == 100
+
+    for field in (
+        "autonomous_plan_max_tasks_ceiling",
+        "autonomous_plan_max_workflows_ceiling",
+        "autonomous_plan_max_enabled_schedules_ceiling",
+        "autonomous_plan_executions_per_day_ceiling",
+        "autonomous_plan_executions_per_month_ceiling",
+        "autonomous_plan_min_interval_seconds_floor",
+        "autonomous_plan_max_timeout_seconds_ceiling",
+        "autonomous_plan_max_nodes_ceiling",
+    ):
+        assert getattr(RuntimeConstants(**{field: 0}), field) == 0
+        with pytest.raises(ValidationError):
+            RuntimeConstants(**{field: -1})
 
 
 # ---------------------------------------------------------------------------
