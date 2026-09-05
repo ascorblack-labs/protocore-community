@@ -41,7 +41,7 @@ exhaustively and reused across products.
 ## Install
 
 ```bash
-pip install protocore==2.0.0a2
+pip install protocore==2.0.0a3
 ```
 
 Name the version explicitly. The published release is a pre-release, and pip
