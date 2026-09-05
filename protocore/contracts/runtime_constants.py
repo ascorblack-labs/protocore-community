@@ -424,6 +424,37 @@ class RuntimeConstants(BaseModel):
             "back to it. 0 disables the cap and leaves only the access plan."
         ),
     )
+    max_active_autonomous_runs_per_user: int = Field(
+        default=20,
+        ge=0,
+        description=(
+            "Hard cap on the number of non-terminal AUTONOMOUS runs one "
+            "principal may hold at once. Autonomous runs are counted in their "
+            "own lane: they are dispatched by a service on a schedule, nobody "
+            "is waiting at a screen for one, and sharing the interactive cap "
+            "would let a single scheduled task occupy the one slot a person "
+            "needs to ask a question. The default matches the number of "
+            "executions the dispatching service runs in parallel by default, "
+            "so an out-of-the-box install refuses nothing it was configured "
+            "to attempt; a lower number here is a deliberate throttle, not a "
+            "starting point. A rejected dispatch answers 429 and names the "
+            "autonomous run already in flight. 0 disables the cap and leaves "
+            "only the access plan."
+        ),
+    )
+    autonomous_delegated_run_token_ttl_seconds: int = Field(
+        default=60,
+        ge=30,
+        le=300,
+        description=(
+            "Lifetime of a delegated autonomous-run credential minted for one "
+            "scheduler dispatch (seconds). The credential is accepted only by "
+            "POST /v1/runs with origin=autonomous and preserves the owning "
+            "principal as the run owner. The hard five-minute ceiling keeps a "
+            "leaked dispatch capability short-lived even when a scope override "
+            "is misconfigured."
+        ),
+    )
     run_idempotency_ttl_seconds: int = Field(
         default=86_400,
         gt=0,
@@ -3266,6 +3297,122 @@ class RuntimeConstants(BaseModel):
             "upload`. Files larger than this are rejected with 413 so a "
             "client cannot push multi-GB blobs into the workspace plane. "
             "Default 25 MiB."
+        ),
+    )
+
+ # ----- Shared (run-level) workspace ---------
+ # A workspace that belongs to a chain of work rather than to one session.
+ # Every session bound to it sees the same directory read-write under
+ # ``shared_workspace_mount_path``, so a step started in a FRESH session
+ # still reads what the previous step wrote. The plane is the same durable
+ # object store the session workspace uses, addressed under a different
+ # prefix; nothing is copied between sessions, which is why a write is
+ # visible to the next reader without a synchronisation window.
+    shared_workspace_mount_path: str = Field(
+        default=".autonomous/memory",
+        min_length=1,
+        description=(
+            "Workspace-relative directory at which a session's shared "
+            "workspace appears. A tool path under this prefix resolves to "
+            "the shared plane; everything else stays in the session's own "
+            "workspace. Changing it moves where every bound session looks: "
+            "files already written keep their place in the shared plane and "
+            "reappear under the new prefix, but a step that hard-codes the "
+            "old path in a prompt asks for a directory that no longer "
+            "exists. No leading or trailing slash."
+        ),
+    )
+    shared_workspace_retention_days: int = Field(
+        default=30,
+        gt=0,
+        description=(
+            "How long a shared workspace is kept after its last write "
+            "before the sweeper deletes it and releases its bytes. It has "
+            "to outlive the individual sessions that mounted it — that is "
+            "the whole point of the object — so this is measured from the "
+            "workspace's own last activity, not from any session's end. A "
+            "workspace given an explicit expiry at creation keeps that "
+            "expiry instead."
+        ),
+    )
+    shared_workspace_max_files: int = Field(
+        default=2_000,
+        gt=0,
+        description=(
+            "How many files one shared workspace may hold. A write that "
+            "would exceed the count is refused rather than evicting an "
+            "older file, because the older file is what a later step is "
+            "about to read."
+        ),
+    )
+    shared_workspace_max_bytes: int = Field(
+        default=524_288_000,
+        gt=0,
+        description=(
+            "Total bytes one shared workspace may hold (default 500 MiB). "
+            "Bounds a chain of steps that each append to the same "
+            "directory; a write past the ceiling is refused, not trimmed."
+        ),
+    )
+    shared_workspace_file_max_bytes: int = Field(
+        default=26_214_400,
+        gt=0,
+        description=(
+            "Largest single file accepted by "
+            "`PUT /v1/workspaces/{id}/files/{path}` and by a tool write "
+            "landing in the shared plane (default 25 MiB). Mirrors "
+            "``workspace_upload_max_bytes`` for the session plane."
+        ),
+    )
+    shared_workspace_list_max_entries: int = Field(
+        default=5_000,
+        gt=0,
+        description=(
+            "Hard cap on entries returned by "
+            "`GET /v1/workspaces/{id}/files`, and on how many shared-plane "
+            "entries are merged into a bound session's own listing."
+        ),
+    )
+    shared_workspace_max_per_scope: int = Field(
+        default=500,
+        gt=0,
+        description=(
+            "How many live shared workspaces one scope may hold at once. "
+            "The dispatcher creates one per chain of work, so this is the "
+            "ceiling on chains whose results are still retained; creating "
+            "past it is refused rather than silently reusing a workspace "
+            "another chain is writing into."
+        ),
+    )
+    shared_workspace_run_pin_max_age_seconds: int = Field(
+        default=86_400,
+        gt=0,
+        description=(
+            "How long a non-terminal run may keep a shared workspace pinned "
+            "against release. A workspace mounted by a session whose run is "
+            "still `queued`, `running` or `paused` is in use, and both "
+            "`DELETE /v1/workspaces/{id}` and the retention sweeper refuse to "
+            "touch it. A run abandoned in `paused` — an approval nobody "
+            "answered — would otherwise pin the directory for ever: the "
+            "delete stays `409` and the sweeper excludes the row, so the bytes "
+            "are never reclaimed and nothing reports it. Past this age the run "
+            "no longer counts as in use and the workspace becomes releasable "
+            "again. Measure it against the longest run this install can "
+            "legitimately keep open, including one waiting on a human."
+        ),
+    )
+    shared_workspace_extension_max_seconds: int = Field(
+        default=315_360_000,
+        gt=0,
+        description=(
+            "Maximum horizon one POST /v1/workspaces/{id}/extend call may "
+            "grant (default 3650 days, matching the creation API's maximum "
+            "retention). The endpoint normally renews the workspace by its "
+            "own retention_days, or by shared_workspace_retention_days when "
+            "none was stored, and caps that duration here. It never shortens "
+            "an existing later expiry. This bounds a service heartbeat "
+            "without forcing it to create a file merely to keep a live "
+            "workspace from expiring."
         ),
     )
 
@@ -6229,6 +6376,72 @@ class RuntimeConstants(BaseModel):
             "``base ** N`` seconds (``backoff_base`` in ``worker/notifier.py``)."
         ),
     )
+    autonomous_dispatch_retry_after_min_seconds: int = Field(
+        default=5,
+        gt=0,
+        description=(
+            "Autonomous dispatcher — floor (s) on how long a run dispatch "
+            "the host refused as back-pressure waits before the "
+            "scheduler tries it again. A server ``Retry-After`` shorter than "
+            "this is raised to it, so a scope whose lane is full is not "
+            "re-POSTed in a tight loop."
+        ),
+    )
+    autonomous_dispatch_retry_after_max_seconds: int = Field(
+        default=120,
+        gt=0,
+        description=(
+            "Autonomous dispatcher — ceiling (s) on that same wait, applied "
+            "to a server ``Retry-After`` and to the task's own "
+            "``retry_backoff_seconds`` alike. A queued execution counts "
+            "against the task's concurrency, so while one waits a recurring "
+            "task fires nothing; this ceiling and "
+            "``autonomous_dispatch_max_requeues`` together bound how long a "
+            "scope may go quiet under back-pressure."
+        ),
+    )
+    autonomous_dispatch_max_requeues: int = Field(
+        default=6,
+        gt=0,
+        description=(
+            "Autonomous dispatcher — how many times ONE execution may be "
+            "returned to the queue for host back-pressure before the "
+            "attempt is given up on. A requeue does not spend a failure "
+            "retry, so without this bound an execution whose scope stays full "
+            "would cycle between queued and refused forever: never terminal, "
+            "never archived, never notified. Past the bound the attempt "
+            "fails with a rate-limited error class."
+        ),
+    )
+    autonomous_delegated_credential_retry_attempts: int = Field(
+        default=2,
+        ge=1,
+        le=5,
+        description=(
+            "Autonomous dispatcher — total fresh owner-resolution, delegated-"
+            "credential mint and run-admission attempts for one execution. "
+            "Includes the first attempt and is capped at five so an outage of "
+            "the host cannot amplify one queued execution without bound."
+        ),
+    )
+    autonomous_owner_resolution_backoff_base_seconds: float = Field(
+        default=5.0,
+        gt=0,
+        description=(
+            "Autonomous scheduler — initial per-owner delay after the host "
+            "cannot resolve that owner's current policy (seconds). Repeated "
+            "failures double this delay until the configured maximum."
+        ),
+    )
+    autonomous_owner_resolution_backoff_max_seconds: float = Field(
+        default=60.0,
+        gt=0,
+        description=(
+            "Autonomous scheduler — ceiling on the per-owner exponential "
+            "delay after repeated owner-resolution failures at the host "
+            "(seconds)."
+        ),
+    )
     autonomous_archive_after_days: int = Field(
         default=7,
         gt=0,
@@ -6237,6 +6450,385 @@ class RuntimeConstants(BaseModel):
             "execution record is eligible for archival by the periodic archive "
             "sweep (``AUTONOMOUS_ARCHIVE_AFTER_DAYS`` / Settings "
             "``archive_after_days``)."
+        ),
+    )
+    autonomous_excluded_interactive_tools: list[str] = Field(
+        default=["AskUser"],
+        description=(
+            "Autonomous dispatcher — human-in-the-loop tools that no scheduled "
+            "run may be offered, whatever the scope's tool surface holds. Such "
+            "a tool exists to stop the agent and wait for a person, and nobody "
+            "is watching a scheduled run: a model that calls one parks the run "
+            "until the watchdog ends it. Names are matched ignoring case and "
+            "separators. Stored in the catalog as a JSON-encoded list string "
+            "and parsed by the host runtime_constants_provider. An empty list "
+            "narrows nothing and hands every scheduled run the interactive "
+            "tools back, so clear it deliberately."
+        ),
+    )
+    autonomous_artifact_max_files: int = Field(
+        default=50,
+        gt=0,
+        description=(
+            "Autonomous dispatcher — how many of a finished run's workspace "
+            "files are copied into the execution's artifacts. A workspace is "
+            "the agent's scratch space as much as its output, so an unbounded "
+            "copy pulls a whole build tree into the service's volume; files "
+            "past this count are left in the workspace and not recorded."
+        ),
+    )
+    autonomous_artifact_max_file_bytes: int = Field(
+        default=10_485_760,
+        gt=0,
+        description=(
+            "Autonomous dispatcher — the largest single workspace file copied "
+            "as an artifact (bytes; default 10 MiB). Bites before the Run "
+            "API's own per-file read limit, so raising it past that limit "
+            "changes nothing."
+        ),
+    )
+    autonomous_metrics_settle_attempts: int = Field(
+        default=3,
+        gt=0,
+        description=(
+            "Autonomous dispatcher — how many times a finished run's totals "
+            "are re-read from the Run API after its terminal frame. Billing "
+            "continues for a moment past that frame, so the numbers carried by "
+            "the stream are always a lower bound; the whole window is spent "
+            "and the last readable answer is the one recorded."
+        ),
+    )
+    autonomous_metrics_settle_interval_seconds: float = Field(
+        default=2.0,
+        gt=0,
+        description=(
+            "Autonomous dispatcher — the gap (s) between those re-reads. "
+            "Attempts × interval is exactly how long a terminal execution's "
+            "totals are given to stop moving before they are written."
+        ),
+    )
+    autonomous_tool_surface_cache_ttl_seconds: float = Field(
+        default=300.0,
+        gt=0,
+        description=(
+            "Autonomous dispatcher — how long one scope's resolved tool "
+            "surface is reused before it is fetched again (s). Because the "
+            "dispatch names the tools a run may use, a stale list BLOCKS a "
+            "newly enabled tool rather than merely omitting it: this is the "
+            "delay between enabling a tool for a scope and an autonomous run "
+            "being able to call it."
+        ),
+    )
+    autonomous_scope_config_cache_ttl_seconds: float = Field(
+        default=30.0,
+        gt=0,
+        description=(
+            "Autonomous scheduler — how long one scope's configured limits are "
+            "reused before they are fetched again (s). Consulted for every due "
+            "task on every scheduler tick, so a short value multiplies into "
+            "steady config traffic while a long one delays a limit change."
+        ),
+    )
+    autonomous_model_catalog_cache_ttl_seconds: float = Field(
+        default=300.0,
+        gt=0,
+        description=(
+            "Autonomous catalog client \u2014 how long one scope's model catalogue "
+            "is reused before it is fetched again (s). The catalogue decides "
+            "which models a task may name, so a stale copy rejects a model an "
+            "operator has just enabled and keeps offering one just removed."
+        ),
+    )
+    autonomous_currency_rate_cache_ttl_seconds: float = Field(
+        default=900.0,
+        gt=0,
+        description=(
+            "Autonomous currency client \u2014 how long the platform's rate table "
+            "is reused before it is fetched again (s). Rates convert a run's "
+            "cost into the currency a task's budget is written in, so this is "
+            "how stale the number a budget is compared against may be."
+        ),
+    )
+    autonomous_budget_check_interval_seconds: float = Field(
+        default=30.0,
+        gt=0,
+        description=(
+            "Autonomous dispatcher \u2014 how often a run carrying a per-task "
+            "budget is asked what it has cost so far (s). The overshoot a "
+            "budget can suffer is this interval times the run's burn rate, so "
+            "it is the knob that decides how tight \"stops at $0.50\" really "
+            "is. Only budgeted runs are polled at all, one snapshot read per "
+            "interval each."
+        ),
+    )
+    autonomous_scheduler_max_catchup_fires: int = Field(
+        default=24,
+        gt=0,
+        description=(
+            "Autonomous scheduler \u2014 how many missed fires of one task are "
+            "walked at once when the schedule has run on without it (the "
+            "service was down, the leader changed hands, the scope was held). "
+            "Which of those fires still happen is the task's catch-up policy; "
+            "this only bounds how far back the walk goes, so a task idle for "
+            "months cannot make one tick enumerate its whole history."
+        ),
+    )
+    autonomous_scheduler_event_retention_days: int = Field(
+        default=30,
+        gt=0,
+        description=(
+            "Autonomous scheduler \u2014 how long a scheduler event and the "
+            "recorded dispatch body beside it are kept before the sweep drops "
+            "them (days). Both are diagnostics kept to explain a recent "
+            "incident, and the dispatch snapshot holds user-written prompt "
+            "text, so this is a privacy window as much as a size bound. "
+            "Resolved once for the default scope: the table is shared and the "
+            "sweep is one delete."
+        ),
+    )
+    autonomous_transcript_max_frames: int = Field(
+        default=2000,
+        gt=0,
+        description=(
+            "Autonomous transcript recorder \u2014 how many stream frames of one "
+            "execution are persisted before recording stops. The transcript is "
+            "what the execution page replays after the run has ended; past "
+            "this count the run continues normally and only the recording is "
+            "truncated."
+        ),
+    )
+    autonomous_transcript_max_frame_bytes: int = Field(
+        default=65_536,
+        ge=0,
+        description=(
+            "Autonomous transcript recorder \u2014 the largest single stream frame "
+            "persisted (bytes; default 64 KiB). A frame past this is stored "
+            "truncated rather than dropped, so the transcript keeps its shape "
+            "when one tool result is enormous. ``0`` means no per-frame "
+            "bound at all and every frame is stored whole."
+        ),
+    )
+    autonomous_file_download_max_bytes: int = Field(
+        default=26_214_400,
+        ge=0,
+        description=(
+            "Autonomous file routes \u2014 the largest single file the service "
+            "will serve out of an execution's tree (bytes; default 25 MiB). "
+            "The service proxies a volume it owns and a workspace it does not, "
+            "and neither bounds what a run may write; a request for a file "
+            "past this limit is refused with the limit named rather than "
+            "taking the pod with it. ``0`` means no ceiling and a file of "
+            "any size is served."
+        ),
+    )
+    autonomous_file_zip_max_bytes: int = Field(
+        default=104_857_600,
+        ge=0,
+        description=(
+            "Autonomous file routes \u2014 the largest archive of an execution's "
+            "files the service will stream (bytes; default 100 MiB). The "
+            "archive stops at this size and names what it could not fit in a "
+            "notice member, because a silently short archive looks exactly "
+            "like a run that produced less than it did. ``0`` means no "
+            "ceiling and the whole tree is streamed."
+        ),
+    )
+    autonomous_memory_max_tokens: int = Field(
+        default=4000,
+        gt=0,
+        description=(
+            "Autonomous chain memory \u2014 ceiling on what the memory index "
+            "injected into an attached step's prompt may occupy, counted in "
+            "tokens. Both this and the byte ceiling apply and the smaller "
+            "wins; the service has no tokeniser for the model of the day, so "
+            "tokens are converted to bytes at a fixed prose ratio."
+        ),
+    )
+    autonomous_memory_max_bytes: int = Field(
+        default=32_768,
+        gt=0,
+        description=(
+            "Autonomous chain memory \u2014 the same injection ceiling counted in "
+            "bytes, which is the one actually measurable at the point of use."
+        ),
+    )
+    autonomous_memory_retention_days: int = Field(
+        default=30,
+        gt=0,
+        description=(
+            "Autonomous chain memory \u2014 how long a workflow run's shared "
+            "directory is kept after its last write (days). Passed to the "
+            "shared-workspace API at creation and remembered on the workspace, "
+            "so the retention a run asked for is the retention every later "
+            "push uses. The workspace API's own "
+            "``shared_workspace_retention_days`` applies when a run names no "
+            "value; where the two disagree the value recorded at creation wins."
+        ),
+    )
+    autonomous_memory_index_max_entries: int = Field(
+        default=500,
+        gt=0,
+        description=(
+            "Autonomous chain memory \u2014 how many files the memory index's "
+            "appendix may name before it states how many it left out. The "
+            "table of steps is never truncated by this; only the file list is."
+        ),
+    )
+    autonomous_memory_result_max_bytes: int = Field(
+        default=262_144,
+        gt=0,
+        description=(
+            "Autonomous chain memory \u2014 the largest single step result written "
+            "into the run's directory (bytes; default 256 KiB). A bigger "
+            "result is stored truncated with the truncation stated in the "
+            "file, rather than left to be discovered by an agent reading a "
+            "sentence that stops. The execution record still holds the whole "
+            "of it."
+        ),
+    )
+    autonomous_memory_tool_max_read_bytes: int = Field(
+        default=262_144,
+        gt=0,
+        description=(
+            "Autonomous memory tool \u2014 the most one read hands the agent out "
+            "of the run's shared directory (bytes; default 256 KiB). A larger "
+            "file is returned truncated, so a step cannot spend its whole "
+            "context on one file it asked for by name."
+        ),
+    )
+    autonomous_memory_tool_max_write_bytes: int = Field(
+        default=262_144,
+        gt=0,
+        description=(
+            "Autonomous memory tool \u2014 the most one write accepts into that "
+            "directory (bytes; default 256 KiB). The workspace API's own "
+            "per-file ceiling applies as well and the stricter of the two "
+            "wins."
+        ),
+    )
+    autonomous_memory_tool_max_entries: int = Field(
+        default=500,
+        gt=0,
+        description=(
+            "Autonomous memory tool \u2014 how many entries one list returns "
+            "before the answer is marked truncated."
+        ),
+    )
+    autonomous_task_memory_max_bytes: int = Field(
+        default=32_768,
+        gt=0,
+        description=(
+            "Autonomous task memory \u2014 how much of a task's previous result "
+            "may be carried into the prompt of its next run (bytes; default "
+            "32 KiB). What does not fit is cut, so a recurring task cannot "
+            "grow its own prompt without bound run after run."
+        ),
+    )
+    autonomous_task_memory_max_age_days: int = Field(
+        default=30,
+        ge=0,
+        description=(
+            "Autonomous task memory \u2014 how old a remembered run may be and "
+            "still be injected (days). Past it the memory is skipped as stale "
+            "and the run starts from the task's prompt alone. ``0`` disables "
+            "the age check and lets a memory of any age be used."
+        ),
+    )
+
+ # ----- Autonomous entitlement — the platform's side of the plan -----
+ # Access plans state an autonomous entitlement per tier in their JSONB
+ # ``quota_policy`` (``autonomous_max_tasks`` and the keys beside it). These
+ # are the PLATFORM ceilings those tier numbers are clamped by: the effective
+ # limit is the LOWER of the plan's number and the ceiling, so a tier that
+ # states nothing is still bounded and no tier can buy more of the cluster
+ # than the scope is willing to sell. They grant nothing on their own — a plan
+ # that states no entitlement does not become entitled because a ceiling
+ # exists. Enforced by the tasks service at create / enable / trigger /
+ # dispatch; nothing in the core loop reads them.
+    autonomous_plan_max_tasks_ceiling: int = Field(
+        default=100,
+        ge=0,
+        description=(
+            "Autonomous entitlement — hard ceiling on how many live tasks one "
+            "principal may own, clamping the plan's ``autonomous_max_tasks``. "
+            "Every live task is a row the scheduler evaluates on every tick, "
+            "so this bounds the tick's cost as much as the principal's "
+            "allowance. 0 leaves a principal no room to create a task at all."
+        ),
+    )
+    autonomous_plan_max_workflows_ceiling: int = Field(
+        default=50,
+        ge=0,
+        description=(
+            "Autonomous entitlement — hard ceiling on how many live workflows "
+            "one principal may own, clamping ``autonomous_max_workflows``."
+        ),
+    )
+    autonomous_plan_max_enabled_schedules_ceiling: int = Field(
+        default=50,
+        ge=0,
+        description=(
+            "Autonomous entitlement — hard ceiling on how many of a "
+            "principal's tasks and workflows may be ENABLED on a schedule at "
+            "once, clamping ``autonomous_max_enabled_schedules``. A disabled "
+            "task costs a row; an enabled one costs a recurring dispatch, "
+            "which is why it is metered separately from the count above."
+        ),
+    )
+    autonomous_plan_executions_per_day_ceiling: int = Field(
+        default=1000,
+        ge=0,
+        description=(
+            "Autonomous entitlement — hard ceiling on a principal's autonomous "
+            "executions per rolling day, clamping "
+            "``autonomous_executions_per_day``. An execution is a whole agent "
+            "run nobody is watching, so this is the platform's bound on what "
+            "one principal can spend unattended in a day."
+        ),
+    )
+    autonomous_plan_executions_per_month_ceiling: int = Field(
+        default=20_000,
+        ge=0,
+        description=(
+            "Autonomous entitlement — the same bound over a rolling month, "
+            "clamping ``autonomous_executions_per_month``. Both windows apply "
+            "and the first one reached refuses the dispatch."
+        ),
+    )
+    autonomous_plan_min_interval_seconds_floor: int = Field(
+        default=60,
+        ge=0,
+        description=(
+            "Autonomous entitlement — platform FLOOR under how often one "
+            "task may fire, in seconds. The only autonomous plan bound whose "
+            "clamp runs the other way: a minimum interval protects the "
+            "platform by being LARGER, so the effective interval is the "
+            "HIGHER of this and the plan's "
+            "``autonomous_min_interval_seconds``, and a tier can buy a "
+            "tighter schedule only down to this value. 0 removes the floor "
+            "and lets a plan state any cadence it likes."
+        ),
+    )
+    autonomous_plan_max_timeout_seconds_ceiling: int = Field(
+        default=86_400,
+        ge=0,
+        description=(
+            "Autonomous entitlement — hard ceiling on the wall-clock timeout "
+            "one autonomous run may be given, clamping "
+            "``autonomous_max_timeout_seconds``. A run holds an executor slot "
+            "and a sandbox for its whole timeout, so this bounds how long a "
+            "single unattended run can hold platform capacity (default 24 h)."
+        ),
+    )
+    autonomous_plan_max_nodes_ceiling: int = Field(
+        default=100,
+        ge=0,
+        description=(
+            "Autonomous entitlement — hard ceiling on how many nodes one "
+            "workflow may contain, clamping ``autonomous_max_nodes``. Each "
+            "node of a running workflow can be an agent run of its own, so "
+            "the node count is what a workflow's worst-case cost is "
+            "proportional to."
         ),
     )
     projects_enabled: bool = Field(
@@ -6520,6 +7112,88 @@ class RuntimeConstants(BaseModel):
             "fail-closed even if its tool args omit a URL. Empty = no host "
             "restriction (any host that passes the SSRF private/metadata deny is "
             "reachable). Matching is case-insensitive. Applies to new runs."
+        ),
+    )
+    dynamic_tools_federation_file_arguments_enabled: bool = Field(
+        default=True,
+        description=(
+            "Dynamic tools — let the model pass a WORKSPACE PATH where an "
+            "external MCP tool's schema asks for base64 bytes. A tool that declares "
+            "a base64 string field is otherwise unusable: the model would have to "
+            "emit the whole file into its own output, which costs more than the "
+            "document and truncates. When on, such a field is projected into a "
+            "path-taking companion field and the bytes are read from the workspace "
+            "and encoded at dispatch, so the wire contract the server declared is "
+            "unchanged. Off = those tools stay on the surface but only a literal "
+            "base64 argument reaches them. Applies to new runs."
+        ),
+    )
+    dynamic_tools_federation_file_argument_schema_mode: str = Field(
+        default="replace",
+        description=(
+            "Dynamic tools — what the model sees where a base64 field was "
+            "detected. 'replace' (default) HIDES the raw base64 field and shows only "
+            "the path companion: asking a model to write base64 is never the right "
+            "outcome, so the field is removed rather than left as a trap. 'augment' "
+            "shows both, as an escape hatch for a server whose field was detected "
+            "wrongly. Any other value is treated as 'replace'. The DESCRIPTOR schema "
+            "(and its fail-closed hash) is never affected either way. Applies to new "
+            "runs."
+        ),
+    )
+    dynamic_tools_federation_file_argument_max_bytes: int = Field(
+        default=10_485_760,
+        ge=0,
+        description=(
+            "Dynamic tools — max bytes of ONE workspace file that may be "
+            "read and base64-encoded into an external tool call. Refused with both "
+            "numbers rather than truncated: half a document delivered as a whole one "
+            "is worse than an error the model can act on. Remember base64 inflates "
+            "by 4/3 on the wire. 0 = unbounded (NOT recommended). Applies to new runs."
+        ),
+    )
+    dynamic_tools_federation_file_arguments_max_total_bytes: int = Field(
+        default=20_971_520,
+        ge=0,
+        description=(
+            "Dynamic tools — max TOTAL raw bytes across every file "
+            "argument materialised into ONE external tool call. Bounds a call that "
+            "passes several files each under the per-file cap. 0 = unbounded (NOT "
+            "recommended). Applies to new runs."
+        ),
+    )
+    dynamic_tools_federation_file_arguments_max_count: int = Field(
+        default=8,
+        ge=0,
+        description=(
+            "Dynamic tools — max number of workspace files that may be "
+            "materialised into ONE external tool call. 0 = unbounded (NOT "
+            "recommended). Applies to new runs."
+        ),
+    )
+    dynamic_tools_federation_file_argument_field_names: str = Field(
+        default=(
+            "content_base64,contentBase64,file_base64,fileBase64,data_base64,"
+            "dataBase64,base64,b64,file_content_base64,document_base64"
+        ),
+        description=(
+            "Dynamic tools — comma-separated field names that mark a "
+            "base64 payload by NAME, for schemas that carry no 'contentEncoding' or "
+            "'format' keyword (most of them). Matching is case-insensitive and also "
+            "accepts any field whose name ends in '_base64', '_b64' or 'Base64'. A "
+            "field must additionally accept a string type before it is treated as "
+            "binary. Empty = name-based detection off (keyword detection still "
+            "applies). Applies to new runs."
+        ),
+    )
+    dynamic_tools_federation_file_argument_detect_by_description: bool = Field(
+        default=True,
+        description=(
+            "Dynamic tools — also treat a string field as base64 when its "
+            "DESCRIPTION says so and its name does not. The weakest signal, and the "
+            "one that can misfire on a field that merely mentions base64 in prose; "
+            "turn it off for a server whose text field was projected wrongly. "
+            "Applies to new runs."
         ),
     )
 
