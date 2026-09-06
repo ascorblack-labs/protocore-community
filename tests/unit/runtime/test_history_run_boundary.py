@@ -372,9 +372,6 @@ _WHOLE_HISTORY_BY_DESIGN: dict[str, _Declaration] = {
     "protocore/runtime/context/compaction.py::run_tier2_summarisation._summarise": _whole(
         "summarises one unit of the whole transcript Tier-2 was handed"
     ),
-    "protocore/runtime/context/compaction.py::run_tier3_fold._fold_one": _whole(
-        "folds one span of the whole transcript Tier-3 was handed"
-    ),
     "protocore/runtime/context/compaction.py::_fold_spans": _whole(
         "finds runs of old summaries and operator turns anywhere in the transcript"
     ),
