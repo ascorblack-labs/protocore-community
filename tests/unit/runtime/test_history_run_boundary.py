@@ -1288,6 +1288,14 @@ _SEED_KEY_DERIVED_ELSEWHERE: dict[str, str] = {
     "protocore/runtime/context/compaction.py::_session_history_seed_indices": (
         "compaction withholds the lossy Tier-2 collapse from seeded turns by INDEX into the list it is given"
     ),
+    "protocore/runtime/context/compaction.py::run_tier2_summarisation": (
+        "Tier-2 protects operator turns by INDEX into the list it is given, and a seeded prior-run "
+        "turn is not an operator turn of this run"
+    ),
+    "protocore/runtime/context/compaction.py::_is_plain_operator_turn": (
+        "the Tier-3 fold classifies one message it is handed; a seeded prior-run turn is not an "
+        "operator turn to fold, and the caller works by INDEX into the whole list"
+    ),
     "protocore/runtime/context/session_memory.py::_tag_seeded": (
         "writes the tag; this is where the boundary comes from"
     ),
