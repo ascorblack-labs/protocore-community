@@ -913,7 +913,7 @@ def _summary_from_response(raw: str, anchor_idx: int) -> str:
     if not isinstance(parsed, dict) or not isinstance(parsed.get("summary"), str):
         _logger.warning("summariser reply for anchor_idx=%s has no 'summary' string: %r", anchor_idx, raw[:200])
         return ""
-    return parsed["summary"]
+    return str(parsed["summary"])
 
 
 def _wrap_compaction_summary(anchor_key: str, summary_text: str) -> str:
