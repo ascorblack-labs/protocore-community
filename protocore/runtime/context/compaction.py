@@ -1066,6 +1066,8 @@ async def run_tier2_summarisation(
             "intent, file paths touched, and every exact identifier that appears "
             "(paths, ids, ports, URLs, numbers, error codes) verbatim; never round, "
             "guess or substitute a plausible value, and say so if a result was missing. "
+            "The absence of a tool result or confirmation in the turn means the outcome is "
+            "UNKNOWN, not that it did not happen or that it succeeded: state unknowns as unknown. "
             "Output STRICT JSON only."
         )
 
