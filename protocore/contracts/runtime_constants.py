@@ -774,6 +774,50 @@ class RuntimeConstants(BaseModel):
             "summarised (kill-switch)."
         ),
     )
+    compaction_fold_enabled: bool = Field(
+        default=True,
+        description=(
+            "Tier-3: fold runs of old compaction summaries and old operator turns "
+            "into one consolidated summary. Tier-2 produces one summary per tool "
+            "batch and never re-summarises one, and operator turns are never "
+            "summarised there, so a long session accumulates hundreds of small "
+            "summaries and every operator message until the window is full of "
+            "them. The fold keeps the first user turn (the task) and the most "
+            "recent operator turns verbatim; older operator instructions survive "
+            "inside the fold as exact quotes."
+        ),
+    )
+    compaction_fold_min_messages: int = Field(
+        default=8,
+        ge=2,
+        description=(
+            "A contiguous run of foldable messages (summaries and old operator "
+            "turns) shorter than this is left alone; folding a handful of "
+            "summaries costs a summariser call and frees little."
+        ),
+    )
+    compaction_fold_min_tokens: int = Field(
+        default=1_500,
+        ge=0,
+        description=(
+            "A foldable run estimated below this many tokens is left alone, so "
+            "already-folded spans are not folded again and again for nothing."
+        ),
+    )
+    compaction_fold_keep_operator_turns: int = Field(
+        default=4,
+        ge=0,
+        description=(
+            "The most recent operator (user-role, non-summary) turns that are "
+            "never folded, on top of the protected first user turn: the live "
+            "instructions the model is acting on stay verbatim."
+        ),
+    )
+    compaction_fold_max_output_tokens: int = Field(
+        default=1_500,
+        ge=100,
+        description="Output budget for one fold summary (it stands for many turns).",
+    )
     compaction_placeholder_preview_chars: int = Field(
         default=240,
         ge=0,

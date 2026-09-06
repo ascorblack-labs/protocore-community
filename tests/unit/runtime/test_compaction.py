@@ -8,6 +8,7 @@ import pytest
 from protocore.contracts.llm import LLMObservabilityContext
 from protocore.contracts.runtime_constants import RuntimeConstants
 from protocore.contracts.types import (
+    COMPACTION_SUMMARY_METADATA_KEY,
     ImageRefBlock,
     Message,
     MessageRole,
@@ -238,7 +239,7 @@ async def test_tier2_summarisation_propagates_observability_context() -> None:
         # Above the empty-wrapper floor so the unit is summarised (and thus a
         # summariser call is issued) — the assertion below is on the propagated
         # observability context of that call.
-        Message(role=MessageRole.user, content_blocks=[TextBlock(text="old turn " * 20)]),
+        Message(role=MessageRole.assistant, content_blocks=[TextBlock(text="old turn " * 20)]),
         Message(role=MessageRole.user, content_blocks=[TextBlock(text="recent")]),
     ]
     await run_tier2_summarisation(
@@ -694,7 +695,7 @@ async def test_tier2_bounded_by_free_target_tokens() -> None:
 
     # 10 large eligible turns (each well above the wrapper floor) + recent.
     history = [
-        Message(role=MessageRole.user, content_blocks=[TextBlock(text="word " * 200)])
+        Message(role=MessageRole.assistant, content_blocks=[TextBlock(text="word " * 200)])
         for _ in range(10)
     ]
     history.append(
@@ -754,7 +755,7 @@ async def test_tier2_extracts_summary_from_json_envelope() -> None:
     llm.queue_response(text=envelope)
 
     history = [
-        Message(role=MessageRole.user, content_blocks=[TextBlock(text="old turn " * 20)]),
+        Message(role=MessageRole.assistant, content_blocks=[TextBlock(text="old turn " * 20)]),
         Message(role=MessageRole.user, content_blocks=[TextBlock(text="recent")]),
     ]
     state = CompactionState()
@@ -1011,3 +1012,76 @@ async def test_tier1_preserves_non_tool_result_siblings_in_multi_block_message()
     assert sibling.text == "sibling note that must NOT be dropped"
     assert isinstance(result_block, ToolResultBlock)
     assert is_compacted_placeholder(result_block.content)
+
+
+# ---------------------------------------------------------------------------
+# Tier-3: folding runs of old summaries and operator turns
+# ---------------------------------------------------------------------------
+def _summary(text: str) -> Message:
+    return Message(
+        role=MessageRole.user,
+        content_blocks=[TextBlock(text=f"<compacted-turn id='k{abs(hash(text)) % 10_000}'>{text}</compacted-turn>")],
+        metadata={COMPACTION_SUMMARY_METADATA_KEY: True},
+    )
+
+
+def _operator(text: str) -> Message:
+    return Message(role=MessageRole.user, content_blocks=[TextBlock(text=text)])
+
+
+@pytest.mark.asyncio
+async def test_tier3_folds_old_summaries_and_operator_turns_keeping_task_and_recent() -> None:
+    from protocore.runtime.context.compaction import COMPACTION_FOLD_METADATA_KEY, run_tier3_fold
+    from protocore.tests_support.adapters import InMemoryLLMProvider
+
+    rc = RuntimeConstants(
+        model_context_window=32_768,
+        compaction_keep_recent_turns=2,
+        compaction_fold_min_messages=4,
+        compaction_fold_min_tokens=0,
+        compaction_fold_keep_operator_turns=2,
+    )
+    history = [
+        _operator("The task: keep the changelog current."),  # first user turn: protected
+        *[_summary(f"summary number {i} about step {i} in file f{i}.py " * 6) for i in range(5)],
+        _operator("Also remove the model-name field from the header."),
+        *[_summary(f"later summary {i} " * 8) for i in range(3)],
+        _operator("recent instruction, must stay"),  # most recent operator turn: kept
+        Message(role=MessageRole.assistant, content_blocks=[TextBlock(text="working")]),
+        _operator("newest"),
+    ]
+    llm = InMemoryLLMProvider()
+    llm.queue_response(text='{"summary": "Folded: steps 0-4 done in f0.py..f4.py. Operator said: \\"Also remove the model-name field from the header.\\""}')
+    before = len(history)
+    result = await run_tier3_fold(history=history, compaction_llm=llm, state=CompactionState(), rc=rc, model_name="mock")
+    assert result.spans_folded == 1 and result.messages_folded == 9 and result.tokens_freed > 0
+    assert len(history) == before - 8
+    assert history[0].text.startswith("The task:")
+    fold = history[1]
+    assert fold.metadata.get(COMPACTION_SUMMARY_METADATA_KEY) is True
+    assert fold.metadata[COMPACTION_FOLD_METADATA_KEY] == {"messages": 9, "operator_turns": 1}
+    assert "Operator said" in fold.text and "model-name field" in fold.text and fold.text.startswith("<compacted-turn id='fold-")
+    assert history[2].text == "recent instruction, must stay"
+    # the prompt carried every operator instruction verbatim for the summariser
+    sent = llm.calls[0].messages[0].text
+    assert "[operator said] Also remove the model-name field" in sent and "[earlier summary] summary number 0" in sent
+    # idempotent: a lone fold summary is below the min span and is not folded again
+    llm.queue_response(text='{"summary": "x"}')
+    again = await run_tier3_fold(history=history, compaction_llm=llm, state=CompactionState(), rc=rc, model_name="mock")
+    assert again.spans_folded == 0
+
+
+@pytest.mark.asyncio
+async def test_tier3_is_off_by_switch_and_below_thresholds() -> None:
+    from protocore.runtime.context.compaction import run_tier3_fold
+    from protocore.tests_support.adapters import InMemoryLLMProvider
+
+    history = [_operator("task"), *[_summary(f"s{i} " * 20) for i in range(10)], _operator("recent"), _operator("newest")]
+    llm = InMemoryLLMProvider()
+    llm.queue_response(text='{"summary": "folded"}')
+    off = RuntimeConstants(model_context_window=32_768, compaction_fold_enabled=False, compaction_keep_recent_turns=1)
+    assert (await run_tier3_fold(history=list(history), compaction_llm=llm, state=CompactionState(), rc=off, model_name="mock")).spans_folded == 0
+    tiny = RuntimeConstants(model_context_window=32_768, compaction_keep_recent_turns=1, compaction_fold_min_messages=50)
+    assert (await run_tier3_fold(history=list(history), compaction_llm=llm, state=CompactionState(), rc=tiny, model_name="mock")).spans_folded == 0
+    big = RuntimeConstants(model_context_window=32_768, compaction_keep_recent_turns=1, compaction_fold_min_messages=4, compaction_fold_min_tokens=1_000_000)
+    assert (await run_tier3_fold(history=list(history), compaction_llm=llm, state=CompactionState(), rc=big, model_name="mock")).spans_folded == 0

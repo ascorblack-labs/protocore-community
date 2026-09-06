@@ -23,9 +23,11 @@ from protocore.runtime.context.compaction import (
     CompactionState,
     Tier1Result,
     Tier2Result,
+    Tier3Result,
     estimate_message_tokens,
     run_tier1_truncation,
     run_tier2_summarisation,
+    run_tier3_fold,
 )
 from protocore.runtime.token_counting import LanguageProfile, detect_profile
 
@@ -240,6 +242,31 @@ class ContextManager:
             budgets=budgets,
         )
 
+    async def _fold(
+        self,
+        history: list[Message],
+        compaction_state: CompactionState,
+        model_name: str,
+        observability: LLMObservabilityContext | None,
+        protect_tail_from_index: int | None,
+    ) -> Tier3Result | None:
+        """Tier-3 after Tier-2: fold runs of old summaries and operator turns; a failure never aborts the pass."""
+        if self._compaction_llm is None or not self._rc.compaction_fold_enabled:
+            return None
+        try:
+            return await run_tier3_fold(
+                history=history,
+                compaction_llm=self._compaction_llm,
+                state=compaction_state,
+                rc=self._rc,
+                model_name=model_name,
+                observability=observability,
+                protect_tail_from_index=protect_tail_from_index,
+            )
+        except Exception as exc:
+            _logger.warning("tier3 fold failed; skipping (err=%s)", exc)
+            return None
+
     async def run_compaction(
         self,
         *,
@@ -319,6 +346,8 @@ class ContextManager:
                     raise CompactionExhaustedError("tier2 summarisation exhausted retries") from exc
                 tier2 = Tier2Result(turns_summarised=0, tokens_freed=0)
             attempt.tier2 = tier2
+
+        attempt.tier3 = await self._fold(history, compaction_state, model_name, observability, protect_tail_from_index)
 
         tokens_after = estimate_history_tokens(history, self._rc)
         attempt.tokens_after = tokens_after
@@ -420,6 +449,8 @@ class ContextManager:
                 tier2 = Tier2Result(turns_summarised=0, tokens_freed=0)
             attempt.tier2 = tier2
 
+        attempt.tier3 = await self._fold(history, compaction_state, model_name, observability, protect_tail_from_index)
+
         tokens_after = estimate_history_tokens(history, self._rc)
         attempt.tokens_after = tokens_after
 
@@ -431,6 +462,7 @@ class ContextManager:
             tokens_after < tokens_before
             or (attempt.tier1 is not None and attempt.tier1.messages_modified > 0)
             or (attempt.tier2 is not None and attempt.tier2.turns_summarised > 0)
+            or (attempt.tier3 is not None and attempt.tier3.spans_folded > 0)
         )
         if progress_made:
             compaction_state.reset_retries()

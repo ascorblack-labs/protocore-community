@@ -114,6 +114,15 @@ class Tier2Result:
     tokens_freed: int
 
 
+@dataclass(frozen=True, slots=True)
+class Tier3Result:
+    """Outcome of Tier 3 — folding runs of old summaries and operator turns."""
+
+    spans_folded: int
+    messages_folded: int
+    tokens_freed: int
+
+
 @dataclass(slots=True)
 class CompactionAttempt:
     """One compaction attempt's combined outcome.
@@ -124,6 +133,7 @@ class CompactionAttempt:
 
     tier1: Tier1Result | None = None
     tier2: Tier2Result | None = None
+    tier3: Tier3Result | None = None
     tokens_before: int = 0
     tokens_after: int = 0
 
@@ -1180,13 +1190,184 @@ async def run_tier2_summarisation(
     return Tier2Result(turns_summarised=summarised, tokens_freed=freed)
 
 
+COMPACTION_FOLD_METADATA_KEY: Final[str] = "protocore.compaction_fold"
+"""Metadata on a Tier-3 fold summary: how many messages it stands for."""
+
+
+def _is_plain_operator_turn(message: Message) -> bool:
+    """A user-role turn written by the operator: no tool result, not a summary, not bootstrap or seed."""
+    if message.role is not MessageRole.user or _is_compaction_summary(message):
+        return False
+    if message.metadata.get(COMPACTION_REFERENCE_METADATA_KEY) is True:
+        return False
+    if message.metadata.get(SESSION_HISTORY_SEED_METADATA_KEY) is True:
+        return False
+    return not any(isinstance(block, ToolResultBlock) for block in message.content_blocks)
+
+
+def _fold_spans(
+    history: list[Message],
+    eligible_upper: int,
+    rc: RuntimeConstants,
+) -> list[tuple[int, int]]:
+    """Contiguous runs ``[start, end)`` of foldable messages inside the eligible region.
+
+    Foldable: a compaction summary, or a plain operator turn that is neither the first
+    user turn (the task) nor one of the ``compaction_fold_keep_operator_turns`` most recent
+    operator turns anywhere in history. A run counts only when it is at least
+    ``compaction_fold_min_messages`` long and ``compaction_fold_min_tokens`` big.
+    """
+    first_user = _first_user_turn_index(history) if rc.compaction_protect_first_user_turn else None
+    operator_indices = [i for i, m in enumerate(history) if _is_plain_operator_turn(m)]
+    keep = rc.compaction_fold_keep_operator_turns
+    recent_operator = set(operator_indices[-keep:]) if keep else set()
+    foldable = [
+        (i < eligible_upper)
+        and i != first_user
+        and i not in recent_operator
+        and (_is_compaction_summary(history[i]) or _is_plain_operator_turn(history[i]))
+        for i in range(len(history))
+    ]
+    spans: list[tuple[int, int]] = []
+    start: int | None = None
+    for i in range(len(history) + 1):
+        if i < len(history) and foldable[i]:
+            if start is None:
+                start = i
+            continue
+        if start is not None:
+            end = i
+            if end - start >= rc.compaction_fold_min_messages:
+                tokens = sum(estimate_message_tokens(history[j], rc) for j in range(start, end))
+                if tokens >= rc.compaction_fold_min_tokens:
+                    spans.append((start, end))
+            start = None
+    return spans
+
+
+def _fold_item_text(message: Message) -> str:
+    text = message.text.strip()
+    if _is_compaction_summary(message):
+        inner = re.sub(r"^<compacted-turn[^>]*>", "", text).removesuffix("</compacted-turn>").strip()
+        return f"[earlier summary] {inner}"
+    return f"[operator said] {text}"
+
+
+async def run_tier3_fold(
+    history: list[Message],
+    compaction_llm: ILLMProvider,
+    state: CompactionState,
+    rc: RuntimeConstants,
+    *,
+    model_name: str,
+    observability: LLMObservabilityContext | None = None,
+    protect_tail_from_index: int | None = None,
+    free_target_tokens: int | None = None,
+) -> Tier3Result:
+    """Fold runs of old summaries and old operator turns into one summary each.
+
+    Tier-2 leaves one ``<compacted-turn>`` per tool batch and never touches a summary
+    again, and it keeps every operator turn verbatim. Over a long session those are the
+    whole window. This pass takes each contiguous run of such messages in the eligible
+    region (see :func:`_fold_spans`) and replaces it with a single consolidated summary,
+    in which operator instructions are kept as exact quotes. The result is a summary
+    like any other (same wrapper, same metadata flag), so a later fold can absorb it
+    once its neighbourhood has grown again. Mutates ``history`` in place.
+    """
+    if not history or not rc.compaction_fold_enabled:
+        return Tier3Result(spans_folded=0, messages_folded=0, tokens_freed=0)
+    eligible_upper = _effective_eligible_upper(history, rc.compaction_keep_recent_turns, protect_tail_from_index)
+    spans = _fold_spans(history, eligible_upper, rc)
+    if not spans:
+        return Tier3Result(spans_folded=0, messages_folded=0, tokens_freed=0)
+
+    replacements: dict[int, Message] = {}
+    drop: set[int] = set()
+    folded_spans = 0
+    folded_messages = 0
+    freed = 0
+    for start, end in spans:
+        if free_target_tokens is not None and freed >= free_target_tokens:
+            break
+        members = history[start:end]
+        before_tokens = sum(estimate_message_tokens(m, rc) for m in members)
+        items = "\n\n".join(_strip_injection_patterns(_fold_item_text(m)) for m in members)
+        operator_count = sum(1 for m in members if _is_plain_operator_turn(m))
+        prompt = (
+            "<turns>\n"
+            f"{items}\n"
+            "</turns>\n\n"
+            f"The above are {len(members)} consecutive items from an older part of a long conversation: "
+            f"earlier summaries and {operator_count} message(s) the operator wrote. Fold them into ONE "
+            "summary. Rules: every operator instruction, decision or preference must be kept as an exact "
+            "quote in a list headed 'Operator said:'; keep every identifier (paths, ids, ports, URLs, "
+            "numbers, error codes) verbatim, never round, guess or substitute; state unknown outcomes "
+            "as unknown; keep chronological order; drop nothing the operator asked for. "
+            "Output STRICT JSON only."
+        )
+        request = LLMRequest(
+            model=model_name,
+            messages=[Message(role=MessageRole.user, content_blocks=[TextBlock(text=prompt)])],
+            tools=[],
+            max_tokens=rc.compaction_fold_max_output_tokens,
+            temperature=rc.compaction_summary_temperature,
+            observability=observability,
+        )
+        try:
+            response = await compaction_llm.complete_structured(request, build_summary_schema(rc))
+        except Exception as exc:
+            _logger.warning("tier3 fold failed for span %s-%s; skipping (err=%s)", start, end, exc)
+            continue
+        raw = response.message.text
+        if not raw:
+            continue
+        summary_text = raw
+        if raw.lstrip().startswith("{"):
+            try:
+                parsed = json.loads(raw)
+            except json.JSONDecodeError:
+                continue
+            if not isinstance(parsed, dict) or not isinstance(parsed.get("summary"), str):
+                continue
+            summary_text = parsed["summary"]
+        if not summary_text:
+            continue
+        anchor_key = "fold-" + hashlib.sha256("|".join(_stable_turn_key(m) for m in members).encode("utf-8")).hexdigest()[:16]
+        wrapped = _wrap_compaction_summary(anchor_key, summary_text)
+        after_tokens = estimate_tokens(wrapped, rc)
+        if after_tokens >= before_tokens:
+            continue
+        replacements[start] = Message(
+            role=MessageRole.user,
+            content_blocks=[TextBlock(text=wrapped)],
+            metadata={COMPACTION_SUMMARY_METADATA_KEY: True, COMPACTION_FOLD_METADATA_KEY: {"messages": len(members), "operator_turns": operator_count}},
+        )
+        drop.update(range(start + 1, end))
+        state.summarised_turn_ids.add(anchor_key)
+        folded_spans += 1
+        folded_messages += len(members)
+        freed += before_tokens - after_tokens
+
+    if replacements:
+        rebuilt: list[Message] = []
+        for idx in range(len(history)):
+            if idx in drop:
+                continue
+            rebuilt.append(replacements.get(idx, history[idx]))
+        history[:] = rebuilt
+    return Tier3Result(spans_folded=folded_spans, messages_folded=folded_messages, tokens_freed=freed)
+
+
 __all__ = [
+    "COMPACTION_FOLD_METADATA_KEY",
     "CompactionAttempt",
     "CompactionExhaustedError",
     "CompactionState",
     "Tier1Result",
     "Tier2Result",
+    "Tier3Result",
     "build_summary_schema",
     "run_tier1_truncation",
     "run_tier2_summarisation",
+    "run_tier3_fold",
 ]
