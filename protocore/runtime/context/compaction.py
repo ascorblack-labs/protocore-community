@@ -1051,8 +1051,11 @@ async def run_tier2_summarisation(
             "<turn>\n"
             f"{sanitised}\n"
             "</turn>\n\n"
-            "Summarise the above turn in 1-2 sentences. Preserve tool names, "
-            "key user intent, and file paths touched. Output STRICT JSON only."
+            "Summarise the above turn in 1-3 sentences. Preserve tool names, key user "
+            "intent, file paths touched, and every exact identifier that appears "
+            "(paths, ids, ports, URLs, numbers, error codes) verbatim; never round, "
+            "guess or substitute a plausible value, and say so if a result was missing. "
+            "Output STRICT JSON only."
         )
 
         request = LLMRequest(
