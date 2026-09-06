@@ -814,7 +814,7 @@ class RuntimeConstants(BaseModel):
         ),
     )
     compaction_fold_max_output_tokens: int = Field(
-        default=1_500,
+        default=3_000,
         ge=100,
         description="Output budget for one fold summary (it stands for many turns).",
     )

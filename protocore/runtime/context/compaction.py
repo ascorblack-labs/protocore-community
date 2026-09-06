@@ -1303,6 +1303,8 @@ async def run_tier3_fold(
             "quote in a list headed 'Operator said:'; keep every identifier (paths, ids, ports, URLs, "
             "numbers, error codes) verbatim, never round, guess or substitute; state unknown outcomes "
             "as unknown; keep chronological order; drop nothing the operator asked for. "
+            "Be dense: the whole summary must fit in about 500 words, so merge repeated "
+            "checks into one line and keep only the last known state of each thing. "
             "Output STRICT JSON only."
         )
         request = LLMRequest(
