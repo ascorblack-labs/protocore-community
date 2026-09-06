@@ -17,6 +17,7 @@ Cyrillic-in-JSON-escape safety preserved via
 """
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import json
 import re
@@ -887,6 +888,34 @@ def _build_summarisation_units(
     return units
 
 
+_SUMMARY_MIN_WORDS: Final[int] = 25
+_SUMMARY_TOKENS_PER_WORD: Final[int] = 6
+"""A summary may use about one word per six tokens of the unit it replaces: room to keep
+identifiers, not enough to restate the turn."""
+
+
+def _summary_from_response(raw: str, anchor_idx: int) -> str:
+    """The ``summary`` string out of a structured summariser reply; empty when the reply is unusable.
+
+    ``complete_structured`` returns the model's RAW content, normally the JSON envelope
+    ``{"summary": "..."}``; a reply that is not a JSON object (a provider that pre-parses,
+    the test-only provider) is taken verbatim.
+    """
+    if not raw:
+        return ""
+    if not raw.lstrip().startswith("{"):
+        return raw
+    try:
+        parsed = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        _logger.warning("summariser reply for anchor_idx=%s looked like JSON but failed to parse (err=%s): %r", anchor_idx, exc, raw[:200])
+        return ""
+    if not isinstance(parsed, dict) or not isinstance(parsed.get("summary"), str):
+        _logger.warning("summariser reply for anchor_idx=%s has no 'summary' string: %r", anchor_idx, raw[:200])
+        return ""
+    return parsed["summary"]
+
+
 def _wrap_compaction_summary(anchor_key: str, summary_text: str) -> str:
     """Build the ``<compacted-turn>`` replacement body for a summarised unit.
 
@@ -1034,13 +1063,10 @@ async def run_tier2_summarisation(
     replacements: dict[int, Message] = {}
     indices_to_drop: set[int] = set()
 
+    # Units worth a call: not yet summarised, big enough to shrink. Calls go out in
+    # small parallel batches, oldest first, and stop once the pass freed its budget.
+    jobs: list[tuple[_SummarisationUnit, str, list[Message], int]] = []
     for unit in units:
-        # Bounded per-pass cost — stop issuing summariser calls once this pass
-        # has freed its budget. Prevents one COMPACTING pass over a many-turn
-        # history from firing dozens of sequential ~5-11s LLM calls.
-        if free_target_tokens is not None and freed >= free_target_tokens:
-            break
-
         anchor = history[unit.anchor_idx]
         # A4 idempotency — never re-summarise an existing compaction summary
         # (would nest <compacted-turn> wrappers and decay the summary).
@@ -1049,30 +1075,28 @@ async def run_tier2_summarisation(
         anchor_key = _stable_turn_key(anchor)
         if anchor_key in state.summarised_turn_ids:
             continue
-
-        # Exhaustive text across EVERY member of the unit (assistant turn +
-        # its tool results), so the summary preserves the tool exchange.
         unit_messages = [history[member] for member in unit.indices]
-        raw_text = "\n".join(
-            _message_text_for_estimation(member, rc) for member in unit_messages
-        ).strip()
-        if not raw_text:
-            continue
         before_tokens = sum(estimate_message_tokens(member, rc) for member in unit_messages)
-
         # No-net-gain floor — a unit at or below the empty-wrapper size cannot
-        # shrink; replacing it would only GROW history (the inflation the
-        # max(0, ...) freed clamp would mask). Skip it before spending an LLM
-        # call that cannot free tokens.
-        if before_tokens <= _compaction_wrapper_floor_tokens(anchor_key, rc):
+        # shrink; replacing it would only GROW history. Below the operator's
+        # minimum a summary is not worth the call either.
+        if before_tokens <= max(_compaction_wrapper_floor_tokens(anchor_key, rc), rc.compaction_summary_min_unit_tokens):
             continue
+        jobs.append((unit, anchor_key, unit_messages, before_tokens))
 
+    async def _summarise(unit: _SummarisationUnit, anchor_key: str, unit_messages: list[Message], before_tokens: int) -> tuple[_SummarisationUnit, str, int, Message | None, int]:
+        raw_text = "\n".join(_message_text_for_estimation(member, rc) for member in unit_messages).strip()
+        if not raw_text:
+            return unit, anchor_key, before_tokens, None, 0
         sanitised = _strip_injection_patterns(raw_text)
+        # The summary has to be smaller than what it replaces: give the model a
+        # word budget derived from the unit's size instead of a fixed "1-3 sentences".
+        max_words = max(_SUMMARY_MIN_WORDS, before_tokens // _SUMMARY_TOKENS_PER_WORD)
         prompt = (
             "<turn>\n"
             f"{sanitised}\n"
             "</turn>\n\n"
-            "Summarise the above turn in 1-3 sentences. Preserve tool names, key user "
+            f"Summarise the above turn in at most {max_words} words. Preserve tool names, key user "
             "intent, file paths touched, and every exact identifier that appears "
             "(paths, ids, ports, URLs, numbers, error codes) verbatim; never round, "
             "guess or substitute a plausible value, and say so if a result was missing. "
@@ -1080,7 +1104,6 @@ async def run_tier2_summarisation(
             "UNKNOWN, not that it did not happen or that it succeeded: state unknowns as unknown. "
             "Output STRICT JSON only."
         )
-
         request = LLMRequest(
             model=model_name,
             messages=[Message(role=MessageRole.user, content_blocks=[TextBlock(text=prompt)])],
@@ -1089,95 +1112,57 @@ async def run_tier2_summarisation(
             temperature=rc.compaction_summary_temperature,
             observability=observability,
         )
-
         try:
-            response = await compaction_llm.complete_structured(
-                request, build_summary_schema(rc)
-            )
+            response = await compaction_llm.complete_structured(request, build_summary_schema(rc))
         except Exception as exc:
             _logger.warning(
                 "tier2 summariser failed for unit anchor_idx=%s; skipping (err=%s)",
                 unit.anchor_idx,
                 exc,
             )
-            continue
-
-        # Reconstruct the summary text from the structured response.
-        # ``complete_structured`` is invoked with :func:`build_summary_schema`
-        # (json_object), and the openai-compat provider's
-        # ``_structured_response_from_body`` returns the model's RAW content
-        # without parsing it. ``response.message.text`` therefore carries the
-        # full JSON envelope — ``{"summary": "..."}``. Detect it by the leading
-        # ``{`` (the schema is a top-level object), parse it strictly, and read
-        # the ``summary`` string. Any other key is ignored rather than trusted:
-        # ``additionalProperties`` is false, but a provider that does not enforce
-        # the grammar can still return one, and an unread key must never reach
-        # the history the summary replaces. A response that is NOT a JSON object
-        # (a future provider that pre-parses, or the test-only
-        # InMemoryLLMProvider) is taken verbatim as the summary — that path is
-        # exercised by the existing tests.
-        raw = response.message.text
-        if not raw:
-            continue
-        if raw.lstrip().startswith("{"):
-            try:
-                parsed = json.loads(raw)
-            except json.JSONDecodeError as exc:
-                _logger.warning(
-                    "tier2 summary response looked like JSON but failed to parse "
-                    "for unit anchor_idx=%s; skipping (err=%s)",
-                    unit.anchor_idx,
-                    exc,
-                )
-                continue
-            if not isinstance(parsed, dict) or not isinstance(parsed.get("summary"), str):
-                _logger.warning(
-                    "tier2 summary response missing 'summary' string field "
-                    "for unit anchor_idx=%s; skipping",
-                    unit.anchor_idx,
-                )
-                continue
-            summary_text: str = parsed["summary"]
-        else:
-            summary_text = raw
+            return unit, anchor_key, before_tokens, None, 0
+        summary_text = _summary_from_response(response.message.text, unit.anchor_idx)
         if not summary_text:
-            continue
-
+            return unit, anchor_key, before_tokens, None, 0
         wrapped = _wrap_compaction_summary(anchor_key, summary_text)
         after_tokens = estimate_tokens(wrapped, rc)
         # Net-gain guard — a verbose summary can come back at or above the
-        # original even when the unit cleared the empty-wrapper floor. Committing
-        # such a replacement would GROW history while the max(0, ...) freed clamp
-        # masked it (and could tip run_compaction's tokens_after over
-        # tokens_before into a no-progress retry). Discard it: leave the original
-        # turn intact rather than inflate. The turn is NOT marked summarised, so
-        # a later pass may retry it.
+        # original even when the unit cleared the floor. Committing it would GROW
+        # history; leave the original intact (a later pass may retry).
         if after_tokens >= before_tokens:
-            continue
+            _logger.warning(
+                "tier2 summary for unit anchor_idx=%s is not smaller (%s >= %s tokens); kept the original",
+                unit.anchor_idx,
+                after_tokens,
+                before_tokens,
+            )
+            return unit, anchor_key, before_tokens, None, 0
         # vLLM-400 fix: the summary replaces an aged turn IN THE MIDDLE of
-        # history. vLLM rejects any ``system`` message past index 0
-        # ("System message must be at the beginning."), so the summary turn is
-        # USER-role. It stays recognisable as a summary via the durable
-        # ``COMPACTION_SUMMARY_METADATA_KEY`` flag + the ``<compacted-turn>``
-        # wrapper (``_is_compaction_summary``); legacy persisted system-role
-        # summaries remain recognised too. (The request-assembly boundary in
-        # ``query._normalize_outbound_system_messages`` is the defense-in-depth
-        # backstop for those legacy snapshots.)
-        replacements[unit.anchor_idx] = Message(
+        # history. vLLM rejects any ``system`` message past index 0, so the
+        # summary turn is USER-role, recognisable via the durable metadata flag
+        # + the ``<compacted-turn>`` wrapper (``_is_compaction_summary``).
+        replacement = Message(
             role=MessageRole.user,
             content_blocks=[TextBlock(text=wrapped)],
             metadata={COMPACTION_SUMMARY_METADATA_KEY: True},
         )
-        # Every non-anchor member of the unit (the matching tool results) is
-        # removed so the dropped ToolUseBlock leaves no orphaned tool_result.
-        indices_to_drop.update(member for member in unit.indices if member != unit.anchor_idx)
+        return unit, anchor_key, before_tokens, replacement, after_tokens
 
-        state.summarised_turn_ids.add(anchor_key)
-        summarised += 1
-        # after_tokens < before_tokens is guaranteed by the net-gain guard above,
-        # so the delta is always a real positive freeing (the clamp is now only a
-        # defensive floor).
-        freed += max(0, before_tokens - after_tokens)
+    batch = max(1, rc.compaction_summariser_parallelism)
+    for offset in range(0, len(jobs), batch):
+        if free_target_tokens is not None and freed >= free_target_tokens:
+            break
+        results = await asyncio.gather(*(_summarise(*job) for job in jobs[offset : offset + batch]))
+        for unit, anchor_key, before_tokens, replacement, after_tokens in results:
+            if replacement is None:
+                continue
+            replacements[unit.anchor_idx] = replacement
+            # Every non-anchor member of the unit (the matching tool results) is
+            # removed so the dropped ToolUseBlock leaves no orphaned tool_result.
+            indices_to_drop.update(member for member in unit.indices if member != unit.anchor_idx)
+            state.summarised_turn_ids.add(anchor_key)
+            summarised += 1
+            freed += max(0, before_tokens - after_tokens)
 
     if replacements or indices_to_drop:
         rebuilt: list[Message] = []
@@ -1286,9 +1271,8 @@ async def run_tier3_fold(
     folded_spans = 0
     folded_messages = 0
     freed = 0
-    for start, end in spans:
-        if free_target_tokens is not None and freed >= free_target_tokens:
-            break
+
+    async def _fold_one(start: int, end: int) -> tuple[int, int, Message | None, int, int, int]:
         members = history[start:end]
         before_tokens = sum(estimate_message_tokens(m, rc) for m in members)
         items = "\n\n".join(_strip_injection_patterns(_fold_item_text(m)) for m in members)
@@ -1319,36 +1303,37 @@ async def run_tier3_fold(
             response = await compaction_llm.complete_structured(request, build_summary_schema(rc))
         except Exception as exc:
             _logger.warning("tier3 fold failed for span %s-%s; skipping (err=%s)", start, end, exc)
-            continue
-        raw = response.message.text
-        if not raw:
-            continue
-        summary_text = raw
-        if raw.lstrip().startswith("{"):
-            try:
-                parsed = json.loads(raw)
-            except json.JSONDecodeError:
-                continue
-            if not isinstance(parsed, dict) or not isinstance(parsed.get("summary"), str):
-                continue
-            summary_text = parsed["summary"]
+            return start, end, None, before_tokens, 0, operator_count
+        summary_text = _summary_from_response(response.message.text, start)
         if not summary_text:
-            continue
+            return start, end, None, before_tokens, 0, operator_count
         anchor_key = "fold-" + hashlib.sha256("|".join(_stable_turn_key(m) for m in members).encode("utf-8")).hexdigest()[:16]
         wrapped = _wrap_compaction_summary(anchor_key, summary_text)
         after_tokens = estimate_tokens(wrapped, rc)
         if after_tokens >= before_tokens:
-            continue
-        replacements[start] = Message(
+            return start, end, None, before_tokens, 0, operator_count
+        state.summarised_turn_ids.add(anchor_key)
+        replacement = Message(
             role=MessageRole.user,
             content_blocks=[TextBlock(text=wrapped)],
             metadata={COMPACTION_SUMMARY_METADATA_KEY: True, COMPACTION_FOLD_METADATA_KEY: {"messages": len(members), "operator_turns": operator_count}},
         )
-        drop.update(range(start + 1, end))
-        state.summarised_turn_ids.add(anchor_key)
-        folded_spans += 1
-        folded_messages += len(members)
-        freed += before_tokens - after_tokens
+        return start, end, replacement, before_tokens, after_tokens, operator_count
+
+    chosen = spans[: rc.compaction_fold_max_spans_per_pass]
+    batch = max(1, rc.compaction_summariser_parallelism)
+    for offset in range(0, len(chosen), batch):
+        if free_target_tokens is not None and freed >= free_target_tokens:
+            break
+        results = await asyncio.gather(*(_fold_one(a, b) for a, b in chosen[offset : offset + batch]))
+        for start, end, replacement, before_tokens, after_tokens, _ in results:
+            if replacement is None:
+                continue
+            replacements[start] = replacement
+            drop.update(range(start + 1, end))
+            folded_spans += 1
+            folded_messages += end - start
+            freed += before_tokens - after_tokens
 
     if replacements:
         rebuilt: list[Message] = []

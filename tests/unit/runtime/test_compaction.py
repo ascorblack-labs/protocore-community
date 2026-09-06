@@ -687,6 +687,7 @@ async def test_tier2_bounded_by_free_target_tokens() -> None:
     rc = RuntimeConstants(
         model_context_window=4_096,
         compaction_keep_recent_turns=1,
+        compaction_summariser_parallelism=1,
         compaction_protect_first_user_turn=False,
     )
     llm = InMemoryLLMProvider()

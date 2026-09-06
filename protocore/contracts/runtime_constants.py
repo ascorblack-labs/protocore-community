@@ -774,6 +774,35 @@ class RuntimeConstants(BaseModel):
             "summarised (kill-switch)."
         ),
     )
+    compaction_summary_min_unit_tokens: int = Field(
+        default=0,
+        ge=0,
+        description=(
+            "Tier-2 does not summarise a unit estimated below this many tokens. "
+            "A summariser writes a sentence or three whatever it is given, so a "
+            "small unit comes back no smaller and the call is wasted; the "
+            "net-gain guard discards such a summary, but only after paying for "
+            "it. 0 keeps the floor at the empty-wrapper size."
+        ),
+    )
+    compaction_summariser_parallelism: int = Field(
+        default=4,
+        ge=1,
+        le=16,
+        description=(
+            "Summariser calls issued at once in one Tier-2 or Tier-3 pass. "
+            "A pass over a long history is otherwise a long chain of "
+            "sequential calls while the run sits in COMPACTING."
+        ),
+    )
+    compaction_fold_max_spans_per_pass: int = Field(
+        default=2,
+        ge=1,
+        description=(
+            "Tier-3 folds at most this many runs per pass; the rest wait for "
+            "the next pass, which keeps one COMPACTING pause short."
+        ),
+    )
     compaction_fold_enabled: bool = Field(
         default=True,
         description=(
