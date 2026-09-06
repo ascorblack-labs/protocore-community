@@ -369,6 +369,15 @@ _WHOLE_HISTORY_BY_DESIGN: dict[str, _Declaration] = {
     "protocore/runtime/context/compaction.py::run_tier2_summarisation": _whole(
         "collapses turns anywhere in the transcript to fit the context window"
     ),
+    "protocore/runtime/context/compaction.py::_fold_spans": _whole(
+        "finds runs of old summaries and operator turns anywhere in the transcript"
+    ),
+    "protocore/runtime/context/compaction.py::run_tier3_fold": _whole(
+        "folds runs of old summaries and operator turns anywhere in the transcript"
+    ),
+    "protocore/runtime/context/manager.py::ContextManager._fold": _whole(
+        "hands the whole transcript to the Tier-3 fold after Tier-2"
+    ),
     # --- building the seed, from messages the caller supplies ---------------
     "protocore/runtime/context/session_memory.py::_serialize_turns": _whole(
         "renders the turns it is handed; it reaches no engine"
