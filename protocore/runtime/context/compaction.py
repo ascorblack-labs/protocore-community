@@ -983,6 +983,17 @@ async def run_tier2_summarisation(
         first_user = _first_user_turn_index(history)
         if first_user is not None:
             protected = frozenset({first_user})
+    # Every operator turn stays verbatim: instructions sent mid-run (steers, follow-ups)
+    # are short, and a summary of an instruction is exactly the fabrication risk that
+    # loses "remove the model-name field" to "the user requested UI changes".
+    protected = protected | frozenset(
+        idx
+        for idx, message in enumerate(history)
+        if message.role is MessageRole.user
+        and not _is_compaction_summary(message)
+        and message.metadata.get(COMPACTION_REFERENCE_METADATA_KEY) is not True
+        and message.metadata.get(SESSION_HISTORY_SEED_METADATA_KEY) is not True
+    )
 
     # Protect executor-seeded prior-run turns from the lossy Tier-2 collapse so
     # a summary never drops the SESSION_HISTORY_SEED tag (which the host
