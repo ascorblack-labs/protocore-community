@@ -42,8 +42,8 @@ def test_build_in_memory_runtime_implements_all_interfaces() -> None:
 
 
 def test_rc_overrides_applied() -> None:
-    runtime = build_in_memory_runtime(rc_overrides={"max_iterations": 100})
-    assert runtime.rc.max_iterations == 100
+    runtime = build_in_memory_runtime(rc_overrides={"max_turns_per_run": 100})
+    assert runtime.rc.max_turns_per_run == 100
 
 
 async def test_llm_provider_scripts_response() -> None:

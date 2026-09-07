@@ -20,12 +20,20 @@ from __future__ import annotations
 import hashlib
 import json
 import re
+import weakref
+from collections import OrderedDict
+from collections.abc import Awaitable, Callable, Sequence
 from dataclasses import dataclass, field
 from typing import Any, Final
 
+from protocore.constants import MAX_TOKEN_ESTIMATE_CACHE_ENTRIES
 from protocore.contracts.blob import IBlobStore
-from protocore.contracts.llm import ILLMProvider, LLMObservabilityContext, LLMRequest
-from protocore.contracts.runtime_constants import RuntimeConstants
+from protocore.contracts.llm import (
+    ILLMProvider,
+    LLMObservabilityContext,
+    LLMRequest,
+)
+from protocore.contracts.runtime_constants import LoopConstants
 from protocore.contracts.types import (
     COMPACTION_REFERENCE_METADATA_KEY,
     COMPACTION_SUMMARY_METADATA_KEY,
@@ -41,6 +49,7 @@ from protocore.contracts.types import (
     ToolUseBlock,
 )
 from protocore.logging_utils import get_logger
+from protocore.runtime.result_eviction import tool_names_by_call_id
 from protocore.runtime.token_counting import estimate_tokens
 from protocore.runtime.wire_format import (
     is_compacted_placeholder,
@@ -63,7 +72,7 @@ _INJECTION_PATTERNS: Final[tuple[re.Pattern[str], ...]] = (
 _INJECTION_REPLACEMENT: Final[str] = "[REDACTED-INJECTION-PATTERN]"
 
 
-def build_summary_schema(rc: RuntimeConstants) -> dict[str, Any]:
+def build_summary_schema(rc: LoopConstants) -> dict[str, Any]:
     """Build the summariser JSON schema with the RC-driven ``maxLength``.
 
     The ``summary.maxLength`` cap is sourced from
@@ -94,7 +103,7 @@ def build_summary_schema(rc: RuntimeConstants) -> dict[str, Any]:
 
 
 class CompactionExhaustedError(RuntimeError):
-    """Compaction failed beyond :attr:`RuntimeConstants.compaction_failed_max_retries`."""
+    """Compaction failed beyond :attr:`LoopConstants.compaction_failed_max_retries`."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -182,7 +191,7 @@ def _block_text_for_estimation(block: ContentBlock) -> str:
     return block.model_dump_json()
 
 
-def _message_text_for_estimation(message: Message, rc: RuntimeConstants) -> str:
+def _message_text_for_estimation(message: Message, rc: LoopConstants) -> str:
     """Return concatenated text content used for token estimation + summarising.
 
  Exhaustive across every content block kind PLUS
@@ -199,21 +208,24 @@ def _message_text_for_estimation(message: Message, rc: RuntimeConstants) -> str:
     return "\n".join(part for part in parts if part)
 
 
-def estimate_message_tokens(message: Message, rc: RuntimeConstants) -> int:
-    """Estimate the token weight of a single :class:`Message` exhaustively.
+def _token_estimate_signature(rc: LoopConstants) -> tuple[float, ...]:
+    """The RC values a per-message estimate depends on, as a cache key part.
 
- The single source of truth for the cheap pre-flight estimate, shared by
- :func:`protocore.runtime.context.manager.estimate_history_tokens` and the
- Tier-2 freed-token accounting below. Every content block contributes:
+    Chars-per-token ratios and the flat image cost are dashboard-tunable and
+    can be applied to a live process, so an estimate remembered under the old
+    values must not be handed back under the new ones.
+    """
+    return (
+        rc.token_count_chars_per_token_latin,
+        rc.token_count_chars_per_token_cyrillic,
+        rc.token_count_chars_per_token_cyrillic_json_escape,
+        rc.token_count_chars_per_token_cjk,
+        rc.token_count_chars_per_token_json_struct,
+        rc.token_count_image_tokens,
+    )
 
- * text-bearing blocks (text / thinking / tool_use / tool_result / unknown)
- via :func:`~protocore.runtime.token_counting.estimate_tokens` on their
- extracted text (tool_use args no longer count as 0);
- * :class:`ImageRefBlock` via the flat
- :attr:`RuntimeConstants.token_count_image_tokens` constant — image blocks
- carry only a blob ref, so a size-derived estimate is impossible ;
- * :attr:`Message.reasoning_content` via ``estimate_tokens`` .
- """
+
+def _estimate_message_tokens_uncached(message: Message, rc: LoopConstants) -> int:
     total = 0
     for block in message.content_blocks:
         if isinstance(block, ImageRefBlock):
@@ -223,6 +235,154 @@ def estimate_message_tokens(message: Message, rc: RuntimeConstants) -> int:
     if message.reasoning_content:
         total += estimate_tokens(message.reasoning_content, rc)
     return total
+
+
+class _CachedEstimate:
+    """One remembered estimate, tied to the message object that produced it."""
+
+    __slots__ = ("message", "signature", "tokens")
+
+    def __init__(
+        self,
+        message: Message,
+        signature: tuple[float, ...],
+        tokens: int,
+    ) -> None:
+        self.message: Callable[[], Message | None] = weakref.ref(message)
+        self.signature = signature
+        self.tokens = tokens
+
+
+class TokenEstimator:
+    """Per-message token estimates, remembered for as long as the message lives.
+
+    Every budget that sizes a history — compaction, session memory, the run
+    accounting around a turn — re-estimates the whole sequence from scratch,
+    and a history is re-estimated several times per turn. The estimate walks
+    each message character by character, so a long history costs hundreds of
+    milliseconds of uninterruptible work on the event loop every time, and the
+    second walk over an unchanged message produces exactly the first answer.
+
+    Caching by object is what makes this safe, and it rests on one property of
+    :class:`Message`: its content is held in immutable sequences, so a message
+    that is still the same object still has the same content. Frozen alone
+    would not be enough — it stops the field being rebound, not a list behind
+    it being appended to — which is why the blocks are held as a tuple rather
+    than merely promised not to change. A compaction that rewrites history
+    produces new objects, which simply are not in the cache. The entry holds a
+    weak reference and is checked against the message it was made for, so a
+    recycled address cannot return someone else's number, and an estimator
+    kept for a whole process never keeps a history alive. The tunable parts of
+    :class:`LoopConstants` are part of the key, because they can change
+    under a running process.
+
+    An estimator is not shared between runs by the components that own one:
+    identity keys make a shared instance harmless, but a private one makes the
+    isolation structural rather than incidental.
+
+    Identity keys also settle what "shared" costs. Two runs cannot read each
+    other's content through a shared estimator — a key is one run's message
+    object and nothing else's — so what they contend for is capacity, not
+    confidentiality: in a process running several runs at once, one long
+    history evicts another's entries and both pay the full walk again. That is
+    why a component holding a history of its own holds an estimator of its
+    own.
+    """
+
+    def __init__(
+        self,
+        *,
+        max_entries: int = MAX_TOKEN_ESTIMATE_CACHE_ENTRIES,
+    ) -> None:
+        self._max_entries = max_entries
+        self._entries: OrderedDict[int, _CachedEstimate] = OrderedDict()
+
+    def estimate_message(self, message: Message, rc: LoopConstants) -> int:
+        """Token weight of one message, from the cache when it is still valid."""
+        return self._estimate(message, rc, _token_estimate_signature(rc))
+
+    def estimate_history(
+        self,
+        history: Sequence[Message],
+        rc: LoopConstants,
+    ) -> int:
+        """Token weight of a sequence, paying only for messages not yet seen."""
+        signature = _token_estimate_signature(rc)
+        return sum(self._estimate(message, rc, signature) for message in history)
+
+    def clear(self) -> None:
+        """Forget every remembered estimate."""
+        self._entries.clear()
+
+    def __len__(self) -> int:
+        """How many estimates are currently remembered."""
+        return len(self._entries)
+
+    def _estimate(
+        self,
+        message: Message,
+        rc: LoopConstants,
+        signature: tuple[float, ...],
+    ) -> int:
+        key = id(message)
+        entry = self._entries.get(key)
+        if (
+            entry is not None
+            and entry.signature == signature
+            and entry.message() is message
+        ):
+            self._entries.move_to_end(key)
+            return entry.tokens
+        tokens = _estimate_message_tokens_uncached(message, rc)
+        self._entries[key] = _CachedEstimate(message, signature, tokens)
+        self._entries.move_to_end(key)
+        while len(self._entries) > self._max_entries:
+            self._entries.popitem(last=False)
+        return tokens
+
+
+_shared_estimator: Final[TokenEstimator] = TokenEstimator()
+
+
+def estimate_message_tokens(message: Message, rc: LoopConstants) -> int:
+    """Estimate the token weight of a single :class:`Message` exhaustively.
+
+ The single source of truth for the cheap pre-flight estimate, shared by
+ :func:`estimate_history_tokens` and the Tier-2 freed-token accounting
+ below. Every content block contributes:
+
+ * text-bearing blocks (text / thinking / tool_use / tool_result / unknown)
+ via :func:`~protocore.runtime.token_counting.estimate_tokens` on their
+ extracted text (tool_use args no longer count as 0);
+ * :class:`ImageRefBlock` via the flat
+ :attr:`LoopConstants.token_count_image_tokens` constant — image blocks
+ carry only a blob ref, so a size-derived estimate is impossible ;
+ * :attr:`Message.reasoning_content` via ``estimate_tokens`` .
+
+    Answers from a process-wide :class:`TokenEstimator`, for callers that hold
+    no history of their own to keep one for. What the runs sharing it share is
+    capacity and nothing else: a key is one message object, so no run can read
+    another's estimate, but a bounded cache split between several concurrent
+    runs evicts entries a single run would have kept. A caller that sizes one
+    run's history repeatedly — the loop, a host's per-run accounting — uses
+    that run's :attr:`ContextManager.token_estimator` instead and does not
+    compete for these slots.
+    """
+    return _shared_estimator.estimate_message(message, rc)
+
+
+def estimate_history_tokens(
+    history: Sequence[Message],
+    rc: LoopConstants,
+) -> int:
+    """Sum :func:`estimate_message_tokens` over ``history``.
+
+    The cheap pre-flight counter used before :meth:`ILLMProvider.count_tokens`
+    (the authoritative endpoint) and by every budget that sizes a message
+    sequence — compaction, session memory, the host's run accounting — so one
+    estimate is shared by all of them.
+    """
+    return _shared_estimator.estimate_history(history, rc)
 
 
 def _content_is_already_compacted(text: str) -> bool:
@@ -398,29 +558,11 @@ def _content_preview(text: str, max_chars: int) -> str:
     return f"{flat[:head_len]}…{flat[-tail_len:]}"
 
 
-def _tool_name_by_call_id(history: list[Message]) -> dict[str, str]:
-    """Map each ``tool_call_id`` to its originating ``ToolUseBlock.name``.
-
-    Used by Tier-1 to enrich a compacted tool-result
-    placeholder with the name of the tool that produced it, so the model
-    knows what was shed and can re-fetch it. A result whose originator is no
-    longer in history (already compacted/summarised away) maps to ``""``.
-    """
-    names: dict[str, str] = {}
-    for message in history:
-        if message.role is not MessageRole.assistant:
-            continue
-        for block in message.content_blocks:
-            if isinstance(block, ToolUseBlock) and block.tool_call_id not in names:
-                names[block.tool_call_id] = block.name
-    return names
-
-
 async def run_tier1_truncation(
     history: list[Message],
     blob_store: IBlobStore,
     tenant_id: str,
-    rc: RuntimeConstants,
+    rc: LoopConstants,
     truncation_threshold_tokens: int,
     *,
     keep_recent_turns: int | None = None,
@@ -457,7 +599,7 @@ async def run_tier1_truncation(
         rc: token-counting + RC fields.
         truncation_threshold_tokens: tool_result tokens above this get blobbed.
         keep_recent_turns: trailing turns to skip (anchor caching). ``None``
-            defaults to :attr:`RuntimeConstants.compaction_keep_recent_turns`.
+            defaults to :attr:`LoopConstants.compaction_keep_recent_turns`.
         protect_tail_from_index: When set, NO message at or after this index is
             eligible — protects the current iteration's just-executed
             tool-result batch (any batch size) on top of ``keep_recent_turns``.
@@ -474,7 +616,14 @@ async def run_tier1_truncation(
     eligible_upper = _effective_eligible_upper(history, keep, protect_tail_from_index)
 
     preview_cap = rc.compaction_placeholder_preview_chars
-    tool_names = _tool_name_by_call_id(history)
+
+    # Hoisted out of the eviction loop. Naming the tool behind a shed result
+    # is a per-block question, but answering it per block walks the whole
+    # transcript per block — quadratic exactly on the large histories
+    # compaction exists for. The pass below only rewrites tool RESULT blocks
+    # and reasoning_content, so no tool_use block moves under this map while
+    # the loop runs.
+    tool_names = tool_names_by_call_id(history)
 
     tokens_freed = 0
     refs_created: list[str] = []
@@ -571,22 +720,46 @@ async def run_tier1_truncation(
                 new_blocks.append(block)
                 continue
 
-            content_bytes = block.content.encode("utf-8")
-            sha256 = hashlib.sha256(content_bytes).hexdigest()
-            blob_md = await blob_store.put(
-                tenant_id=tenant_id,
-                content=content_bytes,
-                content_type="text/plain; charset=utf-8",
-                metadata={
-                    "tool_call_id": block.tool_call_id,
-                    "label": "tool_result",
-                    "tier": "tier1",
-                },
-            )
+            # What gets stored is the CANONICAL value, not the text in front
+            # of the model. A tool that handed back a short view of a long
+            # result left the long result on the block; blobbing the view
+            # instead would put a truncated copy behind a reference the
+            # placeholder calls canonical.
+            canonical_text = block.canonical_content or block.content
+            # The canonical value is stored ONCE. A block that already names
+            # where its value lives — a tool that stored its own output, a
+            # result an earlier pass already shed — is not stored again: the
+            # reference it carries is the canonical value's address, and
+            # writing a second copy under a second address would leave two
+            # answers to "what did this call return" with nothing to say which
+            # is the value and which the projection.
+            existing_ref = block.canonical_ref
+            if existing_ref is not None:
+                canonical_ref = existing_ref
+                # The bytes behind that reference were written elsewhere and
+                # this pass has not seen them. A digest of what is on the block
+                # would describe a different string, so the placeholder says
+                # nothing about the digest rather than something false.
+                sha256 = ""
+            else:
+                content_bytes = canonical_text.encode("utf-8")
+                sha256 = hashlib.sha256(content_bytes).hexdigest()
+                blob_md = await blob_store.put(
+                    tenant_id=tenant_id,
+                    content=content_bytes,
+                    content_type="text/plain; charset=utf-8",
+                    metadata={
+                        "tool_call_id": block.tool_call_id,
+                        "label": "tool_result",
+                        "tier": "tier1",
+                    },
+                )
+                canonical_ref = blob_md.ref
+                refs_created.append(canonical_ref)
 
             placeholder = render_compacted_placeholder(
                 CompactionSourceRef(
-                    blob_ref=blob_md.ref,
+                    blob_ref=canonical_ref,
                     sha256=sha256,
                     original_tokens=original_tokens,
                     label="tool_result",
@@ -596,16 +769,21 @@ async def run_tier1_truncation(
                 "SNAPSHOT",
             )
 
+            # What is shed is the PROJECTION. ``canonical_ref`` survives on
+            # the block, and so does ``path``: a result whose text is now a
+            # placeholder still describes the file it described, and a later
+            # write must still be able to say it is out of date.
             new_blocks.append(
                 ToolResultBlock(
                     tool_call_id=block.tool_call_id,
                     content=placeholder,
                     is_error=block.is_error,
-                    metadata={**block.metadata, "compacted": True, "blob_ref": blob_md.ref},
+                    metadata={**block.metadata, "compacted": True, "blob_ref": canonical_ref},
+                    canonical_ref=canonical_ref,
+                    path=block.path,
                 )
             )
             msg_modified = True
-            refs_created.append(blob_md.ref)
             tokens_freed += original_tokens - estimate_tokens(placeholder, rc)
 
         if msg_modified:
@@ -887,7 +1065,7 @@ def _wrap_compaction_summary(anchor_key: str, summary_text: str) -> str:
     return f"<compacted-turn id='{anchor_key}'>{summary_text}</compacted-turn>"
 
 
-def _compaction_wrapper_floor_tokens(anchor_key: str, rc: RuntimeConstants) -> int:
+def _compaction_wrapper_floor_tokens(anchor_key: str, rc: LoopConstants) -> int:
     """Estimated token weight of an EMPTY ``<compacted-turn>`` wrapper.
 
     A unit can only shrink under Tier-2 if its current token estimate is
@@ -905,16 +1083,24 @@ def _compaction_wrapper_floor_tokens(anchor_key: str, rc: RuntimeConstants) -> i
     return estimate_tokens(_wrap_compaction_summary(anchor_key, ""), rc)
 
 
+#: Called with every request the summariser is about to make, before it is
+#: made. The turn's own provider calls are recorded this way; a compaction
+#: rewrites the transcript every later request is built from, so leaving its
+#: calls unrecorded makes a recording unreplayable from the first compaction on.
+RequestRecorder = Callable[[LLMRequest], Awaitable[Any]]
+
+
 async def run_tier2_summarisation(
     history: list[Message],
     compaction_llm: ILLMProvider,
     state: CompactionState,
-    rc: RuntimeConstants,
+    rc: LoopConstants,
     *,
     model_name: str,
     observability: LLMObservabilityContext | None = None,
     protect_tail_from_index: int | None = None,
     free_target_tokens: int | None = None,
+    record_request: RequestRecorder | None = None,
 ) -> Tier2Result:
     """Summarise old turns via the compaction LLM.
 
@@ -944,6 +1130,12 @@ async def run_tier2_summarisation(
 
  The original task user turn is protected from summarisation when
  ``rc.compaction_protect_first_user_turn`` is set.
+
+ ``record_request`` is called with each summariser request before it is made,
+ which is what puts the summariser on the same footing as the turn's own
+ provider calls: a compaction is precisely the event that rewrites the
+ transcript every later request is built from, so a recording that skipped it
+ could not be replayed past the first one.
 
  When ``protect_tail_from_index`` is set (the per-iteration gate), the
  current iteration's just-executed tool batch (assistant ``tool_use`` turn +
@@ -1005,6 +1197,11 @@ async def run_tier2_summarisation(
     if reference_indices:
         protected = protected | reference_indices
 
+    # Local import — the shared request builder lives beside the action
+    # stream, which imports this module, so the dependency is taken at call
+    # time rather than at module import.
+    from protocore.runtime.query import build_llm_request
+
     units = _build_summarisation_units(history, eligible_upper, protected_indices=protected)
 
     summarised = 0
@@ -1055,7 +1252,7 @@ async def run_tier2_summarisation(
             "key user intent, and file paths touched. Output STRICT JSON only."
         )
 
-        request = LLMRequest(
+        request = build_llm_request(
             model=model_name,
             messages=[Message(role=MessageRole.user, content_blocks=[TextBlock(text=prompt)])],
             tools=[],
@@ -1063,6 +1260,9 @@ async def run_tier2_summarisation(
             temperature=rc.compaction_summary_temperature,
             observability=observability,
         )
+
+        if record_request is not None:
+            await record_request(request)
 
         try:
             response = await compaction_llm.complete_structured(
@@ -1170,6 +1370,7 @@ __all__ = [
     "CompactionState",
     "Tier1Result",
     "Tier2Result",
+    "TokenEstimator",
     "build_summary_schema",
     "run_tier1_truncation",
     "run_tier2_summarisation",

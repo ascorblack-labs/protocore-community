@@ -22,7 +22,7 @@ from itertools import pairwise
 
 import pytest
 
-from protocore.contracts.runtime_constants import RuntimeConstants
+from protocore.contracts.runtime_constants import LoopConstants
 from protocore.contracts.types import (
     COMPACTION_REFERENCE_METADATA_KEY,
     COMPACTION_SUMMARY_METADATA_KEY,
@@ -40,10 +40,10 @@ from protocore.runtime.context.compaction import (
     _build_summarisation_units,
     _is_compaction_summary,
     current_tool_batch_protect_index,
+    estimate_history_tokens,
     run_tier1_truncation,
     run_tier2_summarisation,
 )
-from protocore.runtime.context.manager import estimate_history_tokens
 from protocore.runtime.events import EventType, TurnEvent
 from protocore.runtime.loop_state import LoopState
 from protocore.runtime.wire_format import (
@@ -70,7 +70,7 @@ PINNED_ENTRIES: dict[str, tuple[str, ...]] = {
 # emergency ratio is wired into derive_budgets
 # ---------------------------------------------------------------------------
 def test_emergency_tokens_derived_and_above_trigger() -> None:
-    rc = RuntimeConstants(model_context_window=49_152)
+    rc = LoopConstants(model_context_window=49_152)
     budgets = derive_budgets(rc)
     assert budgets.compaction_emergency_tokens == int(
         rc.model_context_window * rc.compaction_emergency_ratio
@@ -121,7 +121,7 @@ def test_legacy_five_field_placeholder_still_parses() -> None:
 
 @pytest.mark.asyncio
 async def test_tier1_placeholder_enriched_from_originating_tool() -> None:
-    rc = RuntimeConstants(model_context_window=4_096)
+    rc = LoopConstants(model_context_window=4_096)
     blobs = InMemoryBlobStore()
     big = "LINE\n" * 4000
     history = [
@@ -161,7 +161,7 @@ async def test_tier1_placeholder_enriched_from_originating_tool() -> None:
 # ---------------------------------------------------------------------------
 @pytest.mark.asyncio
 async def test_sheds_aged_reasoning_content_keeps_recent() -> None:
-    rc = RuntimeConstants(model_context_window=4_096)
+    rc = LoopConstants(model_context_window=4_096)
     blobs = InMemoryBlobStore()
     aged_reasoning = "deep thinking " * 200
     recent_reasoning = "recent thinking " * 200
@@ -195,7 +195,7 @@ async def test_sheds_aged_reasoning_content_keeps_recent() -> None:
 
 @pytest.mark.asyncio
 async def test_reasoning_shed_kill_switch() -> None:
-    rc = RuntimeConstants(
+    rc = LoopConstants(
         model_context_window=4_096, compaction_shed_reasoning_enabled=False
     )
     blobs = InMemoryBlobStore()
@@ -222,7 +222,7 @@ async def test_reasoning_shed_kill_switch() -> None:
 
 @pytest.mark.asyncio
 async def test_bounds_over_budget_reference_block() -> None:
-    rc = RuntimeConstants(model_context_window=4_096)
+    rc = LoopConstants(model_context_window=4_096)
     blobs = InMemoryBlobStore()
     big_bootstrap = "<environment_context>\n" + ("CONFIG LINE\n" * 4000)
     history = [
@@ -254,7 +254,7 @@ async def test_bounds_over_budget_reference_block() -> None:
 
 @pytest.mark.asyncio
 async def test_untagged_user_turn_never_shed_as_reference() -> None:
-    rc = RuntimeConstants(model_context_window=4_096)
+    rc = LoopConstants(model_context_window=4_096)
     blobs = InMemoryBlobStore()
     big_task = "PLEASE DO THIS LONG THING\n" * 4000  # large but NOT a reference block
     history = [
@@ -288,7 +288,7 @@ async def test_sheds_summary_seed_block_via_reference_path() -> None:
         build_seed,
     )
 
-    rc = RuntimeConstants(model_context_window=4_096)
+    rc = LoopConstants(model_context_window=4_096)
     blobs = InMemoryBlobStore()
     mem = SessionMemory(
         running_summary="DECISION: port 8080. " + ("carried fact line. " * 4000),
@@ -352,7 +352,7 @@ def _summary_history() -> list[Message]:
 async def test_resume_does_not_resummarise() -> None:
     from protocore.tests_support.adapters import InMemoryLLMProvider
 
-    rc = RuntimeConstants(model_context_window=4_096, compaction_keep_recent_turns=1)
+    rc = LoopConstants(model_context_window=4_096, compaction_keep_recent_turns=1)
 
     llm1 = InMemoryLLMProvider()
     llm1.queue_response(text="SUMMARY-1")
@@ -398,7 +398,7 @@ async def test_resume_does_not_resummarise() -> None:
 async def test_existing_summary_anchor_skipped() -> None:
     from protocore.tests_support.adapters import InMemoryLLMProvider
 
-    rc = RuntimeConstants(model_context_window=4_096, compaction_keep_recent_turns=1)
+    rc = LoopConstants(model_context_window=4_096, compaction_keep_recent_turns=1)
     # A history whose aged turn is ALREADY a compaction summary.
     history = [
         Message(role=MessageRole.user, content_blocks=[TextBlock(text="task")]),
@@ -467,7 +467,7 @@ async def test_duplicate_tool_call_turns_each_summarised() -> None:
     # keep_recent=2 protects the two trailing user turns; the first user turn
     # (the task) is protected by compaction_protect_first_user_turn. That leaves
     # BOTH A/R units (indices {1,2} and {3,4}) eligible.
-    rc = RuntimeConstants(model_context_window=4_096, compaction_keep_recent_turns=2)
+    rc = LoopConstants(model_context_window=4_096, compaction_keep_recent_turns=2)
     history = _spiral_history()
     llm = InMemoryLLMProvider()
     llm.queue_response(text="SUMMARY-1")
@@ -504,7 +504,7 @@ async def test_duplicate_tool_call_turns_each_summarised() -> None:
 async def test_first_user_task_protected_from_summarisation() -> None:
     from protocore.tests_support.adapters import InMemoryLLMProvider
 
-    rc = RuntimeConstants(model_context_window=4_096, compaction_keep_recent_turns=1)
+    rc = LoopConstants(model_context_window=4_096, compaction_keep_recent_turns=1)
     history = [
         Message(role=MessageRole.user, content_blocks=[TextBlock(text="ORIGINAL TASK " * 20)]),
         Message(role=MessageRole.user, content_blocks=[TextBlock(text="recent")]),
@@ -564,7 +564,7 @@ async def test_seeded_turns_protected_from_tier2_summary() -> None:
     """
     from protocore.tests_support.adapters import InMemoryLLMProvider
 
-    rc = RuntimeConstants(model_context_window=4_096, compaction_keep_recent_turns=1)
+    rc = LoopConstants(model_context_window=4_096, compaction_keep_recent_turns=1)
     history = [
         Message(
             role=MessageRole.user,
@@ -599,7 +599,7 @@ async def test_tier1_shed_preserves_seed_tag_on_placeholder() -> None:
     the tag, the seeded turn would be re-persisted under the new ``run_id``
     (exponential ``session_messages`` growth) — this test fails loudly first.
     """
-    rc = RuntimeConstants(model_context_window=4_096)
+    rc = LoopConstants(model_context_window=4_096)
     blobs = InMemoryBlobStore()
     big = "SEED RESULT LINE\n" * 4000
     history = [
@@ -658,7 +658,7 @@ async def test_reference_block_protected_from_tier2_summary() -> None:
     """
     from protocore.tests_support.adapters import InMemoryLLMProvider
 
-    rc = RuntimeConstants(model_context_window=4_096, compaction_keep_recent_turns=1)
+    rc = LoopConstants(model_context_window=4_096, compaction_keep_recent_turns=1)
     history = [
         Message(
             role=MessageRole.user,
@@ -695,7 +695,7 @@ async def test_blobbed_reference_placeholder_not_summarised_by_tier2() -> None:
     """
     from protocore.tests_support.adapters import InMemoryLLMProvider
 
-    rc = RuntimeConstants(model_context_window=4_096, compaction_keep_recent_turns=1)
+    rc = LoopConstants(model_context_window=4_096, compaction_keep_recent_turns=1)
     blobs = InMemoryBlobStore()
     big_ref = "<memory-context>\n" + "MEMORY LINE\n" * 4000 + "</memory-context>"
     history = [
@@ -744,7 +744,7 @@ async def test_blobbed_reference_placeholder_not_summarised_by_tier2() -> None:
 # ---------------------------------------------------------------------------
 def _prompt_estimate(req) -> int:
     """Sum estimated tokens across the messages on an LLMRequest."""
-    rc = RuntimeConstants()
+    rc = LoopConstants()
     return estimate_history_tokens(list(req.messages), rc)
 
 
@@ -757,7 +757,7 @@ async def _drive_long_tool_chain(
     window: int = 4_096,
 ):
     # Small window so big tool outputs cross the trigger within the run.
-    rc = RuntimeConstants(
+    rc = LoopConstants(
         model_context_window=window,
         compaction_per_iteration_enabled=per_iteration_enabled,
         # Keep the test deterministic: only Tier-1 (no summariser LLM).
@@ -876,7 +876,7 @@ async def test_real_provider_prompt_size_triggers_compaction_when_estimate_low(
     estimate is far below trigger — the ONLY signal above trigger is the
     provider-reported ``input_tokens``. Compaction must still fire.
     """
-    rc = RuntimeConstants(
+    rc = LoopConstants(
         model_context_window=4_096,
         compaction_per_iteration_enabled=True,
         # Protect the whole (tiny) history from Tier-2 so no summariser LLM
@@ -978,7 +978,7 @@ async def test_tier1_protects_current_parallel_batch() -> None:
     the per-iteration Tier-1 gate, even though they fall outside the keep
     window. The aged prior result (genuinely old) IS still compacted, proving
     the gate is otherwise active."""
-    rc = RuntimeConstants(model_context_window=4_096, compaction_keep_recent_turns=4)
+    rc = LoopConstants(model_context_window=4_096, compaction_keep_recent_turns=4)
     blobs = InMemoryBlobStore()
     fanout = 6  # > keep_recent_turns (4): the 5th/6th-from-last are outside it
     history = _large_parallel_batch_history(fanout=fanout, window=4_096)
@@ -1026,7 +1026,7 @@ async def test_without_protection_current_batch_would_be_compacted() -> None:
     pre-fix behaviour), the keep window alone leaves the >keep oldest results
     of the current batch eligible — they get compacted. This is exactly the
     context-loss the in-iteration protection prevents."""
-    rc = RuntimeConstants(model_context_window=4_096, compaction_keep_recent_turns=4)
+    rc = LoopConstants(model_context_window=4_096, compaction_keep_recent_turns=4)
     blobs = InMemoryBlobStore()
     fanout = 6
     history = _large_parallel_batch_history(fanout=fanout, window=4_096)
@@ -1060,7 +1060,7 @@ async def test_tier2_protects_current_parallel_batch() -> None:
     summarised away before consumption."""
     from protocore.tests_support.adapters import InMemoryLLMProvider
 
-    rc = RuntimeConstants(model_context_window=4_096, compaction_keep_recent_turns=4)
+    rc = LoopConstants(model_context_window=4_096, compaction_keep_recent_turns=4)
     fanout = 6
     history = _large_parallel_batch_history(fanout=fanout, window=4_096)
     protect_idx = current_tool_batch_protect_index(history)
@@ -1130,7 +1130,7 @@ async def test_tier2_summary_replacement_is_user_role_with_flag() -> None:
     """
     from protocore.tests_support.adapters import InMemoryLLMProvider
 
-    rc = RuntimeConstants(model_context_window=4_096, compaction_keep_recent_turns=1)
+    rc = LoopConstants(model_context_window=4_096, compaction_keep_recent_turns=1)
     llm = InMemoryLLMProvider()
     llm.queue_response(text="User asked X; assistant did Y.")
     history = [

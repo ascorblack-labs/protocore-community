@@ -6,9 +6,7 @@ from collections.abc import AsyncIterator
 
 import pytest
 
-from protocore.contracts.llm import ProviderDelta, ProviderDeltaKind
-from protocore.contracts.types import BlockVisibility, Message, MessageRole, StopReason, TextBlock
-from protocore.contracts.verification import (
+from protocore.contracts.evidence import (
     CandidateBundle,
     CandidateReleasedProjection,
     CitationSpan,
@@ -29,9 +27,11 @@ from protocore.contracts.verification import (
     VerificationSeverity,
     VerificationState,
 )
+from protocore.contracts.llm import ProviderDelta, ProviderDeltaKind
+from protocore.contracts.types import BlockVisibility, Message, MessageRole, StopReason, TextBlock
 from protocore.runtime.candidate_delivery import CandidateDeliveryGate
 from protocore.runtime.events import EventType, TurnEvent
-from protocore.runtime.query import query
+from protocore.runtime.query import _query as query
 
 
 def _interleaved_tool_then_text_stream(request: object) -> AsyncIterator[ProviderDelta]:

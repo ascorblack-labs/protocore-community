@@ -22,7 +22,7 @@ from __future__ import annotations
 
 import pytest
 
-from protocore.contracts.runtime_constants import RuntimeConstants
+from protocore.contracts.runtime_constants import LoopConstants
 from protocore.contracts.tool_registry import ToolVisibilityPolicy
 from protocore.contracts.types import Message, MessageRole, TextBlock
 from protocore.runtime.events.types import EventType
@@ -39,7 +39,7 @@ from protocore.tests_support.adapters import (
 
 def _build_engine(
     *,
-    rc: RuntimeConstants | None = None,
+    rc: LoopConstants | None = None,
     run_mode: str = "direct",
     thinking_enabled: bool = False,
     reasoning_effort: str = "low",
@@ -51,7 +51,7 @@ def _build_engine(
             tenant_id="tenant-test",
             session_id="sess-test",
             model_name="qwen3.6-35b-a3b",
-            rc=rc or RuntimeConstants(model_context_window=4_096),
+            rc=rc or LoopConstants(model_context_window=4_096),
             run_mode=run_mode,
             thinking_enabled=thinking_enabled,
             reasoning_effort=reasoning_effort,
@@ -192,16 +192,13 @@ def test_event_type_has_reasoning_step() -> None:
 
 def test_runtime_constants_carry_run_mode_defaults() -> None:
     """§A.1 — per-tenant run-mode defaults are RC fields (dashboard-tunable)."""
-    rc = RuntimeConstants(model_context_window=4_096)
-    assert rc.agent_loop_default_mode == "direct"
-    assert rc.agent_thinking_default is False
-    assert rc.agent_reasoning_effort == "low"
+    rc = LoopConstants(model_context_window=4_096)
     assert rc.agent_deep_plan_include_summary is False
 
 
 def test_runtime_constants_reject_bad_default_mode() -> None:
     with pytest.raises(ValueError):
-        RuntimeConstants(model_context_window=4_096, agent_loop_default_mode="turbo")
+        LoopConstants(model_context_window=4_096, agent_loop_default_mode="turbo")
 
 
 # ---------------------------------------------------------------------------

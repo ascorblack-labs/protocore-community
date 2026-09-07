@@ -67,6 +67,17 @@ BUNDLED_TEMPLATE_DIR: Final[Path] = Path(
 # Canonical name (used by callers + override DB rows) → bundled file name.
 # Names are stable; file extensions may evolve (``.j2`` is the v2 choice;
 # v1 used ``.jinja2``).
+#
+# Two groups, one registry. The first five are the *standing* prompts a host
+# assembles a request from — the system prompt, the planner step, the contract
+# handed to a delegated run, the finalization block, the environment manifest.
+# The rest are the short texts the loop itself injects into the conversation
+# mid-run: a nudge towards the terminal tool, a recovery instruction after a
+# truncated tool call, the placeholder that stands in for a tool result the
+# run never received. They were configuration fields once, which meant an
+# operator who wanted to say any of it in a third language had nowhere to put
+# the translation and no template engine to reach for. They are prompts; they
+# belong where the prompts are.
 BUNDLED_TEMPLATES: Final[Mapping[str, str]] = MappingProxyType(
     {
         "leader_system": "leader_system.j2",
@@ -74,6 +85,15 @@ BUNDLED_TEMPLATES: Final[Mapping[str, str]] = MappingProxyType(
         "subagent_contract": "subagent_contract.j2",
         "finalization": "finalization.j2",
         "environment_manifest": "environment_manifest.j2",
+        "terminal_tool_nudge": "terminal_tool_nudge.j2",
+        "terminal_tool_nudge_write_first": "terminal_tool_nudge_write_first.j2",
+        "finalize_prose_gate_repair": "finalize_prose_gate_repair.j2",
+        "tool_call_truncation_recovery_en": "tool_call_truncation_recovery_en.j2",
+        "tool_call_truncation_recovery_ru": "tool_call_truncation_recovery_ru.j2",
+        "tool_call_truncation_resume": "tool_call_truncation_resume.j2",
+        "tool_result_interrupted": "tool_result_interrupted.j2",
+        "tool_result_pairing_repair": "tool_result_pairing_repair.j2",
+        "result_eviction": "result_eviction.j2",
     }
 )
 

@@ -6,8 +6,112 @@ All notable changes to this project are recorded here. The format follows
 
 ## [Unreleased]
 
+## [2.0.0a4]
+
+This release is the result of a long pass over the core with one question in
+front of it: what belongs in a universal agent runtime, and what only ever
+belonged to the layer above it. The answer moved a great deal of code out,
+tightened what remains into declared contracts, and made several things that
+were conventions into checks. The public surface is narrower than it was and
+says what it means; that is the point of the release, and it is a breaking one.
+
+### Added
+
+- **Conformance suites, shipped in the package.** `protocore.conformance` is a
+  pytest suite a host runs against its **own** implementations of the contracts:
+  `pip install "protocore[testing]"`, then `pytest --pyargs protocore.conformance`.
+  It replaces "read the Protocol and hope" with a suite that fails when an
+  adapter is subtly wrong — a store that loses ordering, a client that reports a
+  stream idle without ending it, a sink that drops a field.
+- **A constants registry.** Every tunable is declared once, with its bounds, its
+  type, its default and the relationships it must hold with its neighbours, in a
+  form a program can read. Coercion, validation, a whole-snapshot check and a
+  repair that resets an out-of-range field are part of the model rather than
+  something each caller reimplements.
+- **A request manifest, and a provider that replays it.** Every model request
+  now records what it was assembled from, with a digest taken over exactly the
+  fields the model can see, so a request is reproducible and a replay that
+  diverges is a real difference rather than a timestamp. Observability metadata
+  is deliberately outside the digest: the same request stays the same request
+  when only its labels differ.
+- **A durable record of a tool call before it runs.** The intent is written
+  before the effect, so a process that dies between deciding to call a tool and
+  calling it resumes with the decision intact, and the charge against a run's
+  budget is idempotent per call rather than per attempt.
+- **An optional native token estimator**, released separately as
+  `protocore-native` and built from source until there are wheels for it. The
+  core stays pure Python and selects the extension only when it can import it,
+  so having it changes speed and nothing else — the same numbers either way, and
+  both arrangements are tested on every supported Python.
+  `PROTOCORE_DISABLE_NATIVE=1` keeps the Python implementation in force when the
+  extension is installed; it is read once, at import.
+- **A `testing` extra** carrying just a test runner, so a host using the
+  conformance suites does not inherit the core's linting and typing toolchain.
+- **Turn policy as a contract.** The driver of an assistant turn kept the
+  mechanics — open a stream, translate deltas, dispatch calls, close the round —
+  and every product opinion that had grown into a branch inside it is now an
+  object: it declares the named seams of a turn at which it wants to be
+  consulted, is consulted in an order the core owns, and answers with events to
+  forward and one directive saying what the loop does next. A host's policies
+  are **merged with the core's by name rather than replacing them**, so the
+  core's own guarantees cannot be switched off by omission, and a directive a
+  seam cannot honour — asking to restart a turn at a completion seam — is
+  refused with a named error instead of being ignored.
+- **One session work pool for both kinds of work.** A background command and a
+  delegated child run are the same thing from the loop's side: a unit of work
+  with an address, a status, a way to wait for it and a way to stop it. A child
+  run therefore has an address, can be asked how far along it is, and can be
+  stopped — and a parent waiting on one no longer holds its turn and its slot in
+  the tree budget for the whole descendant run. A pool is a collaborator the
+  host injects, and a cold start that fails to re-attach a session's still
+  running work says so on the run instead of looking like a session with nothing
+  running.
+- **Interrupts are parked, declared and resumed as a set.** A turn parks every
+  held call, announces the whole set in one event, and is resumed with one call
+  carrying the resolutions — instead of a turn that could only ever be stopped
+  by the first thing that interrupted it.
+
+### Changed
+
+- **The constants snapshot carries the loop's settings and not the host's.**
+  What used to be one enormous per-tenant model was a mixture: values the run
+  loop reads on every turn, and values only a service layer above the core ever
+  looked at. The second group has left the core entirely, and what remains is
+  named for what it is. A host that kept its own settings in this model moves
+  them into its own; the registry above is how it declares them.
+- **One public entry point for resuming a run.** `resume(engine, snapshot, ...)`
+  restores from the snapshot first — identity, delivery mode and schema are all
+  checked before the first mutation, so a refusal drives nothing — and only then
+  chooses how to continue: an approved tool call, a new message, or neither.
+  Asking for two at once is an error rather than a guess. The weaker per-turn
+  entry point is no longer part of the public surface.
+- **One canonical tool result, with projections taken from it.** The typed
+  result carries both its success flag and its content blocks, and the shapes a
+  model, a user interface and a store each need are derived from it rather than
+  maintained beside it.
+- **Tool identity comes from a declared role map**, not from tool names spelled
+  as literals across the runtime. Which tools delegate, which have side effects,
+  which may never be delegated — each is now a property something declares once
+  and the loop reads, instead of a name repeated in fifty-five places where a
+  rename could silently miss one.
+
 ### Fixed
 
+- **The streaming JSON parser no longer costs more than the text it reads.**
+  Repairing a partial document used regular expressions that were retried at
+  every quote and, on an unterminated string, walked to the end of the buffer
+  each time; growth was quadratic. It is now a single string-aware pass, and the
+  incremental parser keeps a mirror of the value being built so that the cost of
+  a chunk is the depth of the structure rather than the length of the buffer.
+  Measured: 28 KiB delivered in 64-byte chunks, 4.84 s to 0.017 s; a single
+  repair of a 64 KiB truncated string full of escapes, 18.65 s to 0.016 s.
+  A repair that reached a Python-only literal one level down could also return a
+  `set` from a JSON parser; every level is now normalised or refused.
+- **Token estimates are memoised across a turn**, so a long history is not
+  re-measured from scratch on every pass over it.
+- **The transient-retry counter resets when the stream settles**, not only on a
+  clean round, so a round that ended by tripping the backstop now refreshes the
+  retry budget in the same place as every other round.
 - `QueryEngine.rearm()` now also restarts the state that is attached to an
   engine *after* it is constructed. The re-arm rebuilds from a fresh engine, and
   `vars()` of a fresh engine cannot see what the host or the run loop attaches
@@ -24,6 +128,17 @@ All notable changes to this project are recorded here. The format follows
   ledger. A test now reads the package for every `engine.x = ...` and
   `setattr(engine, "x", ...)` outside the constructor and fails when one is
   classified as neither dropped nor kept.
+- **A run resumed from a snapshot is bound to the run it came from.** A snapshot
+  whose identity does not match is refused instead of quietly driving another
+  run's state.
+- **A cold resume restores the whole of a run's accounting**, not the part that
+  happened to be constructed with the engine: the position of the provider
+  chain, the cumulative budgets of a run tree (a dead process holds no permits,
+  so occupied slots come back released), the durable fact that a run was
+  cancelled, and the session's background tasks.
+- **Context is rebuilt when a request falls back to a generic shape**, and the
+  idle-stream branch of provider fallback is now reachable and covered — it
+  previously could not be entered at all.
 
 ## [2.0.0a3]
 
@@ -93,6 +208,8 @@ describe the boundary rather than the company.
 - 2964 tests, a 90% coverage floor, strict typing, lint, and a security scan,
   all gated on Python 3.12, 3.13, and 3.14.
 
-[Unreleased]: https://github.com/ascorblack-labs/protocore-community/compare/v2.0.0a2...HEAD
+[Unreleased]: https://github.com/ascorblack-labs/protocore-community/compare/v2.0.0a4...HEAD
+[2.0.0a4]: https://github.com/ascorblack-labs/protocore-community/releases/tag/v2.0.0a4
+[2.0.0a3]: https://github.com/ascorblack-labs/protocore-community/releases/tag/v2.0.0a3
 [2.0.0a2]: https://github.com/ascorblack-labs/protocore-community/releases/tag/v2.0.0a2
 [2.0.0a1]: https://github.com/ascorblack-labs/protocore-community/releases/tag/v2.0.0a1

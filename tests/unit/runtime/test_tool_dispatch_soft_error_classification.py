@@ -24,7 +24,8 @@ from typing import Any
 
 import pytest
 
-from protocore.contracts.runtime_constants import RuntimeConstants
+from protocore.contracts.run_state import RunScopedState
+from protocore.contracts.runtime_constants import LoopConstants
 from protocore.contracts.tool_registry import ToolVisibilityPolicy
 from protocore.contracts.tools import ToolContext
 from protocore.contracts.types import (
@@ -39,6 +40,7 @@ from protocore.runtime.tool_dispatch import (
 )
 from protocore.runtime.tool_permission import ToolPermissionGate
 from protocore.runtime.tool_registry import ToolRegistry
+from tests._fixtures.tool_roles import CONVENTIONAL_TOOL_ROLES
 
 from ._tool_fixtures import MockTool
 
@@ -58,22 +60,22 @@ def _build_dispatcher(
 ) -> ToolDispatcher:
     return ToolDispatcher(
         registry=ToolRegistry(tools),
-        permission_gate=ToolPermissionGate(),
+        permission_gate=ToolPermissionGate(roles=CONVENTIONAL_TOOL_ROLES),
         tool_error_counter=counter,
     )
 
 
 def _ctx(
-    *, run_id: str = "run-soft", helpers: dict[str, Any] | None = None
-) -> tuple[ToolContext, dict[str, Any]]:
-    bag: dict[str, Any] = dict(helpers) if helpers else {}
+    *, run_id: str = "run-soft", rc: Any | None = None
+) -> tuple[ToolContext, RunScopedState]:
+    state = RunScopedState(rc=rc)
     ctx = ToolContext(
         tenant_id="tenant-soft",
         run_id=run_id,
         session_id="sess-soft",
-        metadata={"protocore.helpers": bag},
+        run_state=state,
     )
-    return ctx, bag
+    return ctx, state
 
 
 async def _drain(
@@ -142,7 +144,7 @@ async def test_benign_nonzero_does_not_trip_consecutive_cap() -> None:
     """Repeating a benign nonzero many times must NOT trip the consecutive
     cap — a polling ``grep -q`` loop is not a 'repeat the same failing call'
     signal. cap=2 makes the regression obvious if the gate were ignored."""
-    rc = RuntimeConstants(tool_dispatch_consecutive_error_cap=2)
+    rc = LoopConstants(tool_dispatch_consecutive_error_cap=2)
     tool = MockTool(
         tool_name="Bash",
         response_content="grep -q needle: exit 1",
@@ -150,7 +152,7 @@ async def test_benign_nonzero_does_not_trip_consecutive_cap() -> None:
         response_metadata=_BENIGN_METADATA,
     )
     dispatcher = _build_dispatcher([tool])
-    ctx, bag = _ctx(helpers={"rc": rc})
+    ctx, state = _ctx(rc=rc)
 
     for _ in range(5):
         outcome = await _drain(
@@ -161,7 +163,7 @@ async def test_benign_nonzero_does_not_trip_consecutive_cap() -> None:
         )
         assert "consecutive" not in outcome.content.lower()
     # The streak cell was never written — the benign path leaves it untouched.
-    assert "tool_dispatch.consecutive_error_state" not in bag
+    assert state.consecutive_error is None
 
 
 # ----------------------------------------------------------------------
@@ -174,7 +176,7 @@ async def test_hard_failure_still_counts_and_caps() -> None:
     """A soft error WITHOUT the opt-out flags (the timeout/legacy case) must
     behave exactly as before: counted toward ``tool_errors_count`` and
     eligible for the consecutive cap."""
-    rc = RuntimeConstants(tool_dispatch_consecutive_error_cap=2)
+    rc = LoopConstants(tool_dispatch_consecutive_error_cap=2)
     counter = _RecordingCounter()
     # No response_metadata → flags absent → default (True, True).
     tool = MockTool(
@@ -183,7 +185,7 @@ async def test_hard_failure_still_counts_and_caps() -> None:
         response_is_error=True,
     )
     dispatcher = _build_dispatcher([tool], counter=counter)
-    ctx, _ = _ctx(helpers={"rc": rc})
+    ctx, _ = _ctx(rc=rc)
 
     first = await _drain(
         dispatcher, tool_call=ToolCall(name="Bash", arguments={}), ctx=ctx
@@ -238,7 +240,7 @@ async def test_benign_nonzero_does_not_reset_a_real_streak() -> None:
     (count=2 → cap). If the benign call had reset the streak, the 2nd real
     failure would be a fresh count=1 and never cap.
     """
-    rc = RuntimeConstants(tool_dispatch_consecutive_error_cap=2)
+    rc = LoopConstants(tool_dispatch_consecutive_error_cap=2)
     real = MockTool(
         tool_name="Bash",
         response_content="boom failure",
@@ -250,7 +252,7 @@ async def test_benign_nonzero_does_not_reset_a_real_streak() -> None:
         response_is_error=True,
         response_metadata=_BENIGN_METADATA,
     )
-    ctx, _ = _ctx(helpers={"rc": rc})
+    ctx, _ = _ctx(rc=rc)
 
     out1 = await _drain(
         _build_dispatcher([real]),

@@ -1,5 +1,9 @@
 # ruff: noqa: RUF001 — Bilingual RU+EN runtime nudge strings intentionally use Cyrillic characters.
-"""``query`` — public entry that drives ONE turn of the agent loop.
+"""The turn driver — the body of ONE turn of the agent loop.
+
+Public entries: :func:`resume` (pick a stored run back up and drive it) and
+:func:`resume_approved_tool` (execute a call that was waiting on approval);
+:meth:`QueryEngine.run` opens a fresh turn.  Everything below them is private.
 
 md` (full ASCII sequence).
 
@@ -29,26 +33,56 @@ import inspect
 import json
 import re
 import time
-from collections.abc import AsyncIterator, Callable, Iterator, Mapping
-from dataclasses import replace
+from collections.abc import (
+    AsyncIterator,
+    Awaitable,
+    Callable,
+    Iterator,
+    Mapping,
+    Sequence,
+)
+from dataclasses import dataclass, replace
+from functools import partial
 from typing import TYPE_CHECKING, Any, Final
 
-from protocore.constants import MAX_DATA_NESTING_DEPTH
+from protocore.contracts.agent_dispatch import IDelegationTool
+from protocore.contracts.background import describe_finished_task
+from protocore.contracts.evidence import ToolEvidenceContext
 from protocore.contracts.hooks import HookActionKind
+from protocore.contracts.interrupt import (
+    InterruptDecision,
+    InterruptKind,
+    InterruptResolution,
+    InterruptResolutionError,
+    PendingInterrupt,
+    find_interrupt_for_call,
+    interrupts_of_kind,
+    plan_resolution,
+)
 from protocore.contracts.llm import (
+    CacheBreakpoint,
     LLMContextWindowExceeded,
     LLMError,
     LLMObservabilityContext,
-    LLMProviderError,
     LLMRateLimitError,
     LLMRequest,
     LLMStreamEvent,
     LLMStreamIdleError,
     LLMTimeoutError,
-    MaxOutputTokensExhausted,
     ProviderDelta,
     ProviderDeltaKind,
 )
+from protocore.contracts.middleware import (
+    ILifecycleRegistry,
+    LifecycleOutcome,
+    LifecycleVerdict,
+)
+from protocore.contracts.observability import (
+    RequestManifest,
+    build_request_manifest,
+    constants_digest,
+)
+from protocore.contracts.run_state import RunScopedState
 from protocore.contracts.skills import (
     ISkillStore,
     SkillBundle,
@@ -57,14 +91,27 @@ from protocore.contracts.skills import (
 )
 from protocore.contracts.tool_chunking import (
     CHUNKABLE_CONTENT_FIELD,
-    CHUNKABLE_CONTENT_MUTATION_ALLOWLIST,
+    chunkable_content_mutation_names,
     is_chunkable_content_mutation,
+)
+from protocore.contracts.tool_roles import (
+    WORKSPACE_INSPECTION_ROLES,
+    WORKSPACE_MUTATION_ROLES,
+    ToolArgumentSlot,
+    ToolRole,
 )
 from protocore.contracts.tools import (
     SUBAGENT_DISPATCH_GROUP_METADATA_KEY,
     SUBAGENT_DISPATCH_ORDER_METADATA_KEY,
     SUBAGENT_TREE_PERMIT_METADATA_KEY,
     ToolContext,
+)
+from protocore.contracts.turn_policy import (
+    TurnContext,
+    TurnCoordinate,
+    TurnDirective,
+    TurnFlags,
+    TurnPolicyOutcome,
 )
 from protocore.contracts.types import (
     PARTIAL_ASSISTANT_ATTEMPT_METADATA_KEY,
@@ -74,7 +121,6 @@ from protocore.contracts.types import (
     SYNTHETIC_RECOVERY_LONGFILE_CONTINUE,
     SYNTHETIC_RECOVERY_LONGFILE_SALVAGE,
     SYNTHETIC_RECOVERY_LONGFILE_TERMINAL_SEAL,
-    SYNTHETIC_RECOVERY_MAX_OUTPUT_CONTINUE,
     SYNTHETIC_RECOVERY_METADATA_KEY,
     SYNTHETIC_RECOVERY_POST_TOOL_EMPTY_NUDGE,
     SYNTHETIC_RECOVERY_PRE_DISPATCH_TERMINAL_VERIFY,
@@ -83,7 +129,6 @@ from protocore.contracts.types import (
     SYNTHETIC_RECOVERY_TERMINAL_REPAIR,
     SYNTHETIC_RECOVERY_TERMINAL_TOOL_NUDGE,
     SYNTHETIC_RECOVERY_THINKING_CONTINUE,
-    SYNTHETIC_RECOVERY_TRUNCATION_CONTINUE,
     TERMINAL_TOOL_METADATA_KEY,
     TOOL_RESULT_CONSECUTIVE_CAP_ELIGIBLE_METADATA_KEY,
     ContentBlock,
@@ -93,6 +138,7 @@ from protocore.contracts.types import (
     StopReason,
     TextBlock,
     ToolCall,
+    ToolDefinition,
     ToolResultBlock,
     ToolUseBlock,
 )
@@ -107,7 +153,29 @@ from protocore.runtime.context.compaction import (
     current_tool_batch_protect_index,
 )
 from protocore.runtime.context.manager import ContextBundle
+from protocore.runtime.error_kinds import (
+    INTERNAL_ERROR_KIND as INTERNAL_ERROR_KIND,  # re-exported: a caller that
+    # reports a run's terminal kind reads it from the driver it drives.
+)
 from protocore.runtime.events import BlockVisibility, EventType, TurnEvent
+from protocore.runtime.intent import (
+    RESERVED,
+    SETTLED,
+    IntentRecord,
+    assert_pause_matches,
+    commit_intent,
+    find_intent,
+    mark_dispatched,
+    mark_paused_ask_user,
+    mark_pending_approval,
+    orphaned_intents,
+    settle_intent,
+    settle_unknown,
+    unknown_outcome_text,
+)
+from protocore.runtime.intent import (
+    fingerprint_arguments as _intent_fingerprint,
+)
 from protocore.runtime.live_control import (
     QueuedPrompt,
     place_items,
@@ -126,23 +194,23 @@ from protocore.runtime.loop_guard import (
 from protocore.runtime.loop_state import LoopState
 from protocore.runtime.loop_strategies import select_strategy
 from protocore.runtime.prompt_caching import apply_system_and_3
-from protocore.runtime.result_eviction import evict_history_for_llm
+from protocore.runtime.result_eviction import evict_history_for_llm, tool_name_for_result
 from protocore.runtime.run_work_budget import (
+    SUBAGENT_RUN_BUDGET_SHORT,
+    ChildRunGrant,
     RunWorkLedger,
-    resolve_run_work_ledger,
 )
 from protocore.runtime.skill_index import (
     derive_skill_index_budget_tokens,
     render_skills_catalog,
 )
 from protocore.runtime.subagent_budget import SubagentTreeBudget, SubagentTreePermit
+from protocore.runtime.tool_arguments import argument_names, string_argument
 from protocore.runtime.tool_dispatch import (
     DISPATCH_POST_TOOL_OUTPUT_MODIFIED_METADATA_KEY,
     DISPATCH_REPLAY_ERROR_KIND_METADATA_KEY,
     DISPATCH_REPLAY_ERROR_MESSAGE_METADATA_KEY,
     DISPATCH_STRUCTURED_ERROR_METADATA_KEY,
-    HELPER_SUBAGENT_TREE_BUDGET_KEY,
-    HELPER_SUBAGENT_TREE_PERMIT_KEY,
     STRUCTURED_ERROR_FINALIZATION_RECOMMENDED_KEY,
     STRUCTURED_ERROR_REASON_KEY,
     DispatchErrorKind,
@@ -154,10 +222,42 @@ from protocore.runtime.tool_dispatch import (
     _record_tool_call_soft_cap_warning,
 )
 from protocore.runtime.tool_permission import ToolPermissionGate
+from protocore.runtime.turn_policies import (
+    RunCounter,
+    TurnPolicyRegistry,
+    UnsupportedTurnDirectiveError,
+)
+from protocore.runtime.turn_policies.answer_floor import AnswerFloorPolicy
+from protocore.runtime.turn_policies.cancellation import CancellationPolicy
+from protocore.runtime.turn_policies.compaction import PerIterationCompactionPolicy
+from protocore.runtime.turn_policies.empty_completion import EmptyCompletionGuardPolicy
+from protocore.runtime.turn_policies.empty_model_turn import EmptyModelTurnPolicy
+from protocore.runtime.turn_policies.longfile import LongFileConvergencePolicy
+from protocore.runtime.turn_policies.output_cap import (
+    OutputCapRecoveryPolicy,
+    TruncationSalvage,
+)
+from protocore.runtime.turn_policies.provider_failure import ProviderFailurePolicy
+from protocore.runtime.turn_policies.repeat_guard import StreamLoopGuardPolicy
+from protocore.runtime.turn_policies.run_ceilings import RunCeilingsPolicy
+from protocore.runtime.turn_policies.sibling_walk import (
+    dispatch_parking_holds,
+    park_deferred_hold,
+)
+from protocore.runtime.turn_policies.sibling_walk import (
+    prose_gate_just_injected as _prose_gate_injected,
+)
+from protocore.runtime.turn_policies.terminal_nudge import TerminalNudgePolicy
+from protocore.runtime.turn_policies.terminal_tool_finish import (
+    TerminalToolFinishPolicy,
+)
+from protocore.runtime.turn_policies.truncated_tool_call import (
+    TruncatedToolCallRecoveryPolicy,
+)
 
 if TYPE_CHECKING:
     from protocore.contracts.hooks import HookResult
-    from protocore.contracts.runtime_constants import RuntimeConstants
+    from protocore.contracts.runtime_constants import LoopConstants
     from protocore.runtime.query_engine import QueryEngine
 
 
@@ -200,6 +300,482 @@ def _soft_stop_turn_budget(engine: QueryEngine, assistant_message_idx: int) -> i
     return assistant_message_idx + engine.config.rc.soft_stop_max_turns
 
 
+def _append_thinking_continue_prompt(engine: QueryEngine) -> None:
+    """Ask a model that spent its whole round thinking to answer.
+
+    The reasoning itself is already back in history; this is the short user
+    turn that says what to do with it.
+    """
+    engine.history.append(
+        Message(
+            role=MessageRole.user,
+            content_blocks=[TextBlock(text=engine.config.rc.continue_prompt_text)],
+            metadata={
+                SYNTHETIC_RECOVERY_METADATA_KEY: SYNTHETIC_RECOVERY_THINKING_CONTINUE
+            },
+        )
+    )
+
+
+def _append_post_tool_empty_nudge(engine: QueryEngine) -> None:
+    """Correct a model that answered a tool result with silence.
+
+    An API-valid pair: an empty assistant turn first, so the wire sequence
+    stays tool → assistant → user and never tool → user, then the nudge. The
+    empty turn is flagged as recovery scaffolding, or the marker it carries
+    would later read as a real model answer that a backstop could submit.
+    """
+    rc = engine.config.rc
+    engine.history.append(
+        Message(
+            role=MessageRole.assistant,
+            content_blocks=[TextBlock(text=rc.post_tool_empty_nudge_assistant_text)],
+            metadata={
+                SYNTHETIC_RECOVERY_METADATA_KEY: SYNTHETIC_RECOVERY_POST_TOOL_EMPTY_NUDGE
+            },
+        )
+    )
+    engine.history.append(
+        Message(
+            role=MessageRole.user,
+            content_blocks=[TextBlock(text=rc.post_tool_empty_nudge_user_text)],
+            metadata={
+                SYNTHETIC_RECOVERY_METADATA_KEY: SYNTHETIC_RECOVERY_POST_TOOL_EMPTY_NUDGE
+            },
+        )
+    )
+
+
+def _policy_continue_prompt_event(
+    engine: QueryEngine, round_: int, reasoning_chars: int
+) -> TurnEvent:
+    """Say a continue prompt went in, and what the round produced instead."""
+    return TurnEvent(
+        type=EventType.STATE_CHANGED,
+        run_id=engine.config.run_id,
+        payload={
+            "from": engine.state.value,
+            "to": engine.state.value,
+            "reason": "continue_prompt_injected",
+            "round": round_,
+            "reasoning_content_chars": reasoning_chars,
+        },
+    )
+
+
+def _empty_rounds_spent(engine: QueryEngine) -> int:
+    return engine._consecutive_empty_responses
+
+
+def _charge_empty_round(engine: QueryEngine) -> int:
+    engine._consecutive_empty_responses += 1
+    return engine._consecutive_empty_responses
+
+
+def _reset_empty_rounds(engine: QueryEngine) -> None:
+    engine._consecutive_empty_responses = 0
+
+
+def _policy_commit_usage(
+    engine: QueryEngine,
+    *,
+    kind: str,
+    input_tokens: int = 0,
+    output_tokens: int = 0,
+    success: bool,
+) -> TurnEvent | None:
+    """Record what an attempt spent, from a policy that saw it fail."""
+    from protocore.runtime.correctness_bind import commit_usage
+
+    return commit_usage(
+        engine,
+        kind=kind,
+        input_tokens=input_tokens,
+        output_tokens=output_tokens,
+        success=success,
+    )
+
+
+def _policy_fallback_event(
+    engine: QueryEngine,
+    advanced_to: str,
+    exc: BaseException,
+    error_class: str | None,
+) -> TurnEvent:
+    """Say on the wire that the run moved to another provider, and why."""
+    payload: dict[str, Any] = {
+        "from": engine.state.value,
+        "to": engine.state.value,
+        "reason": "model_fallback_triggered",
+        "fallback_model_id": advanced_to,
+        "primary_error": str(exc),
+    }
+    if error_class is not None:
+        payload["error_class"] = error_class
+    return TurnEvent(
+        type=EventType.STATE_CHANGED,
+        run_id=engine.config.run_id,
+        payload=payload,
+    )
+
+
+def _policy_transient_retry_event(
+    engine: QueryEngine,
+    kind: str,
+    attempt: int,
+    backoff_seconds: float,
+    exc: BaseException,
+) -> TurnEvent:
+    """Say that the same endpoint will be tried again, and after how long."""
+    return TurnEvent(
+        type=EventType.STATE_CHANGED,
+        run_id=engine.config.run_id,
+        payload={
+            "from": engine.state.value,
+            "to": engine.state.value,
+            "reason": "transient_llm_error_retry",
+            "error_class": kind,
+            "attempt": attempt,
+            "backoff_seconds": backoff_seconds,
+            "primary_error": str(exc),
+        },
+    )
+
+
+def _policy_log_stream_crash(engine: QueryEngine, exc: BaseException) -> None:
+    """Name the turn an unclassified crash landed on, in the run's log."""
+    _logger.warning(
+        "DIAG query.stream_crashed run=%s tenant=%s turn=%s exception=%s "
+        "message=%s",
+        engine.config.run_id,
+        engine.config.tenant_id,
+        engine.turn_id(),
+        type(exc).__name__,
+        exc,
+        exc_info=exc,
+    )
+
+
+def _output_recoveries_spent(engine: QueryEngine) -> int:
+    return engine._max_output_recovery_count
+
+
+def _charge_output_recovery(engine: QueryEngine) -> int:
+    engine._max_output_recovery_count += 1
+    return engine._max_output_recovery_count
+
+
+def _reset_output_recoveries(engine: QueryEngine) -> None:
+    engine._max_output_recovery_count = 0
+
+
+def _pin_terminal_backstop(engine: QueryEngine) -> None:
+    """Mark the wind-down turns as the run's last, recovery-free ones."""
+    engine._terminal_backstop_turn_active = True
+
+
+def _run_chunkable_write_names(engine: QueryEngine) -> frozenset[str]:
+    """The built-in writes of this run whose content can be sent in chunks."""
+    return chunkable_content_mutation_names(engine.config.tool_roles)
+
+
+def _policy_state_payload_event(
+    engine: QueryEngine, payload: dict[str, Any]
+) -> TurnEvent:
+    """A state-change event carrying a payload the policy composed itself."""
+    return TurnEvent(
+        type=EventType.STATE_CHANGED,
+        run_id=engine.config.run_id,
+        payload=payload,
+    )
+
+
+def _transient_retries_spent(engine: QueryEngine) -> int:
+    return engine._transient_stream_retry_count
+
+
+def _charge_transient_retry(engine: QueryEngine) -> int:
+    engine._transient_stream_retry_count += 1
+    return engine._transient_stream_retry_count
+
+
+def _reset_transient_retries(engine: QueryEngine) -> None:
+    engine._transient_stream_retry_count = 0
+
+
+def _truncation_recoveries_spent(engine: QueryEngine) -> int:
+    return engine._tool_call_truncated_recovery_count
+
+
+def _charge_truncation_recovery(engine: QueryEngine) -> int:
+    engine._tool_call_truncated_recovery_count += 1
+    return engine._tool_call_truncated_recovery_count
+
+
+def _reset_truncation_recoveries(engine: QueryEngine) -> None:
+    engine._tool_call_truncated_recovery_count = 0
+
+
+def _policy_truncation_result_event(
+    engine: QueryEngine, tool_call_id: str, message: str
+) -> TurnEvent:
+    """The error result a call that was never dispatched leaves on the wire.
+
+    Shaped as an ordinary ``tool_result`` with a real ``tool_call_id`` binding
+    rather than as a bare error, because every consumer of the stream already
+    knows how to draw a failed call, and none of them knows how to draw a call
+    that silently was not made.
+    """
+    return TurnEvent(
+        type=EventType.TOOL_RESULT,
+        run_id=engine.config.run_id,
+        payload={
+            "tool_call_id": tool_call_id,
+            "success": False,
+            "is_error": True,
+            "error": {"kind": "tool_call_truncated", "message": message},
+            "content_blocks": [{"type": "text", "text": message}],
+        },
+    )
+
+
+def _policy_tool_use_message_stop(engine: QueryEngine) -> TurnEvent:
+    """Close the assistant-message window a policy dispatched tools inside.
+
+    Carries the usage figures the ordinary between-messages frame carries, so
+    a reader cannot tell a window a policy closed from one the loop closed.
+    """
+    return TurnEvent(
+        type=EventType.MESSAGE_STOP,
+        run_id=engine.config.run_id,
+        payload={
+            "turn_id": engine.turn_id(),
+            "stop_reason": "tool_use",
+            "tokens_used": _tokens_used_payload(engine),
+            "cache_hit_rate": engine.total_usage.this_turn_cache_hit_rate(),
+        },
+    )
+
+
+def _post_tool_nudges_spent(engine: QueryEngine) -> int:
+    return engine._post_tool_empty_nudge_count
+
+
+def _charge_post_tool_nudge(engine: QueryEngine) -> int:
+    engine._post_tool_empty_nudge_count += 1
+    return engine._post_tool_empty_nudge_count
+
+
+def _reset_post_tool_nudges(engine: QueryEngine) -> None:
+    engine._post_tool_empty_nudge_count = 0
+
+
+def _log_output_token_budget_exhausted(
+    engine: QueryEngine, spent: int, budget: int, turn: int
+) -> None:
+    """Say that the run spent its output-token budget, and by how much."""
+    _logger.warning(
+        "DIAG query.run_output_token_budget_exhausted run=%s tenant=%s "
+        "output_tokens=%d budget=%d turn=%d",
+        engine.config.run_id,
+        engine.config.tenant_id,
+        spent,
+        budget,
+        turn,
+    )
+
+
+def _empty_completion_redrives_spent(engine: QueryEngine) -> int:
+    """How many re-drives this run has already spent on an empty finish."""
+    return engine._empty_completion_redrive_count
+
+
+def _charge_empty_completion_redrive(engine: QueryEngine) -> None:
+    """Spend one of them."""
+    engine._empty_completion_redrive_count += 1
+
+
+def _log_answer_floor_repair(
+    engine: QueryEngine,
+    pointer: tuple[str, int, int] | None,
+    attempt: int,
+) -> None:
+    """Say which of the two answer-floor tests fired, and what it measured.
+
+    Two ways to reach a repair, and they need opposite reading. The floor line
+    says the answer was too short and repeats the threshold it was measured
+    against; the pointer line says the answer was long enough and still
+    delivered nothing, and carries the two sizes that make that case. When
+    both hold, the pointer line is the one that explains the run.
+    """
+    rc = engine.config.rc
+    if pointer is None:
+        _logger.warning(
+            "DIAG query.finalize_prose_gate.plain_stop_repair "
+            "run=%s tenant=%s turn=%s floor=%d",
+            engine.config.run_id,
+            engine.config.tenant_id,
+            engine.turn_id(),
+            rc.finalize_prose_gate_min_chars,
+        )
+        return
+    path, answer_chars, written_chars = pointer
+    _logger.warning(
+        "DIAG query.finalize_prose_gate.pointer_answer_repair "
+        "run=%s tenant=%s turn=%s attempt=%d/%d "
+        "answer_chars=%d written_chars=%d max_fraction=%.3f path=%s",
+        engine.config.run_id,
+        engine.config.tenant_id,
+        engine.turn_id(),
+        attempt,
+        rc.finalize_prose_gate_pointer_max_repair_attempts,
+        answer_chars,
+        written_chars,
+        rc.finalize_prose_gate_pointer_max_answer_fraction,
+        path,
+    )
+
+
+def _spend_short_answer_repair(engine: QueryEngine) -> None:
+    """Spend the run's single repair for an answer that was merely too short."""
+    engine._finalize_prose_gate_used = True
+
+
+def _policy_message_stop(engine: QueryEngine, stop_reason: str) -> TurnEvent:
+    """The end-of-turn frame, on a policy that has ended the turn."""
+    return TurnEvent(
+        type=EventType.MESSAGE_STOP,
+        run_id=engine.config.run_id,
+        payload={"turn_id": engine.turn_id(), "stop_reason": stop_reason},
+    )
+
+
+def _policy_pair_orphan_tool_calls(engine: QueryEngine) -> None:
+    """Pair every tool_use that will never receive a result.
+
+    A terminal reached from inside a turn leaves the calls the loop never got
+    to, and a snapshot carrying an orphan tool_use is not a transcript any
+    consumer can read.
+    """
+    _synthesize_missing_tool_results(
+        engine.history,
+        error_content=engine.prompt_text("tool_result_interrupted"),
+    )
+
+
+def _record_nothing() -> None:
+    """The default at a coordinate where there is no partial round to keep."""
+
+
+def _policy_state_change(engine: QueryEngine, reason: str) -> TurnEvent:
+    """A state-change event reporting no transition, on a policy's say-so."""
+    return _emit_state_change(engine, engine.state, engine.state, reason=reason)
+
+
+def _turn_at(
+    engine: QueryEngine,
+    flags: TurnFlags,
+    coordinate: TurnCoordinate,
+    *,
+    turn_budget: int = 0,
+    stored_stream_error: tuple[BaseException, str] | None = None,
+    text_emitted: bool = False,
+    reasoning_emitted: bool = False,
+    reasoning_chars: int = 0,
+    tool_calls_pending: bool = False,
+    tool_results_ready: bool = False,
+    record_partial_attempt: Callable[[], None] = _record_nothing,
+    terminal_tool_finished: bool = False,
+    dispatched_tools: bool = False,
+    pending_tool_calls: Sequence[ToolCall] = (),
+    finish_reason: str = "",
+    stream_error: BaseException | None = None,
+    cancel_checkpoint: Callable[[], AsyncIterator[TurnEvent]] | None = None,
+    stream_repeat_guard: Callable[[], tuple[str, int] | None] | None = None,
+) -> TurnContext:
+    """One consultation of the turn policies, at ``coordinate``.
+
+    The engine goes in as itself; the annotation on
+    :attr:`~protocore.contracts.turn_policy.TurnContext.engine` is what keeps
+    a policy to the fourteen names it is allowed to touch.
+    """
+    turn = TurnContext(
+        engine=engine,
+        flags=flags,
+        coordinate=coordinate,
+        turn_budget=turn_budget,
+        stored_stream_error=stored_stream_error,
+        text_emitted=text_emitted,
+        reasoning_emitted=reasoning_emitted,
+        reasoning_chars=reasoning_chars,
+        tool_calls_pending=tool_calls_pending,
+        tool_results_ready=tool_results_ready,
+        terminal_tool_finished=terminal_tool_finished,
+        dispatched_tools=dispatched_tools,
+        record_partial_attempt=record_partial_attempt,
+        pending_tool_calls=pending_tool_calls,
+        finish_reason=finish_reason,
+        stream_error=stream_error,
+    )
+    if cancel_checkpoint is not None:
+        turn.cancel_checkpoint = cancel_checkpoint
+    if stream_repeat_guard is not None:
+        turn.stream_repeat_guard = stream_repeat_guard
+    return turn
+
+
+def _turn_budget_after(
+    outcome: TurnPolicyOutcome, max_messages: int, flags: TurnFlags
+) -> int:
+    """The turn budget a policy's ``restart_turn`` leaves behind.
+
+    A policy either replaces the budget outright — the wind-down does, because
+    its whole point is a different, smaller one — or asks for one more message
+    than the loop is currently allowed, which is what every bounded re-drive
+    wants and what a bare ``max_messages + 1`` would get wrong on the second
+    re-drive of the same turn.
+    """
+    if outcome.turn_budget is not None:
+        return outcome.turn_budget
+    if outcome.extra_turn:
+        return max(max_messages, flags.assistant_message_idx + 1)
+    return max_messages
+
+
+def _effective_policies(engine: QueryEngine) -> TurnPolicyRegistry:
+    """The policy set this run is driven by.
+
+    A host installs policies to REPLACE a decision the core makes, not to
+    remove the bounds the core keeps. The turn cap, the compaction gate and
+    the guard on a finish that produced no answer live in policies now, and a
+    set that simply took the core's place would leave the driver's ``while``
+    with nothing to stop it — silently, because a registry that is missing a
+    bound looks exactly like one that never had it. So an installed set is
+    merged in by name: one of the host's displaces the core policy that
+    answers to the same name, a name the core does not carry is added, and
+    nothing is dropped.
+    """
+    installed = engine.turn_policies
+    if installed is None:
+        return _CORE_TURN_POLICIES
+    return _CORE_TURN_POLICIES.merged_with(installed)
+
+
+def _finish_taken_over(turn: TurnContext) -> bool:
+    """Whether a finish policy took the completion over from the loop.
+
+    The finish seams honour ``end_turn`` — a policy that ends the turn has
+    already emitted its terminal events, and sealing the run COMPLETED over
+    them would report a second, different ending. ``restart_turn`` they cannot
+    honour, and a directive the loop cannot obey is refused out loud rather
+    than dropped.
+    """
+    directive = turn.outcome.directive
+    if directive is TurnDirective.restart_turn:
+        raise UnsupportedTurnDirectiveError(turn.coordinate, directive)
+    return directive is TurnDirective.end_turn
+
+
 async def _emit_voluntary_completion(
     engine: QueryEngine,
 ) -> AsyncIterator[TurnEvent]:
@@ -229,6 +805,79 @@ async def _emit_voluntary_completion(
     )
 
 
+#: The seams a run passes through when the model finishes without calling a
+#: tool, in the order it passes them. Declared once because the order IS the
+#: behaviour: an answer is held to its floor before the finish that carries
+#: it is allowed, and a nudge towards the terminal tool comes before both.
+_FINISH_SEAMS: Final[tuple[TurnCoordinate, ...]] = (
+    TurnCoordinate.turn_end,
+    TurnCoordinate.finish_nudge,
+    TurnCoordinate.answer_floor,
+    TurnCoordinate.voluntary_finish,
+)
+
+
+async def _finalise_or_verify_first(
+    engine: QueryEngine, flags: TurnFlags
+) -> bool:
+    """One bounded corrective turn before a terminal result closes the run.
+
+    Every dispatch path reaches the same question when a call comes back
+    terminal — is the run finished, or does it owe itself one check first? —
+    and each of them used to answer it in its own words. ``True`` means the
+    corrective turn went in, so the batch stops WITHOUT finalising and the
+    caller grants it a message slot; the helper persists the snapshot itself
+    on injection. ``False`` means the run is finished, and says so on the
+    flags the turn shares with its policies.
+    """
+    if await _maybe_inject_pre_terminal_self_verify(engine):
+        return True
+    flags.terminal_tool_completed = True
+    return False
+
+
+async def _cancel_checkpoint(
+    engine: QueryEngine,
+    flags: TurnFlags,
+    policies: TurnPolicyRegistry,
+) -> AsyncIterator[TurnEvent]:
+    """Ask whether the run has been told to stop, and end it if it has.
+
+    Placed at every seam whose next step would be a NEW side effect. The
+    caller reads :attr:`TurnFlags.terminal_yielded` afterwards and returns
+    when it is set — the policy has already emitted the whole ending.
+    """
+    turn = _turn_at(engine, flags, TurnCoordinate.cancel_checkpoint)
+    async for event in policies.apply(turn):
+        yield event
+    if turn.outcome.directive is TurnDirective.end_turn:
+        flags.terminal_yielded = True
+
+
+async def _complete_via_terminal_tool(
+    engine: QueryEngine,
+    flags: TurnFlags,
+    policies: TurnPolicyRegistry,
+) -> AsyncIterator[TurnEvent]:
+    """Close a run the model ended by calling the tool that ends runs.
+
+    Three dispatch paths reach this ending, and what the ending IS belongs to
+    the policy consulted here rather than to whichever path arrived: the
+    pairing of the calls the turn abandoned and the seal itself are one
+    decision, made once. All this seam owns is refusing a directive it cannot
+    obey — a finish is not a place a turn can be sent back from.
+    """
+    turn = _turn_at(
+        engine,
+        flags,
+        TurnCoordinate.terminal_tool_finish,
+        terminal_tool_finished=True,
+    )
+    async for event in policies.apply(turn):
+        yield event
+    _finish_taken_over(turn)
+
+
 def _tool_call_budget_reached(engine: QueryEngine) -> bool:
     """True once this run has dispatched its whole cumulative tool-call budget.
 
@@ -248,22 +897,6 @@ def _tool_call_budget_reached(engine: QueryEngine) -> bool:
     return engine._tool_call_ledger_seq >= cap
 
 
-INTERNAL_ERROR_KIND: Final[str] = "internal_error"
-"""Terminal ``kind`` for a failure that is this process, not the upstream.
-
-Reported on :class:`~protocore.runtime.events.EventType.ERROR` and carried into
-``runs.error_class`` by the executor. Every exception outside the
-:class:`~protocore.contracts.llm.LLMError` family lands here — a parser bug, a
-``RecursionError``, an ``AttributeError`` in the loop. Kept distinct from
-``llm_provider_error`` because the two demand opposite responses: a provider
-failure is a reason to try a different endpoint, and this is a reason to read a
-traceback. Conflating them made the provider-failure metric count our own bugs,
-and made the one record of a real crash say the upstream had failed.
-
-``stop_reason`` is unaffected — an internal error still ends the run in
-``error``.
-"""
-
 
 def _llm_history(engine: QueryEngine) -> tuple[list[Message], list[str]]:
     """History view for the next LLM request (eviction never mutates persist)."""
@@ -272,12 +905,14 @@ def _llm_history(engine: QueryEngine) -> tuple[list[Message], list[str]]:
     view, evicted = evict_history_for_llm(
         engine.history,
         engine.config.rc,
+        engine.prompt_provider,
         engine._pinned_tool_result_ids,
+        roles=engine.config.tool_roles,
     )
     view = apply_checkpoint(view, getattr(engine, "compact_checkpoint", None))
     if engine.config.rc.tool_result_split_enabled:
         from protocore.contracts.types import ToolResultBlock
-        from protocore.runtime.tool_result_split import split_result
+        from protocore.runtime.tool_result_split import project_result_content
 
         split_view: list[Message] = []
         for message in view:
@@ -285,15 +920,19 @@ def _llm_history(engine: QueryEngine) -> tuple[list[Message], list[str]]:
             changed = False
             for block in message.content_blocks:
                 if isinstance(block, ToolResultBlock):
-                    content, details = split_result(block.content, rc=engine.config.rc)
-                    if content != block.content:
-                        meta = dict(block.metadata)
-                        if details:
-                            meta["ui_details"] = details
+                    projection = project_result_content(
+                        block.content,
+                        rc=engine.config.rc,
+                        canonical_ref=block.canonical_ref,
+                    )
+                    if projection.is_shortened:
+                        # The projection replaces the text in the VIEW only.
+                        # ``engine.history`` still holds the whole value, which
+                        # is what lets the next build shorten it differently —
+                        # or not at all, once compaction has moved the value to
+                        # a blob and left a reference in its place.
                         new_blocks.append(
-                            block.model_copy(
-                                update={"content": content, "metadata": meta}
-                            )
+                            block.model_copy(update={"content": projection.content})
                         )
                         changed = True
                         continue
@@ -331,10 +970,17 @@ def _maybe_run_settled_event(engine: QueryEngine) -> TurnEvent | None:
     )
 
 
-def _apply_stream_loop_guard(
+def _strip_stream_repeat(
     engine: QueryEngine,
     stream_result: Any,
-) -> TurnEvent | None:
+) -> tuple[str, int] | None:
+    """Take a repeated tail off the round in flight, and say what went.
+
+    Rewriting the buffers is bookkeeping on a round the loop is holding; what
+    a repetition MEANS for the run — a nudge, and past a bound the refusal of
+    the calls that came with it — belongs to the policy this probe is offered
+    to.
+    """
     new_text, new_reason, hit = inspect_stream_repeat(
         stream_result.text_buffer,
         stream_result.reasoning_buffer,
@@ -344,21 +990,40 @@ def _apply_stream_loop_guard(
         return None
     stream_result._text_fragments = [new_text] if new_text else []
     stream_result._reasoning_fragments = [new_reason] if new_reason else []
+    return str(hit.kind), int(hit.stripped_chars)
+
+
+def _loop_guard_nudges_spent(engine: QueryEngine) -> int:
+    return engine._loop_guard_nudge_count
+
+
+def _charge_loop_guard_nudge(engine: QueryEngine) -> int:
     engine._loop_guard_nudge_count += 1
+    return engine._loop_guard_nudge_count
+
+
+def _reset_loop_guard_nudges(engine: QueryEngine) -> None:
+    engine._loop_guard_nudge_count = 0
+
+
+def _policy_loop_guard_event(
+    engine: QueryEngine, kind: str, nudge_index: int, stripped_chars: int
+) -> TurnEvent:
     return TurnEvent(
         type=EventType.LOOP_GUARD_FIRED,
         run_id=engine.config.run_id,
         payload={
-            "kind": hit.kind,
-            "nudge_index": engine._loop_guard_nudge_count,
-            "stripped_chars": hit.stripped_chars,
+            "kind": kind,
+            "nudge_index": nudge_index,
+            "stripped_chars": stripped_chars,
         },
     )
 
 
 def _block_identical_tools(
     engine: QueryEngine,
-    tool_calls: list[ToolCall],
+    tool_calls: Sequence[ToolCall],
+    nudge_index: int = 0,
 ) -> tuple[list[ToolCall], list[TurnEvent]]:
     """Split tool calls into executable vs blocked-identical, emitting results."""
     executable: list[ToolCall] = []
@@ -397,8 +1062,14 @@ def _block_identical_tools(
                 run_id=engine.config.run_id,
                 payload={
                     "tool_call_id": call.id,
-                    "content": "identical tool call blocked by loop guard",
+                    "success": False,
                     "is_error": True,
+                    "content_blocks": [
+                        {
+                            "type": "text",
+                            "text": "identical tool call blocked by loop guard",
+                        }
+                    ],
                 },
             )
         )
@@ -408,7 +1079,7 @@ def _block_identical_tools(
                 run_id=engine.config.run_id,
                 payload={
                     "kind": "identical_tool",
-                    "nudge_index": engine._loop_guard_nudge_count,
+                    "nudge_index": nudge_index,
                     "tool_call_id": call.id,
                     "tool_name": call.name,
                 },
@@ -458,10 +1129,15 @@ async def _populate_discovered_rules(engine: QueryEngine) -> None:
 def _activate_rules_from_tool(engine: QueryEngine, tool_call: ToolCall) -> None:
     from protocore.runtime.rules_activation import activate_on_filesystem_touch, discover_agents_md
 
-    if tool_call.name not in {"Read", "Write", "Edit", "Glob", "Grep"}:
+    roles = engine.config.tool_roles
+    if not roles.has_any_role(
+        tool_call.name, WORKSPACE_INSPECTION_ROLES | WORKSPACE_MUTATION_ROLES
+    ):
         return
     args = tool_call.arguments if isinstance(tool_call.arguments, dict) else {}
-    path = str(args.get("path") or args.get("file_path") or args.get("pattern") or "")
+    path = string_argument(args, ToolArgumentSlot.path, roles=roles) or str(
+        args.get("pattern") or ""
+    )
     if not path:
         return
     if engine.config.rc.rules_discovery_enabled and not engine.discovered_rules:
@@ -477,6 +1153,7 @@ def _activate_rules_from_tool(engine: QueryEngine, tool_call: ToolCall) -> None:
         discovered=list(engine.discovered_rules),
         already_active=engine.active_rule_paths,
         rc=engine.config.rc,
+        roles=roles,
     )
     if engine.active_rule_paths != before:
         engine._pending_rules_activated = [
@@ -484,22 +1161,88 @@ def _activate_rules_from_tool(engine: QueryEngine, tool_call: ToolCall) -> None:
         ]
 
 
-async def _maybe_place_background_wakes(engine: QueryEngine) -> list[str]:
-    """Refresh the session pool and inject one batched wake turn if needed."""
-    pool = getattr(engine, "background_pool", None)
-    if pool is None or not engine.config.rc.background_tasks_enabled:
-        return []
+#: Background tasks are enabled for this run and no pool was injected at all.
+BACKGROUND_DETACHED_NO_POOL = "no_pool_bound"
+#: A pool is bound but it does not yet speak for this session — the shape a
+#: resumed run takes when the host has not re-attached the session's commands.
+BACKGROUND_DETACHED_SESSION_NOT_REATTACHED = "session_not_reattached"
+#: The pool speaks for the session but does not hold commands this run's own
+#: durable state says were still running. The shape a cold resume takes against
+#: a pool that keeps its records in memory: it came up empty and, from the
+#: inside, empty and idle are the same picture. Only the run can tell them apart.
+BACKGROUND_DETACHED_TASKS_NOT_READOPTED = "tasks_not_readopted"
+
+
+@dataclass(frozen=True, slots=True)
+class _BackgroundWakeOutcome:
+    """What the wake check found, told apart from finding nothing.
+
+    ``task_ids`` empty with ``detached_reason`` empty is the ordinary answer:
+    the pool speaks for the session and nothing has finished. ``detached_reason``
+    set is the answer that used to look identical from the caller's side and is
+    not — nobody can say what this session's background commands are doing.
+
+    The two are independent, and that matters: one stranded command must not
+    silence the wakes of every healthy one beside it. A detached report is a
+    statement about what the pool CANNOT answer, not a reason to stop asking it
+    what it can.
+    """
+
+    task_ids: tuple[str, ...] = ()
+    detached_reason: str = ""
+
+
+async def _maybe_place_background_wakes(
+    engine: QueryEngine,
+) -> _BackgroundWakeOutcome:
+    """Refresh the session pool and inject one batched wake turn if needed.
+
+    Reports a detached pool rather than an empty result. The two used to be the
+    same value, and that is the whole defect: a run resumed on a fresh process
+    came up with no pool bound to its session, every wake check answered "nothing
+    finished", and the agent waited on a command that had finished before the
+    run was even resumed. Background work only ever reaches the agent through
+    this function, so silence here is silence everywhere.
+
+    A detached report does not stop the check. Whatever the pool can still
+    answer is still asked for and still delivered — one stranded record must not
+    take the wakes of every healthy command beside it.
+    """
+    if not engine.config.rc.background_tasks_enabled:
+        return _BackgroundWakeOutcome()
+    if engine.config.run_depth > 0:
+        # A wake is a turn injected into a conversation, and only the run at
+        # the root of the tree has one a person is reading. A child run woken
+        # by its own finished work would spend turns of its own budget on it
+        # and then report it to nobody, so the notification is a property of
+        # depth 0 — the pool still holds the records, and the root still gets
+        # its own.
+        return _BackgroundWakeOutcome()
+    pool = engine.background_pool
+    if pool is None:
+        return _BackgroundWakeOutcome(detached_reason=BACKGROUND_DETACHED_NO_POOL)
+    detached_reason = ""
+    if not await pool.ensure_session_attached(engine.config.session_id):
+        detached_reason = BACKGROUND_DETACHED_SESSION_NOT_REATTACHED
+    elif any(
+        pool.get(task_id) is None for task_id in engine._resumed_background_task_ids
+    ):
+        # The pool vouches for the session, and the commands this run recorded
+        # as running are not in it. A pool holding its records in memory has no
+        # way to notice that — it came up empty and empty looks exactly like
+        # idle — so the run's own durable state is the only witness there is.
+        detached_reason = BACKGROUND_DETACHED_TASKS_NOT_READOPTED
     for task in list(pool.list(engine.config.session_id)):
         await pool.refresh(task.id)
     ids: list[str] = list(pool.drain_wakes(engine.config.session_id))
     if not ids:
-        return []
-    statuses = []
+        return _BackgroundWakeOutcome(detached_reason=detached_reason)
+    described = []
     for task_id in ids:
         item = pool.get(task_id)
         if item is not None:
-            statuses.append(f"{item.id} {item.status}")
-    text = "background tasks finished: " + ", ".join(statuses)
+            described.append(describe_finished_task(item))
+    text = "background tasks finished: " + "; ".join(described)
     engine.history.append(
         Message(
             role=MessageRole.user,
@@ -509,7 +1252,46 @@ async def _maybe_place_background_wakes(engine: QueryEngine) -> list[str]:
     persister = getattr(engine, "persist_session_history", None)
     if callable(persister):
         persister(engine)
-    return ids
+    return _BackgroundWakeOutcome(
+        task_ids=tuple(ids), detached_reason=detached_reason
+    )
+
+
+async def _background_wake_events(engine: QueryEngine) -> AsyncIterator[TurnEvent]:
+    """Run the wake check and emit what it found, at one site for both callers.
+
+    The two turn-opening paths ask the same question in the same place and used
+    to carry their own copy of the answer; a second copy of a fire-once report
+    behind a run-scoped latch is unreachable by construction, and unreachable
+    code is not a second chance at anything.
+    """
+    background = await _maybe_place_background_wakes(engine)
+    if background.task_ids:
+        yield TurnEvent(
+            type=EventType.BACKGROUND_WAKE,
+            run_id=engine.config.run_id,
+            payload={"task_ids": list(background.task_ids)},
+        )
+    if background.detached_reason and not engine._background_detach_reported:
+        engine._background_detach_reported = True
+        _logger.warning(
+            "DIAG query.background_pool_detached run=%s tenant=%s session=%s reason=%s",
+            engine.config.run_id,
+            engine.config.tenant_id,
+            engine.config.session_id,
+            background.detached_reason,
+        )
+        yield TurnEvent(
+            type=EventType.STATE_CHANGED,
+            run_id=engine.config.run_id,
+            payload={
+                "from": engine.state.value,
+                "to": engine.state.value,
+                "reason": "background_tasks_detached",
+                "detached_reason": background.detached_reason,
+                "session_id": engine.config.session_id,
+            },
+        )
 
 
 async def _reload_live_control(engine: QueryEngine) -> None:
@@ -588,29 +1370,14 @@ def _pin_keep_flag(engine: QueryEngine, tool_call: ToolCall) -> None:
 # and with what verdict?" is answerable from the executor log alone.
 #
 # ``observed`` (the size of the per-run observed-state collection a trigger
-# may compare cited refs against) lives on the OPAQUE helper bag core already
-# forwards (``engine._helpers`` — see the ``protocore.helpers`` threading in
-# ``_dispatch_tool``). Reading it is a plain mapping lookup, NOT a host
-# import, so core stays import-boundary-pure (guard:
-# ``tests/test_core_import_boundary.py``). The helper key is a runtime-facing
-# convention; if its producer ever drifts, the heartbeat degrades gracefully to
-# ``observed=-1``
-# (sentinel for "not cheaply observable from core") — it never lies and never
-# raises. ``cited`` is computed purely from the un-submitted ``ToolCall``
-# arguments (the exact input the trigger reads: canonical ``refs`` slot, legacy
-# ``sources`` alias), so it is always exact.
-_OBSERVED_REF_LEDGER_HELPER_KEY: Final[str] = "terminal_answer_observed_refs"
-# The per-run content-read collection key (the set of paths whose BODY the run
-# actually read — the real, harness-returned paths the run banked). Read off
-# the SAME opaque helper bag core already
-# forwards (``engine._helpers``); a plain mapping lookup, NOT a host
-# import, so core stays import-boundary-pure. The guaranteed-terminal backstop
-# cites these REAL banked paths (never fabricated); if the key ever drifts the
-# backstop degrades gracefully to a message-only answer.
-_CONTENT_READ_LEDGER_HELPER_KEY: Final[str] = "terminal_answer_content_read_refs"
+# may compare cited refs against) is a named field on the run's state, so the
+# count is always available and never a guess: a run whose read tools recorded
+# nothing has an empty one, which is a fact rather than an unknown. ``cited`` is
+# computed purely from the un-submitted ``ToolCall`` arguments (the exact input
+# the trigger reads: canonical ``refs`` slot, legacy ``sources`` alias), so it
+# is always exact too.
 _TERMINAL_ANSWER_REFS_KEY: Final[str] = "refs"
 _TERMINAL_ANSWER_REFS_LEGACY_ALIAS: Final[str] = "sources"
-_HEARTBEAT_OBSERVED_UNAVAILABLE: Final[int] = -1
 
 
 def _observability_context(
@@ -630,6 +1397,147 @@ def _observability_context(
     )
 
 
+# The request contract's own default, so the one temperature policy below
+# states a value on every path without repeating a literal that already lives
+# on the contract.
+_DEFAULT_REQUEST_TEMPERATURE: Final[float] = float(
+    LLMRequest.model_fields["temperature"].default
+)
+
+
+def build_llm_request(
+    *,
+    model: str,
+    messages: Sequence[Message],
+    max_tokens: int,
+    tools: Sequence[ToolDefinition] = (),
+    temperature: float | None = None,
+    thinking_enabled: bool | None = None,
+    reasoning_effort: str | None = None,
+    forced_tool_choice: str | None = None,
+    response_format: Mapping[str, Any] | None = None,
+    cache_breakpoints: Sequence[CacheBreakpoint] | None = None,
+    observability: LLMObservabilityContext | None = None,
+) -> LLMRequest:
+    """Assemble the one :class:`LLMRequest` every provider call is made of.
+
+    Every call that leaves this runtime — the action stream, the deep loop's
+    plan call, its prompted-JSON plan fallback, and the Tier-2 compaction
+    summariser — is built here, so the four agree by construction on the three
+    things they used to decide separately:
+
+    * **the model**. Callers pass ``QueryEngine.effective_model_name``, which
+      is the live override when one is set and the configured model otherwise.
+      Resolving it per call site meant a mid-run model change moved only the
+      action stream: one agent turn then spanned two models with nothing on the
+      event stream saying so.
+    * **the forced tool**. ``extra["forced_tool_choice"]`` is the single slot,
+      and it carries the tool NAME; a provider adapter renders it into whatever
+      native single-tool ``tool_choice`` shape its wire wants. Stating the same
+      intent in two spellings meant a single reader could not tell whether a
+      turn had been forced.
+    * **the temperature**. Stated on every request: the caller's value, or the
+      request contract's default when the caller has no opinion.
+
+    ``thinking_enabled`` and ``reasoning_effort`` travel as a pair or not at
+    all — the effort bounds the CoT, and thinking requested without it was
+    measured to truncate the answer — so passing exactly one is a programming
+    error. Omitting both is how a path (the plan fallback) ships only the knobs
+    every provider accepts.
+
+    Keys land in ``extra`` only when the caller supplies them: an adapter that
+    does not recognise a key ignores it, but an absent key and a key holding a
+    default are different requests, and the manifest of a call has to be able
+    to tell them apart.
+    """
+    if (thinking_enabled is None) != (reasoning_effort is None):
+        raise ValueError(
+            "thinking_enabled and reasoning_effort must be given together: "
+            "the effort bounds the requested chain of thought"
+        )
+    extra: dict[str, object] = {}
+    if cache_breakpoints is not None:
+        extra["cache_breakpoints"] = cache_breakpoints
+    if thinking_enabled is not None and reasoning_effort is not None:
+        extra["enable_thinking"] = thinking_enabled
+        extra["reasoning_effort"] = reasoning_effort
+    if forced_tool_choice is not None:
+        extra["forced_tool_choice"] = forced_tool_choice
+    if response_format is not None:
+        extra["response_format"] = dict(response_format)
+    return LLMRequest(
+        model=model,
+        messages=list(messages),
+        tools=list(tools),
+        max_tokens=max_tokens,
+        temperature=(
+            _DEFAULT_REQUEST_TEMPERATURE if temperature is None else temperature
+        ),
+        extra=extra,
+        observability=observability,
+    )
+
+
+async def _manifest_request(
+    engine: QueryEngine,
+    request: LLMRequest,
+    *,
+    call_purpose: str,
+) -> RequestManifest | None:
+    """Record what this call is made of, before a single delta of it exists.
+
+    The manifest is the answer to the one question a run cut off mid-stream
+    could not answer: whether the request that produced the output somebody
+    already saw is the request this build would produce again. So it is emitted
+    HERE — after the outbound list is final and before the provider is asked —
+    and the id is stamped on the run's snapshot at the same moment, without
+    waiting to find out whether the host's store accepted anything.
+
+    Inert with no sink configured: a run nobody is recording pays nothing, not
+    even the hashing of its history.
+
+    A sink that raises does NOT fail the run. Manifesting a request is
+    evidence-keeping, and a store that is full or unreachable is the host's
+    operational problem; ending an agent's turn over it would trade a missing
+    record for a failed run. The id is stamped either way, so the snapshot
+    still names the call — a reader that cannot then find the manifest learns
+    that it was not kept, which is a different and more useful fact than a run
+    with no reference at all.
+    """
+    sink = engine.config.request_manifest_sink
+    if sink is None:
+        return None
+    chain = engine.provider_chain
+    manifest, bodies = build_request_manifest(
+        request=request,
+        attempt_scope=f"{engine.config.run_id}/{engine.turn_id()}/{call_purpose}",
+        constants_sha256=constants_digest(engine.config.rc),
+        inline_value_max_bytes=(
+            engine.config.rc.request_manifest_inline_value_max_bytes
+        ),
+        provider_chain_position=engine._provider_chain_advances,
+        provider_chain_model=(
+            chain.current_model_name() if chain is not None else None
+        ),
+    )
+    engine.note_request_manifest(manifest)
+    try:
+        await sink.record_request_manifest(
+            manifest=manifest,
+            manifest_id=manifest.manifest_id,
+            bodies=bodies,
+        )
+    except Exception as exc:
+        _logger.warning(
+            "request manifest sink failed for run=%s attempt=%s (err=%s); the "
+            "run continues without the record",
+            engine.config.run_id,
+            manifest.attempt_id,
+            exc,
+        )
+    return manifest
+
+
 def _provider_call_category(engine: QueryEngine) -> str:
     if engine.config.parent_run_id is not None:
         return "subagent_call"
@@ -640,9 +1548,20 @@ def _tool_surface_advertised_payload(
     engine: QueryEngine,
     context: ContextBundle,
 ) -> dict[str, object]:
-    """Diagnostic payload for the exact tool list sent to the LLM provider."""
+    """The exact tool list sent to the provider, and what each of those tools does.
+
+    The roles ride along because the runtime is no longer the only reader that
+    needs them. A client renders an approval card red for a command it is about
+    to let a person authorise, dims a surface a plan-only run cannot write
+    with, and picks an icon per tool — and each of those was, until now, its own
+    copy of a list of names, kept in step with this deployment by nobody. A
+    scope that renamed its shell tool got a destructive command drawn as
+    something harmless. The map is the host's answer to that question, so it is
+    the thing to publish, rather than leaving every reader to guess again.
+    """
 
     policy = engine.effective_tool_policy
+    roles = engine.config.tool_roles
     toolsearch_pins = frozenset(engine.context_manager.pinned_tool_names())
     forced_pins = frozenset(policy.forced_pinned)
     configured_pins = frozenset(policy.pinned) - toolsearch_pins
@@ -663,6 +1582,7 @@ def _tool_surface_advertised_payload(
                 "name": tool.name,
                 "description": tool.description,
                 "sources": sources,
+                "roles": sorted(role.value for role in roles.roles_of(tool.name)),
             }
         )
     return {
@@ -673,44 +1593,225 @@ def _tool_surface_advertised_payload(
         "configured_pinned_tool_names": sorted(configured_pins),
         "forced_pinned_tool_names": sorted(forced_pins),
         "retrieval_top_k": engine.config.rc.tool_retrieval_top_k,
+        "argument_names": {
+            slot.value: list(names)
+            for slot, names in sorted(roles.argument_aliases.items())
+        },
         "tools": tools,
     }
 
 
-def query(engine: QueryEngine) -> AsyncIterator[TurnEvent]:
+async def resume(
+    engine: QueryEngine,
+    snapshot: dict[str, Any],
+    *,
+    approved_tool_call: ToolCall | None = None,
+    message: Message | None = None,
+    abandon_approval: bool = False,
+    resolutions: Mapping[str, InterruptResolution] | None = None,
+    allow_partial_resolution: bool = False,
+) -> AsyncIterator[TurnEvent]:
+    """Pick a stored run back up and drive it — the one public resume entry.
+
+    A run that stopped is stopped in one of three ways, and each needs a
+    different drive.  Before this entry existed the choice between them lived
+    in the host: it rehydrated with
+    :meth:`~protocore.runtime.query_engine.QueryEngine.resume_from_snapshot`
+    and then picked one of the drivers itself, which meant the guarantee a
+    resumed turn got — whether ``stop()`` could reach it, whether it left a
+    pickup point behind — depended on which driver the host happened to reach
+    for.  Here the choice is made from what the caller supplies, and whichever
+    branch is taken the drive carries the same cancellation handle and the same
+    closing snapshot.
+
+    ``snapshot`` is restored first and restored strictly: the identity binding
+    (run, tenant, session and the subagent lineage), the delivery mode and the
+    schema are all settled before the first mutation, so a snapshot belonging
+    to another run is refused with the engine untouched.  Nothing is driven
+    when the restore refuses.
+
+    The four drives:
+
+    * ``resolutions`` — the run stopped on one or more typed interrupts and
+      every one of them now has an answer.  This is the general form: a map
+      from interrupt id to :class:`~protocore.contracts.interrupt.InterruptResolution`,
+      which is what lets three calls parked together be approved, denied and
+      corrected in ONE resume instead of three rounds of stop-ask-resume.  A
+      map that leaves an open interrupt undecided is refused unless
+      ``allow_partial_resolution`` says that is deliberate; a map naming an
+      interrupt that is not open, or answering an approval with an answer, is
+      refused outright.
+    * ``approved_tool_call`` — the run stopped waiting for a decision on that
+      call and the decision was *approve*.  The call is executed once, through
+      :func:`resume_approved_tool`, which verifies it against the durable
+      pending call rather than trusting the argument.
+    * ``message`` — the run stopped waiting for input that has now arrived
+      (an answered question, an operator's reply).  The message opens a fresh
+      turn, as it would on a live engine.
+    * neither — the run stopped mid-turn with its history already ending in the
+      input it owes an answer to; the turn is simply re-driven.
+
+    ``approved_tool_call``, ``message`` and ``resolutions`` are alternatives,
+    not a sequence: a caller that supplies more than one has not decided which
+    of several different things happened, and gets a :class:`ValueError`
+    instead of the engine's guess.
+
+    A run restored in ``AWAITING`` is a run that was waiting, and the state
+    that recorded the wait is cleared here rather than left for the caller to
+    clear: the loop refuses to open a turn from ``AWAITING``.
+
+    A pending approval is not cleared with it.  A re-drive and an arriving
+    message are both news that something happened elsewhere; neither is a
+    decision on the call an operator was asked about.  Clearing the latch
+    anyway leaves the call parked in history with no result, and the wire
+    repair then fills the gap with a synthetic failure — telling the model
+    that a call nobody approved was attempted and failed, which is the one
+    thing the durable record exists to prevent.  So a non-approval drive over
+    a pending approval is refused, naming the call.
+
+    ``abandon_approval`` is how a caller says the decision will never come:
+    the parked call is closed with a result saying it was never approved and
+    never ran, which is true and leaves nothing for the repair to invent.  It
+    is a deliberate act, not a default, because the alternative reading — the
+    operator has not answered yet — is the common one.
+
+    The approved-call drive stops when the call's result lands in history; it
+    does not go on to answer it.  Producing that answer is a fresh turn against
+    the restored history and belongs to the caller, which is the one that knows
+    whether it still wants it.
+    """
+    if approved_tool_call is not None and message is not None:
+        raise ValueError(
+            "resume() takes an approved tool call or a message, not both: "
+            "an approved call resumes the tool that was waiting, a message "
+            "opens a new turn."
+        )
+    if approved_tool_call is not None and abandon_approval:
+        raise ValueError(
+            "resume() cannot both execute an approved tool call and abandon "
+            "the approval it was waiting for."
+        )
+    if resolutions is not None and (
+        approved_tool_call is not None or message is not None or abandon_approval
+    ):
+        raise ValueError(
+            "resume() takes a resolution map or one of the single-answer "
+            "arguments, not both: the map already says, per interrupt, which "
+            "of approve, deny, answer and abandon happened."
+        )
+    if allow_partial_resolution and resolutions is None:
+        raise ValueError(
+            "allow_partial_resolution says which interrupts a resolution map "
+            "may leave parked, and there is no map to say it about."
+        )
+
+    await engine.resume_from_snapshot(snapshot)
+
+    if resolutions is not None:
+        async for event in resume_interrupts(
+            engine, resolutions, allow_partial=allow_partial_resolution
+        ):
+            yield event
+        return
+
+    if approved_tool_call is not None:
+        async for event in resume_approved_tool(engine, approved_tool_call):
+            yield event
+        return
+
+    if engine.state is LoopState.AWAITING:
+        parked = engine.pending_interrupts
+        answerable = tuple(
+            item for item in parked if item.kind is not InterruptKind.approval
+        )
+        if abandon_approval:
+            for item in parked:
+                _abandon_pending_approval(engine, item.tool_call_id)
+                engine.release_interrupt(item.interrupt_id)
+        elif message is not None and len(parked) == len(answerable) == 1:
+            # One question outstanding and the answer has arrived. It settles
+            # the call that asked it — that is what the tool was waiting for —
+            # and the same text then opens the turn that reacts to it, which is
+            # what the caller asked for by passing a message rather than a
+            # resolution map.
+            waiting = parked[0]
+            _settle_parked_call(
+                engine,
+                tool_call_id=waiting.tool_call_id,
+                content=_message_text(message),
+                is_error=False,
+            )
+            engine.release_interrupt(waiting.interrupt_id)
+        elif parked:
+            raise ValueError(
+                "this run is waiting on "
+                f"{[(item.interrupt_id, item.kind.value, item.tool_call_id) for item in parked]}"
+                "; resuming without answering would leave those calls with no "
+                "result, and the wire repair would then report calls nobody "
+                "decided on, and questions the model really asked, to the "
+                "model as failures. Pass resolutions to answer them all, "
+                "approved_tool_call for the single-approval case, or "
+                "abandon_approval=True to close them as never answered."
+            )
+        engine.transition_to(LoopState.RUNNING)
+
+    async for event in engine.run(message):
+        yield event
+
+
+def _abandon_pending_approval(engine: QueryEngine, tool_call_id: str) -> None:
+    """Close a parked call whose approval the caller says will never come.
+
+    Writes the one true thing about it — it was never approved, so it never
+    ran and changed nothing — into history, and settles the durable record
+    that was holding it. Both halves matter: a record left standing keeps the
+    call open forever, and a ``tool_use`` left unpaired is filled in on the
+    wire with a synthetic failure, which says the opposite of the truth.
+    """
+    text = engine.config.rc.tool_result_approval_abandoned_placeholder
+    _insert_tool_result_after_use(
+        engine.history,
+        tool_call_id=tool_call_id,
+        content=text,
+        is_error=False,
+    )
+    intent = find_intent(engine.open_intents, tool_call_id)
+    if intent is not None:
+        settle_intent(intent, result=text)
+        _forget_intent(engine, intent)
+    engine.forget_tool_name(tool_call_id)
+
+
+def _query(engine: QueryEngine) -> AsyncIterator[TurnEvent]:
     """Drive one already-prepared turn through the public delivery boundary.
 
-    ``QueryEngine.run`` owns initial-message admission — the input message, the
-    turn number, the run clock and the turn-start snapshot — and then consumes
-    the same private generator directly.  This lower-level public iterator
-    leaves that admission to its caller, but it must never become an alternate
-    route around verification-gated reader delivery, and it must never become
-    one around the turn boundary either: the per-turn counters and latches,
-    which a caller cannot reach because they are private to the engine, this
-    entry puts back itself via
+    Internal, and internal on purpose.  ``QueryEngine.run`` owns initial-message
+    admission — the input message, the turn number, the run clock and the
+    turn-start snapshot — and then consumes the same private generator
+    directly.  This lower-level entry leaves that admission to its caller and
+    skips two further obligations ``run`` holds: ``_current_turn_task`` is never
+    bound, so :meth:`QueryEngine.stop` has no handle to cancel through and only
+    its cooperative flag fires, and no turn-start or turn-end snapshot is
+    persisted, so a turn driven here has no cross-pod pickup point.  A turn
+    driven through it therefore gets weaker cancellation and durability than
+    one driven through :meth:`QueryEngine.run` or :func:`resume`, which is why
+    it is not part of the package's public surface: an entry offering less than
+    its neighbours must not be the one a host reaches for first.
+
+    What it does still owe, it pays: the per-turn counters and latches, which a
+    caller cannot reach because they are private to the engine, it puts back
+    itself via
     :meth:`~protocore.runtime.query_engine.QueryEngine._reset_per_turn_state`.
     Without that, a turn opened here on an engine nudged in an earlier turn
     began already finalising and deleted its own answer as post-answer
-    narration.
-
-    That is the reset state only, and the sentence is deliberately not the
-    general rule "everything private belongs to the entry".  Two private
-    obligations of ``run`` are still skipped here, and a caller driving this
-    entry inherits them:
-
-    * ``_current_turn_task`` is never bound, so :meth:`QueryEngine.stop` has
-      no handle to cancel through and only its cooperative flag fires;
-    * no turn-start or turn-end snapshot is persisted, so a turn driven here
-      has no cross-pod resume point.
-
-    Both are reachable work rather than accepted design; they are named so the
-    next reader does not take the reset guarantee for a wider one.
+    narration.  It must also never become an alternate route around
+    verification-gated reader delivery.
 
     Deliberately NOT an async generator.  ``run`` is one, so its reset lands on
     the first ``__anext__`` rather than at the call — harmless there because
     every live caller iterates immediately, but a caveat that stops being
     harmless once it holds at more than one entry.  Returning the generator
-    instead of being one makes the reset here happen when ``query`` is called,
+    instead of being one makes the reset here happen when ``_query`` is called,
     so there is still exactly one place where a built-but-not-yet-iterated turn
     carries last turn's state.
     """
@@ -719,13 +1820,88 @@ def query(engine: QueryEngine) -> AsyncIterator[TurnEvent]:
 
 
 async def _projected_turn_events(engine: QueryEngine) -> AsyncIterator[TurnEvent]:
-    """The body of :func:`query`, split out so the reset above stays eager."""
+    """The body of :func:`_query`, split out so the reset above stays eager."""
     async for event in _query_raw(engine):
         for projected in engine._project_public_turn_event(event):
             yield projected
 
 
+def _hook_denied_stop(
+    engine: QueryEngine, point: HookEvent, outcome: LifecycleOutcome
+) -> TurnEvent:
+    """The stop a non-``allow`` verdict at ``point`` ends the turn with."""
+    return TurnEvent(
+        type=EventType.MESSAGE_STOP,
+        run_id=engine.config.run_id,
+        payload={
+            "stop_reason": "hook_denied",
+            "hook": point.value,
+            "verdict": outcome.verdict.value,
+            "reason": outcome.reason,
+            "decided_by": outcome.decided_by,
+        },
+    )
+
+
+def _apply_context_transform(
+    context: ContextBundle, payload: Mapping[str, Any]
+) -> ContextBundle:
+    """Rebuild the bundle from what the ``context_transform`` chain returned.
+
+    Only the two fields a transform is allowed to speak about are read, and
+    each only when it came back as the right shape: a handler that returns
+    nothing, or returns a field it has no business setting, leaves the bundle
+    exactly as it was.
+    """
+    sections = payload.get("system_prompt_sections")
+    language = payload.get("active_language")
+    updates: dict[str, Any] = {}
+    if isinstance(sections, (list, tuple)) and all(
+        isinstance(item, str) for item in sections
+    ):
+        replacement = tuple(sections)
+        if replacement != context.system_prompt_sections:
+            updates["system_prompt_sections"] = replacement
+    if isinstance(language, str) and language and language != context.active_language:
+        updates["active_language"] = language
+    if not updates:
+        return context
+    return replace(context, **updates)
+
+
 async def _query_raw(engine: QueryEngine) -> AsyncIterator[TurnEvent]:
+    """Drive one turn and close it out at the ``run_finalize`` coordinate.
+
+    The coordinate fires however the turn ended — a normal finish, an early
+    return, or an exception on its way out — because a finalization seam that
+    only runs when nothing went wrong is the one nobody can use for cleanup.
+    The exception is held, the coordinate is dispatched, and then the exception
+    continues on its way.
+    """
+    from protocore.runtime.correctness_bind import fire_lifecycle
+
+    error: Exception | None = None
+    try:
+        async for event in _drive_turn(engine):
+            yield event
+    except Exception as exc:
+        error = exc
+    _finalize, finalize_evt = await fire_lifecycle(
+        engine,
+        HookEvent.run_finalize,
+        {
+            "run_id": engine.config.run_id,
+            "state": engine.state.value,
+            "error": str(error) if error is not None else None,
+        },
+    )
+    if finalize_evt is not None:
+        yield finalize_evt
+    if error is not None:
+        raise error
+
+
+async def _drive_turn(engine: QueryEngine) -> AsyncIterator[TurnEvent]:
     """Drive one full turn of ``engine``. Yields :class:`TurnEvent` envelopes.
 
     See module docstring for the lifecycle. The function is a Python async
@@ -739,7 +1915,7 @@ async def _query_raw(engine: QueryEngine) -> AsyncIterator[TurnEvent]:
         # snapshot stays pairing-valid.
         _synthesize_missing_tool_results(
             engine.history,
-            error_content=engine.config.rc.tool_result_interrupted_placeholder,
+            error_content=engine.prompt_text("tool_result_interrupted"),
         )
         restored = restore_queued_prompts(engine)
         await _persist_live_control(engine)
@@ -788,33 +1964,30 @@ async def _query_raw(engine: QueryEngine) -> AsyncIterator[TurnEvent]:
     if callable(persister):
         persister(engine)
     await _populate_discovered_rules(engine)
-    from protocore.runtime.intent import resume_open_intents
+    # Before this turn drives anything, close out any call this run was in the
+    # middle of when it last stopped. A run rehydrated on another pod has to
+    # say something about a tool call it left in flight, and the only true
+    # thing it can say is that the outcome was never recorded.
+    if engine.open_intents:
+        async for intent_evt in _settle_interrupted_tool_intents(engine):
+            yield intent_evt
 
-    if engine.config.rc.intent_settlement_enabled and engine.open_intents:
-        engine.open_intents = resume_open_intents(list(engine.open_intents))
-        from protocore.runtime.correctness_bind import mark_intent_recovery, persist_correctness
+    from protocore.runtime.correctness_bind import fire_lifecycle
 
-        for item in engine.open_intents:
-            if item.status == "interrupted":
-                yield TurnEvent(
-                    type=EventType.INTENT_COMMITTED,
-                    run_id=engine.config.run_id,
-                    payload={"status": "interrupted", "operation_id": item.operation_id},
-                )
-                for rec_evt in mark_intent_recovery(engine, item):
-                    yield rec_evt
-        persist_correctness(engine)
-
-    from protocore.runtime.correctness_bind import fire_typed_hook
-
-    before_run, before_run_evt = fire_typed_hook(engine, "before_run", {"run_id": engine.config.run_id})
-    if before_run_evt is not None:
-        yield before_run_evt
-    if before_run.decision == "deny":
+    run_start, run_start_evt = await fire_lifecycle(
+        engine, HookEvent.run_start, {"run_id": engine.config.run_id}
+    )
+    if run_start_evt is not None:
+        yield run_start_evt
+    if not run_start.allowed:
         yield TurnEvent(
             type=EventType.MESSAGE_STOP,
             run_id=engine.config.run_id,
-            payload={"stop_reason": "hook_denied", "hook": "before_run"},
+            payload={
+                "stop_reason": "hook_denied",
+                "hook": HookEvent.run_start.value,
+                "reason": run_start.reason,
+            },
         )
         return
 
@@ -883,7 +2056,7 @@ async def _query_raw(engine: QueryEngine) -> AsyncIterator[TurnEvent]:
             # carries a tool_use with no result; pair it before the snapshot.
             _synthesize_missing_tool_results(
                 engine.history,
-                error_content=engine.config.rc.tool_result_interrupted_placeholder,
+                error_content=engine.prompt_text("tool_result_interrupted"),
             )
             yield TurnEvent(
                 type=EventType.MESSAGE_STOP,
@@ -919,7 +2092,7 @@ async def _query_raw(engine: QueryEngine) -> AsyncIterator[TurnEvent]:
         # FAILED snapshot so a later resume is wire-valid.
         _synthesize_missing_tool_results(
             engine.history,
-            error_content=engine.config.rc.tool_result_interrupted_placeholder,
+            error_content=engine.prompt_text("tool_result_interrupted"),
         )
         from_state = engine.state
         engine.transition_to(LoopState.FAILED)
@@ -1072,7 +2245,7 @@ async def _query_raw(engine: QueryEngine) -> AsyncIterator[TurnEvent]:
         # another pod must not replay a dangling tool_use into a 400.
         _synthesize_missing_tool_results(
             engine.history,
-            error_content=engine.config.rc.tool_result_interrupted_placeholder,
+            error_content=engine.prompt_text("tool_result_interrupted"),
         )
         restored = restore_queued_prompts(engine)
         await _persist_live_control(engine)
@@ -1135,7 +2308,6 @@ async def _run_compaction(
     turn-start gate and reactive-413 path pass ``None`` (no in-flight batch).
     """
     from protocore.runtime.context.budgets import derive_budgets
-    from protocore.runtime.context.manager import estimate_history_tokens
 
     from_state = engine.state
     engine.transition_to(LoopState.COMPACTING)
@@ -1154,7 +2326,9 @@ async def _run_compaction(
     # the bare window which made the telemetry incoherent.
     rc = engine.context_manager._rc
     budgets = derive_budgets(rc)
-    tokens_before_value = estimate_history_tokens(engine.history, rc)
+    tokens_before_value = engine.context_manager.token_estimator.estimate_history(
+        engine.history, rc
+    )
     yield TurnEvent(
         type=EventType.COMPACTION_STARTED,
         run_id=engine.config.run_id,
@@ -1173,27 +2347,61 @@ async def _run_compaction(
         if force
         else engine.context_manager.run_compaction
     )
-    from protocore.runtime.correctness_bind import fire_typed_hook
+    from protocore.runtime.correctness_bind import fire_lifecycle
 
-    _before_compact, before_compact_evt = fire_typed_hook(
-        engine, "before_compact", {"reason": reason}
+    pre_compact, pre_compact_evt = await fire_lifecycle(
+        engine, HookEvent.pre_compact, {"reason": reason}
     )
-    if before_compact_evt is not None:
-        yield before_compact_evt
+    if pre_compact_evt is not None:
+        yield pre_compact_evt
+    if not pre_compact.allowed:
+        # Compaction is a transaction, and this is the seam that can refuse to
+        # open it. Nothing was written, so there is nothing to roll back.
+        yield TurnEvent(
+            type=EventType.HOOK_FIRED,
+            run_id=engine.config.run_id,
+            payload={
+                "hook": HookEvent.compaction_rollback.value,
+                "decision": pre_compact.verdict.value,
+                "reason": pre_compact.reason,
+            },
+        )
+        return
+    async def _record_summariser_request(request: LLMRequest) -> None:
+        """Put the summariser's calls in the run's record alongside the turn's.
+
+        By default the summariser talks to the same provider the run streams
+        through, so a recording that held only the turn's calls would be short
+        by one entry per summary — and a compaction is exactly the event that
+        rewrites the transcript every later request is built from, which makes
+        it the one a reader most needs explained.
+        """
+        await _manifest_request(engine, request, call_purpose="compaction_summary")
+
     try:
         attempt = await compaction_call(
             history=engine.history,
             compaction_state=engine.compaction_state,
             tenant_id=engine.config.tenant_id,
-            model_name=engine.config.model_name,
+            model_name=engine.effective_model_name,
             observability=_observability_context(
                 engine,
                 call_purpose="structured",
                 call_category="compaction",
             ),
             protect_tail_from_index=protect_tail_from_index,
+            record_request=_record_summariser_request,
         )
     except CompactionExhaustedError as exc:
+        # The transaction opened at ``pre_compact`` and cannot close on
+        # success; say so at the coordinate that means exactly that.
+        _rollback, rollback_evt = await fire_lifecycle(
+            engine,
+            HookEvent.compaction_rollback,
+            {"reason": reason, "error": str(exc)},
+        )
+        if rollback_evt is not None:
+            yield rollback_evt
         compacting_from = engine.state
         engine.transition_to(LoopState.FAILED)
         yield _emit_state_change(
@@ -1221,8 +2429,19 @@ async def _run_compaction(
             "blob_refs_created": (list(attempt.tier1.blob_refs_created) if attempt.tier1 else []),
         },
     )
-    _after_compact, after_compact_evt = fire_typed_hook(
-        engine, "after_compact", {"reason": reason}
+    _commit, commit_evt = await fire_lifecycle(
+        engine,
+        HookEvent.compaction_commit,
+        {
+            "reason": reason,
+            "tokens_before": int(getattr(attempt, "tokens_before", 0) or 0),
+            "tokens_after": int(getattr(attempt, "tokens_after", 0) or 0),
+        },
+    )
+    if commit_evt is not None:
+        yield commit_evt
+    _after_compact, after_compact_evt = await fire_lifecycle(
+        engine, HookEvent.post_compact, {"reason": reason}
     )
     if after_compact_evt is not None:
         yield after_compact_evt
@@ -1307,7 +2526,7 @@ async def _emit_dispatch_cancel_teardown(
     """
     _synthesize_missing_tool_results(
         engine.history,
-        error_content=engine.config.rc.tool_result_interrupted_placeholder,
+        error_content=engine.prompt_text("tool_result_interrupted"),
     )
     from_state = engine.state
     engine.transition_to(LoopState.CANCELLED)
@@ -1359,6 +2578,20 @@ _PROVIDER_ADVANCE_REASONS: frozenset[str] = frozenset(
         "timeout",
     }
 )
+
+
+@dataclass(frozen=True, slots=True)
+class _IdleStreamVerdict:
+    """Core's own verdict on a stream that stopped speaking.
+
+    The provider adapters pin their classification onto the errors they raise
+    and core reads it duck-typed, without naming the taxonomy. The idle
+    watchdog lives in core, so nothing above it can classify what it raises and
+    core has to supply the verdict itself — in the same shape, so the reader
+    below stays one function.
+    """
+
+    reason: str = "timeout"
 
 
 def _classified_failure_reason(exc: BaseException) -> str:
@@ -1688,16 +2921,19 @@ async def _stream_one_assistant_message(
     LLM raises.
 
     The loop body was previously implemented as recursion; it now uses an
-    explicit ``while``-loop with a depth counter so that endless tool
-    calls cannot exceed Python's recursion limit before the
-    ``max_turns_per_run`` cap fires. Each iteration counts as one
-    assistant message.
+    explicit ``while``-loop with a depth counter, so that endless tool calls
+    cannot exceed Python's recursion limit. Each iteration counts as one
+    assistant message, and the cap on how many a run may open is a policy —
+    one of the bounds :func:`_effective_policies` keeps in the set whatever a
+    host installs, because the loop itself no longer carries one.
     """
-    assistant_message_idx = 0
+    # The turn-local state the loop shares with its policies. Every field was
+    # a local of this function; a policy that owns one now owns the write.
+    flags = TurnFlags()
+    policies = _effective_policies(engine)
     max_messages = engine.config.rc.max_turns_per_run
     current_context = context
     previous_tool_results_ready_at: float | None = None
-    terminal_nudge_used = False
     # When the forced backstop is armed from a typed provider/stream error,
     # the original exception + its terminal ``kind`` are stashed here. If the
     # best-effort forced turn (or any later turn) reaches a no-answer
@@ -1709,210 +2945,50 @@ async def _stream_one_assistant_message(
 
     while True:
         await _reload_live_control(engine)
-        wake_ids = await _maybe_place_background_wakes(engine)
-        if wake_ids:
-            yield TurnEvent(
-                type=EventType.BACKGROUND_WAKE,
-                run_id=engine.config.run_id,
-                payload={"task_ids": wake_ids},
-            )
-        # Cumulative tool-call budget. The bound that fires first on a run that
-        # is working rather than spiralling, and the one that used to do
-        # nothing: it appended a paragraph of English asking the agent to wrap
-        # up, said in the same breath that tools still ran, and the agent made
-        # another eighteen calls. Reaching it now starts the wind-down, so the
-        # NEXT turn has no tools to make a nineteenth call with.
-        if _tool_call_budget_reached(engine):
-            _budget_windup = _enter_soft_stop(
-                engine, cause=_soft_stop.CAUSE_TOOL_CALL_BUDGET
-            )
-            if _budget_windup:
-                for _evt in _budget_windup:
-                    yield _evt
-                max_messages = _soft_stop_turn_budget(engine, assistant_message_idx)
-                await engine._persist_snapshot()
-                current_context = await _rebuild_context_for_recovery(engine)
-                continue
-
-        # Cumulative OUTPUT-token budget guard. A spiral that re-emits a large
-        # truncated tool call burns output tokens every round and, with
-        # unbounded history, eventually trips the provider context-length
-        # ceiling. Reaching it starts the wind-down; reaching it AGAIN, with the
-        # wind-down already running and out of turns, terminates FAILED before
-        # the run degrades into the provider's context-length ceiling.
-        # ``run_max_output_tokens_budget=0`` disables the guard.
-        rc_budget = engine.config.rc.run_max_output_tokens_budget
-        if (
-            rc_budget > 0
-            and engine.total_usage.output_tokens > rc_budget
-            and not engine.is_terminal
-        ):
-            _logger.warning(
-                "DIAG query.run_output_token_budget_exhausted run=%s tenant=%s "
-                "output_tokens=%d budget=%d turn=%d",
-                engine.config.run_id,
-                engine.config.tenant_id,
-                engine.total_usage.output_tokens,
-                rc_budget,
-                assistant_message_idx,
-            )
-            _output_windup = _enter_soft_stop(
-                engine, cause=_soft_stop.CAUSE_OUTPUT_TOKEN_BUDGET
-            )
-            if _output_windup:
-                for _evt in _output_windup:
-                    yield _evt
-                max_messages = _soft_stop_turn_budget(engine, assistant_message_idx)
-                await engine._persist_snapshot()
-                current_context = await _rebuild_context_for_recovery(engine)
-                continue
-            async for evt in _emit_llm_terminal(
-                engine,
-                MaxOutputTokensExhausted(
-                    "run_max_output_tokens_budget exhausted "
-                    f"({engine.total_usage.output_tokens} > {rc_budget} output "
-                    "tokens) — terminating before the context-length ceiling"
-                ),
-                kind="run_output_token_budget_exhausted",
-            ):
-                yield evt
+        async for _bg_evt in _background_wake_events(engine):
+            yield _bg_evt
+        # Every bound this run can reach is read here, before the message
+        # opens: the tool-call budget, the output-token budget, and a
+        # precondition that burnt its attempts.
+        _turn = _turn_at(
+            engine,
+            flags,
+            TurnCoordinate.turn_start,
+            turn_budget=max_messages,
+            stored_stream_error=stored_stream_error,
+        )
+        async for _policy_evt in policies.apply(_turn):
+            yield _policy_evt
+        max_messages = _turn_budget_after(_turn.outcome, max_messages, flags)
+        if _turn.outcome.directive is TurnDirective.end_turn:
             return
-
-        # A run-level tool precondition that burnt its attempt budget ends the
-        # run. Checked at the top of every outer iteration — i.e. BEFORE
-        # another attempt is spent, and before the run can reach any
-        # completion path — because a caller who asked for a precondition and
-        # did not get one has been lied to, and silently answering anyway is
-        # exactly the failure this mechanism exists to prevent. Inert for a run
-        # that carries no preconditions.
-        if _preconditions.is_exhausted(engine) and not engine.is_terminal:
-            async for evt in _emit_tool_precondition_terminal(engine):
-                yield evt
-            return
-
-        # Hard cap on assistant messages within a single ``query()`` turn.
-        # ``turn_count`` only increments once per ``engine.run()`` — without
-        # this counter, a model emitting endless tool calls would blow the
-        # Python recursion stack before max_turns_per_run could fire.
-        assistant_message_idx += 1
-        if assistant_message_idx > max_messages:
-            # The turn budget is spent. First time here, that starts the
-            # wind-down: the model is told, its tools are taken away, and it
-            # gets ``soft_stop_max_turns`` turns to write the answer it has the
-            # evidence for. This branch used to hold three mechanisms — a forced
-            # artifact seal, a terminal-tool nudge, and a synthetic answer the
-            # runtime submitted on the model's behalf — each with its own latch,
-            # its own RC and its own idea of what "finish now" meant. The
-            # wind-down subsumes all three: the artifact sealer stays on the
-            # narrowed surface while an artifact is open, the notice is the
-            # nudge, and the answer is written by the model rather than
-            # assembled by the runtime out of its last words.
-            _turns_windup = _enter_soft_stop(engine, cause=_soft_stop.CAUSE_MAX_TURNS)
-            if _turns_windup:
-                for _evt in _turns_windup:
-                    yield _evt
-                max_messages = _soft_stop_turn_budget(engine, assistant_message_idx)
-                await engine._persist_snapshot()
+        if _turn.outcome.directive is TurnDirective.restart_turn:
+            if _turn.outcome.rebuild_context:
                 current_context = await _rebuild_context_for_recovery(engine)
-                continue
+            continue
 
-            # Second time here: the wind-down was given its turns and did not
-            # produce an answer, or it is disabled. If a typed stream error was
-            # what started it and the run is still unanswered, that error is the
-            # run's outcome — surfacing it beats completing silently on a budget
-            # the error is the reason we ran out of.
-            # The stored error is the run's outcome ONLY if the wind-down it
-            # started produced nothing. A wind-down that got the model to write
-            # its answer did the job it exists for, and re-raising the upstream
-            # failure over that answer would throw away the recovery and report
-            # a run that answered as a run that failed.
-            if (
-                stored_stream_error is not None
-                and not _history_has_terminal_tool_result(engine)
-                and not run_has_final_answer(engine)
-            ):
-                _exc, _kind = stored_stream_error
-                async for evt in _emit_llm_terminal(engine, _exc, kind=_kind):
-                    yield evt
-                return
+        # Hard cap on assistant messages within a single turn. The run-level
+        # turn count only moves once per run — without this counter a model
+        # emitting endless tool calls would blow the Python recursion stack
+        # before the run-level cap could fire.
+        flags.assistant_message_idx += 1
 
-            # Exhaustion, not a successful completion. Route to the
-            # FAILURE-class terminal so downstream success/failure accounting
-            # (the host _finalise_run, the terminal-signal classifier,
-            # dashboards, eval rigs) does not score a budget-exhausted run
-            # green. A run that got here THROUGH the wind-down says
-            # ``soft_stop`` rather than ``max_turns``: it was told to stop and
-            # given turns to finish in, which is a different fact about the run
-            # than simply running out of them.
-            #
-            # The transition MUST happen BEFORE the ``MESSAGE_STOP`` yield (the
-            # contract every other FAILED/CANCELLED site follows): ``query()``
-            # is consumed directly by the executor, so while the consumer
-            # processes the yielded event this generator is suspended — a
-            # transition placed after the yield only runs on the next pull,
-            # which is ``StopAsyncIteration``. The executor's terminal mirror
-            # reads ``engine.state`` while handling ``MESSAGE_STOP``;
-            # transitioning late made it read RUNNING and score the
-            # budget-exhausted run completed.
-            from_state = engine.state
-            # Pair any already-appended tool_use that never received a result
-            # before driving the FAILED terminal. The budget-exhausted last turn
-            # may have appended an assistant ``ToolUseBlock`` the dispatch loop
-            # never reached; without this the persisted snapshot carries an
-            # orphan tool_use and ``_repair_outbound_tool_pairing`` forward-fills
-            # an opaque synthetic on every subsequent request, which a
-            # transcript consumer cannot tell from a real model output.
-            _synthesize_missing_tool_results(
-                engine.history,
-                error_content=engine.config.rc.tool_result_interrupted_placeholder,
-            )
-            _soft_stopped = _soft_stop.is_armed(engine)
-            _finalized = _soft_stop.finalize(engine)
-            if _finalized is not None:
-                yield _finalized
-            engine.transition_to(LoopState.FAILED)
-            yield _emit_state_change(
-                engine,
-                from_state,
-                LoopState.FAILED,
-                reason=(
-                    "soft_stop_exhausted" if _soft_stopped else "max_turns_exhausted"
-                ),
-            )
-            yield TurnEvent(
-                type=EventType.MESSAGE_STOP,
-                run_id=engine.config.run_id,
-                payload={
-                    "turn_id": engine.turn_id(),
-                    "stop_reason": (
-                        _soft_stop.STOP_REASON
-                        if _soft_stopped
-                        else StopReason.max_turns.value
-                    ),
-                },
-            )
+        _turn = _turn_at(
+            engine,
+            flags,
+            TurnCoordinate.turn_budget,
+            turn_budget=max_messages,
+            stored_stream_error=stored_stream_error,
+        )
+        async for _policy_evt in policies.apply(_turn):
+            yield _policy_evt
+        max_messages = _turn_budget_after(_turn.outcome, max_messages, flags)
+        if _turn.outcome.directive is TurnDirective.end_turn:
             return
-
-        # Wall-clock deadline. The failure this guards: the run produced a good
-        # answer and was killed by an external trial or reaper before it got
-        # round to delivering it. Reaching ``agent_max_seconds`` minus the
-        # configured slack starts the wind-down, which is the same wind-down the
-        # turn and token budgets start — one mechanism, so "the run was cut
-        # short" reads the same in the transcript whichever bound did it. Inert
-        # when ``agent_max_seconds`` is 0.0. The wind-down's own arming latch is
-        # durable, so a run resumed near or past its deadline does not start a
-        # second one.
-        if _terminal_deadline_reached(engine):
-            _deadline_windup = _enter_soft_stop(
-                engine, cause=_soft_stop.CAUSE_DEADLINE
-            )
-            if _deadline_windup:
-                for _evt in _deadline_windup:
-                    yield _evt
-                max_messages = _soft_stop_turn_budget(engine, assistant_message_idx)
-                await engine._persist_snapshot()
+        if _turn.outcome.directive is TurnDirective.restart_turn:
+            if _turn.outcome.rebuild_context:
                 current_context = await _rebuild_context_for_recovery(engine)
-                continue
+            continue
 
         # Reset per-message recovery state at every new assistant
         # message — the budget is per-message, not per-run.
@@ -1925,11 +3001,11 @@ async def _stream_one_assistant_message(
         # / ``tool_result`` frames inside ``_drive_one_stream``, and the
         # ``message_stop`` at the bottom of this iteration) reads the same id
         # because they all call ``engine.turn_id()`` — so no frame is orphaned
-        # from its round. The FIRST round (``assistant_message_idx == 1``) was
+        # from its round. The FIRST round (``flags.assistant_message_idx == 1``) was
         # already opened just before the 4b loop-strategy step (so the Deep
         # ``REASONING_STEP`` and this message_start share one id); only rounds 2+
         # advance here. Pre-loop terminals keep the legacy (unsuffixed) id.
-        if assistant_message_idx > 1:
+        if flags.assistant_message_idx > 1:
             engine.begin_wire_round()
 
         # ── message_start ───────────────────────────────────────────
@@ -1949,13 +3025,13 @@ async def _stream_one_assistant_message(
         text_buffer = ""
         reasoning_buffer = ""
 
-        terminal_yielded = False
+        flags.terminal_yielded = False
         # Forced terminal backstop — set True when an exhaustion exit
         # inside the inner stream loop armed the forced terminal backstop
         # instead of going terminal. Checked right after the inner loop so
         # the OUTER loop iterates with the injected nudge in history (one
         # final bounded turn). Default behaviour (RC off) never sets this.
-        backstop_armed = False
+        flags.backstop_armed = False
         # An inner while-loop lets us re-stream after recovery
         # for ``LLMContextWindowExceeded`` (reactive compaction),
         # ``LLMProviderError`` with configured fallback model, or
@@ -1964,689 +3040,173 @@ async def _stream_one_assistant_message(
             stream_result = _StreamAttemptResult()
             tool_results_ready_at = previous_tool_results_ready_at
             previous_tool_results_ready_at = None
-            from protocore.runtime.correctness_bind import commit_usage, fire_typed_hook
+            from protocore.runtime.correctness_bind import commit_usage, fire_lifecycle
 
-            _transform_out, transform_evt = fire_typed_hook(
-                engine, "transform_context", {"history_len": len(engine.history)}
+            turn_start, turn_start_evt = await fire_lifecycle(
+                engine,
+                HookEvent.turn_start,
+                {
+                    "assistant_message_idx": flags.assistant_message_idx,
+                    "history_len": len(engine.history),
+                },
+            )
+            if turn_start_evt is not None:
+                yield turn_start_evt
+            if not turn_start.allowed:
+                yield _hook_denied_stop(engine, HookEvent.turn_start, turn_start)
+                return
+            transform_out, transform_evt = await fire_lifecycle(
+                engine,
+                HookEvent.context_transform,
+                {
+                    "history_len": len(engine.history),
+                    "system_prompt_sections": list(current_context.system_prompt_sections),
+                    "active_language": current_context.active_language,
+                },
             )
             if transform_evt is not None:
                 yield transform_evt
+            if not transform_out.allowed:
+                yield _hook_denied_stop(engine, HookEvent.context_transform, transform_out)
+                return
+            # The rewrite a transform returns is the context this turn is
+            # actually built from. A transform whose result went nowhere was
+            # the older, worse version of this seam.
+            current_context = _apply_context_transform(current_context, transform_out.payload)
+            request_prepare, request_prepare_evt = await fire_lifecycle(
+                engine,
+                HookEvent.request_prepare,
+                {
+                    "model": engine.effective_model_name,
+                    "message_count": len(current_context.messages),
+                },
+            )
+            if request_prepare_evt is not None:
+                yield request_prepare_evt
+            if not request_prepare.allowed:
+                yield _hook_denied_stop(engine, HookEvent.request_prepare, request_prepare)
+                return
             try:
-                async for evt in _drive_one_stream(
-                    engine,
-                    current_context,
-                    stream_result,
-                    previous_tool_results_ready_at=tool_results_ready_at,
-                ):
-                    yield evt
-                retrying = engine._transient_stream_retry_count > 0
-                usage_evt = commit_usage(
-                    engine,
-                    kind="retry" if retrying else "inference",
-                    input_tokens=engine.total_usage.this_turn_input,
-                    output_tokens=engine.total_usage.this_turn_output,
-                    success=True,
-                )
-                if usage_evt is not None:
-                    yield usage_evt
-            except LLMContextWindowExceeded as exc:
-                # Context-window-overflow recovery.
-                _persist_partial_attempt_to_history(engine, stream_result)
-                async for evt in _handle_context_window_exceeded(engine, exc):
-                    yield evt
-                if engine.is_terminal:
-                    terminal_yielded = True
-                    break
-                current_context = await _rebuild_context_for_recovery(engine)
-                continue
-            except LLMStreamIdleError as exc:
-                _persist_partial_attempt_to_history(engine, stream_result)
-                # The stream went quiet. A model that stalls AFTER the last
-                # tool result has its evidence in hand and only needs to be
-                # asked for the answer, so this starts the wind-down rather than
-                # terminating. The original error is stashed first: if the
-                # wind-down produces nothing, that error is what the run
-                # reports, instead of a silent no-answer completion.
-                _idle_windup = _enter_soft_stop(
-                    engine, cause=_soft_stop.CAUSE_PROVIDER_ERROR
-                )
-                if _idle_windup:
-                    stored_stream_error = (exc, "llm_stream_idle")
-                    max_messages = _soft_stop_turn_budget(
-                        engine, assistant_message_idx
-                    )
-                    for _evt in _idle_windup:
-                        yield _evt
-                    await engine._persist_snapshot()
-                    current_context = await _rebuild_context_for_recovery(engine)
-                    backstop_armed = True
-                    break
-                # Backstop disabled / already used — terminal LLM error.
-                # But a transient idle stream on a harness-forced continuation
-                # must NOT bury an answer the user already received: if a
-                # substantive reply is already in history, complete on it
-                # instead of driving the run FAILED.
-                if _preserve_completed_answer_on_stream_error(engine):
-                    async for evt in _complete_run_on_preserved_answer(
+                try:
+                    async for evt in _drive_one_stream(
                         engine,
-                        reason="stream_error_completed_answer_preserved",
+                        current_context,
+                        stream_result,
+                        previous_tool_results_ready_at=tool_results_ready_at,
                     ):
                         yield evt
-                    return
-                # Persist the partial before the terminal FAILED transition;
-                # otherwise a reload after the terminal event shows no record
-                # of what the user saw live.
-                async for evt in _emit_llm_terminal(engine, exc, kind="llm_stream_idle"):
-                    yield evt
-                terminal_yielded = True
-                break
-            except (LLMRateLimitError, LLMTimeoutError) as exc:
-                _persist_partial_attempt_to_history(engine, stream_result)
-                # TRANSIENT upstream failure — a 429 rate-limit
-                # (``LLMRateLimitError``) or a request/stream timeout
-                # (``LLMTimeoutError``). The error classifier marks both
-                # retryable / should_fallback, so — unlike an unclassified
-                # crash — they must get the SAME recovery a generic provider
-                # error gets, plus a bounded in-place retry. These two classes
-                # are siblings of ``LLMProviderError`` (not subclasses), so
-                # this branch MUST precede it to intercept them. Recovery
-                # order: (a) step down the run's provider chain;
-                # (b) else re-open the same stream up to
-                # ``llm_transient_error_retry_max_attempts`` with a backoff;
-                # (c) only after both are unavailable/exhausted go terminal —
-                # and even then preserve an already-delivered answer.
-                #
-                # (a) before (b) because a healthy sibling provider beats
-                # sleeping on a sick one: the backoff is a bet that this
-                # endpoint recovers, and the chain exists precisely for the
-                # runs where that bet is wrong.
-                rc = engine.config.rc
-                kind = (
-                    "llm_rate_limit"
-                    if isinstance(exc, LLMRateLimitError)
-                    else "llm_timeout"
-                )
-                # (a) step down the provider chain — bounded by
-                # ``llm_provider_chain_max_advances``, one-way, and the same
-                # path the ``LLMProviderError`` branch below uses.
-                advanced_to = await _advance_provider_chain(engine, exc, kind=kind)
-                if advanced_to:
-                    yield TurnEvent(
-                        type=EventType.STATE_CHANGED,
-                        run_id=engine.config.run_id,
-                        payload={
-                            "from": engine.state.value,
-                            "to": engine.state.value,
-                            "reason": "model_fallback_triggered",
-                            "fallback_model_id": advanced_to,
-                            "primary_error": str(exc),
-                            "error_class": kind,
-                        },
-                    )
-                    # Persist the partial the user already saw live before the
-                    # swap so the next provider's stream (and a reload) carry it.
-                    current_context = await _rebuild_context_for_recovery(engine)
-                    continue
-                # (b) bounded in-place retry with backoff. The streak counter
-                # resets after any successful stream (below), so the bound is
-                # per consecutive-failure streak.
-                if (
-                    engine._transient_stream_retry_count
-                    < rc.llm_transient_error_retry_max_attempts
-                ):
-                    fail_evt = commit_usage(
+                    retrying = engine._transient_stream_retry_count > 0
+                    usage_evt = commit_usage(
                         engine,
-                        kind="inference",
+                        kind="retry" if retrying else "inference",
                         input_tokens=engine.total_usage.this_turn_input,
                         output_tokens=engine.total_usage.this_turn_output,
-                        success=False,
+                        success=True,
                     )
-                    if fail_evt is not None:
-                        yield fail_evt
-                    engine._transient_stream_retry_count += 1
-                    delay = _transient_retry_backoff_seconds(
-                        rc, engine._transient_stream_retry_count, exc
-                    )
-                    yield TurnEvent(
-                        type=EventType.STATE_CHANGED,
-                        run_id=engine.config.run_id,
-                        payload={
-                            "from": engine.state.value,
-                            "to": engine.state.value,
-                            "reason": "transient_llm_error_retry",
-                            "error_class": kind,
-                            "attempt": engine._transient_stream_retry_count,
-                            "backoff_seconds": delay,
-                            "primary_error": str(exc),
+                    if usage_evt is not None:
+                        yield usage_evt
+                    _received, received_evt = await fire_lifecycle(
+                        engine,
+                        HookEvent.response_received,
+                        {
+                            "finish_reason": stream_result.finish_reason,
+                            "tool_call_count": len(stream_result.tool_calls),
+                            "text_length": len(stream_result.text_buffer),
                         },
                     )
-                    # Persist the partial before the backoff so a crash during
-                    # the pause does not lose what the user already saw.
-                    if delay > 0:
-                        await asyncio.sleep(delay)
-                    current_context = await _rebuild_context_for_recovery(engine)
-                    continue
-                # (c) fallback unavailable/engaged AND retries exhausted. A
-                # transient error on a harness-forced continuation must NOT
-                # bury an answer the user already received.
-                if _preserve_completed_answer_on_stream_error(engine):
-                    async for evt in _complete_run_on_preserved_answer(
+                    if received_evt is not None:
+                        yield received_evt
+                except Exception as request_exc:
+                    # Every provider failure this turn can take passes through
+                    # here on its way to the recovery branch that owns it, so
+                    # the coordinate fires once per failure and changes none of
+                    # the recovery that follows.
+                    _errored, error_evt = await fire_lifecycle(
                         engine,
-                        reason="stream_error_completed_answer_preserved",
-                    ):
-                        yield evt
-                    return
-                # Persist the partial before the terminal FAILED transition so
-                # a reload reflects what streamed live.
-                async for evt in _emit_llm_terminal(engine, exc, kind=kind):
-                    yield evt
-                terminal_yielded = True
-                break
-            except LLMProviderError as exc:
-                _persist_partial_attempt_to_history(engine, stream_result)
-                # Step down the provider chain. This branch is the adapters'
-                # catch-all — a 503 and a policy refusal arrive here as the same
-                # Python type — so only the classification attached to the error
-                # decides whether a different endpoint could serve it. An
-                # unclassified one never advances.
-                advanced_to = await _advance_provider_chain(
-                    engine, exc, kind="llm_provider_error"
-                )
-                if advanced_to:
-                    yield TurnEvent(
-                        type=EventType.STATE_CHANGED,
-                        run_id=engine.config.run_id,
-                        payload={
-                            "from": engine.state.value,
-                            "to": engine.state.value,
-                            "reason": "model_fallback_triggered",
-                            "fallback_model_id": advanced_to,
-                            "primary_error": str(exc),
+                        HookEvent.request_error,
+                        {
+                            "error": str(request_exc),
+                            "error_type": type(request_exc).__name__,
                         },
                     )
-                    # The failed attempt's deltas already streamed to SSE
-                    # consumers; persist the partial assistant turn to history
-                    # so the next provider's stream (and a reload) carry the
-                    # same content the live view showed. Without this, the user
-                    # sees a divergent second answer in the same turn window
-                    # while reload shows only the second.
-                    continue
-                # No fallback available or already used. Wind the run down
-                # rather than dropping it: the partial the user already saw is
-                # in history, the model has whatever evidence it gathered, and
-                # one narrowed turn is enough to turn that into an answer. Same
-                # entry point as every other bound. The original error is
-                # stashed so a wind-down that produces nothing still reports the
-                # provider failure rather than completing silently.
-                _provider_windup = _enter_soft_stop(
-                    engine, cause=_soft_stop.CAUSE_PROVIDER_ERROR
-                )
-                if _provider_windup:
-                    stored_stream_error = (exc, "llm_provider_error")
-                    max_messages = _soft_stop_turn_budget(
-                        engine, assistant_message_idx
-                    )
-                    for _evt in _provider_windup:
-                        yield _evt
-                    await engine._persist_snapshot()
-                    current_context = await _rebuild_context_for_recovery(engine)
-                    backstop_armed = True
-                    break
-                # Backstop disabled / already used — terminal.
-                # A transient provider error on a harness-forced finalize-nudge
-                # continuation must NOT override an otherwise-successful run: if
-                # a complete assistant answer already streamed in a prior turn,
-                # complete on that delivered answer rather than propagating the
-                # continuation turn's provider error as the run's terminal status.
-                if _preserve_completed_answer_on_stream_error(engine):
-                    async for evt in _complete_run_on_preserved_answer(
-                        engine,
-                        reason="stream_error_completed_answer_preserved",
-                    ):
-                        yield evt
-                    return
-                # Persist the partial before the terminal FAILED transition;
-                # otherwise a reload after the terminal event shows no record
-                # of what the user saw live.
-                async for evt in _emit_llm_terminal(engine, exc, kind="llm_provider_error"):
-                    yield evt
-                terminal_yielded = True
-                break
+                    if error_evt is not None:
+                        yield error_evt
+                    raise
             except Exception as exc:
+                # Every way a stream attempt can fail arrives here, and what
+                # the run does about it — another endpoint, the same one
+                # again, a wind-down onto the evidence it already has, or a
+                # terminal — is one ranked decision rather than five branches
+                # that grew apart. The partial the reader already saw is put
+                # in the transcript first, so whatever recovery is chosen
+                # carries it forward.
                 _persist_partial_attempt_to_history(engine, stream_result)
-                # The generic catch-all must NOT arm the backstop. It catches
-                # real parser/runtime crashes, not just provider-class
-                # failures; arming here would let a later best-effort terminal
-                # call complete "successfully" and SWALLOW the crash. An
-                # unclassified exception stays terminal so the original error
-                # is always surfaced.
-                #
-                # The traceback is logged HERE as well as in the terminal
-                # emitter. The two records answer different questions: this one
-                # names the turn the crash landed on, and it is written even if
-                # driving the terminal then raises in turn.
-                _logger.warning(
-                    "DIAG query.stream_crashed run=%s tenant=%s turn=%s "
-                    "assistant_message=%d exception=%s message=%s",
-                    engine.config.run_id,
-                    engine.config.tenant_id,
-                    engine.turn_id(),
-                    assistant_message_idx,
-                    type(exc).__name__,
-                    exc,
-                    exc_info=exc,
+                _turn = _turn_at(engine, flags, TurnCoordinate.stream_failed,
+                    stream_error=exc,
                 )
-                async for evt in _emit_llm_terminal(
-                    engine, exc, kind=INTERNAL_ERROR_KIND
-                ):
-                    yield evt
-                terminal_yielded = True
-                break
-
-            # Mid-tool-call truncation recovery: the
-            # model started emitting a tool_use block, ran out of output
-            # tokens before closing the args JSON, and the SSE parser
-            # synthesised a stop with ``truncated_by_output_cap=True``.
-            # Dispatching that partial call would silently corrupt the
-            # tool target (e.g. a Write call would write a truncated
-            # file and the model would never know to continue). Instead:
-            #
-            # 1. Append the partial assistant turn to history so the
-            #    next stream can see what was already emitted (text +
-            #    tool_use blocks with the truncated args JSON).
-            # 2. Append a synthetic user-role resume nudge naming the
-            #    truncated tool(s) so the model knows it must re-issue
-            #    the call with COMPLETE arguments.
-            # 3. Re-open the LLM stream and let the model finish.
-            #
-            # Budgeted by ``rc.max_output_recovery_rounds`` (shared with
-            # the text-only length-truncation branch — each truncation type
-            # debits the same per-message counter).
-            truncated_tool_calls = [
-                tc
-                for tc in stream_result.tool_calls
-                if tc.truncated_by_output_cap
-            ]
-            # The recovery trigger is the PROVIDER-AGNOSTIC
-            # ``truncated_by_output_cap`` signal under ANY ``finish_reason``
-            # (NOT only ``length``). A content-less Write cut at the cap can
-            # arrive under ``finish_reason="tool_use"``; the old
-            # ``finish_reason == "length"`` gate missed it, causing the broken
-            # call to fall through to dispatch → Pydantic ``Field required`` →
-            # spiral. A truncated mutation call is NEVER dispatched: it is
-            # routed into the bounded chunk-recovery protocol instead.
-            if truncated_tool_calls:
-                rc = engine.config.rc
-                _persist_partial_attempt_to_history(engine, stream_result)
-                if engine._max_output_recovery_count < rc.max_output_recovery_rounds:
-                    engine._max_output_recovery_count += 1
-                    # partition the truncated chunkable
-                    # writes whose partial ``content`` body the parser RECOVERED
-                    # (salvageable) from the rest. Only when the convergence
-                    # driver is enabled: a disabled driver keeps the pre-FEAT
-                    # discard-redo (bit-identical). The salvaged calls' partial
-                    # bytes are written to disk via a CLEAN synthetic write so
-                    # the genuine truncation case lands bytes + the truncation-
-                    # gated driver can engage (the stand-validated path). The
-                    # NON-salvaged calls (content absent / ``__raw__`` / non-
-                    # content tools) keep the chunk-recovery protocol and are
-                    # NEVER dispatched ("never dispatch corrupt / content-less"
-                    # invariant preserved). A call qualifies for salvage ONLY
-                    # when ALL hold: the driver is enabled; the tool is a
-                    # BUILT-IN chunkable write (Write/AppendFile) — salvage
-                    # dispatches a built-in write, so a flagged TENANT tool
-                    # keeps its own recovery instead of being silently
-                    # rewritten; a real target path resolves (a pathless
-                    # content-present call must stay in ``unsalvaged`` and get
-                    # the recovery prompt, never be dropped); and a non-empty
-                    # partial ``content`` was recovered.
-                    salvage_jobs: list[tuple[ToolCall, str]] = []
-                    if _longfile.is_enabled(engine):
-                        for _tc in truncated_tool_calls:
-                            if _tc.name not in CHUNKABLE_CONTENT_MUTATION_ALLOWLIST:
-                                continue
-                            if _truncated_call_state_path(_tc) is None:
-                                continue
-                            salvaged_partial = _salvage_truncated_content(_tc)
-                            if salvaged_partial:
-                                salvage_jobs.append((_tc, salvaged_partial))
-                    salvaged_ids = {tc.id for tc, _ in salvage_jobs}
-
-                    # Telemetry: surface every successful trigger for dashboard
-                    # observability. Counter lives in the host-side
-                    # parser-recovery telemetry; the core loop signals the same
-                    # The original provider attempt was persisted above with its
-                    # original call ids and the partial-attempt marker. Synthetic
-                    # salvage calls remain separate runtime-authored scaffolding.
-
-                    # Dispatch the COMPLETE (non-truncated) sibling tool calls
-                    # in this turn so we do not lose work the model
-                    # legitimately finished alongside the truncated one. The
-                    # output cap ends the stream, so every complete call
-                    # PRECEDES the truncated tail call → dispatching them here
-                    # preserves causal order. Without this, complete calls'
-                    # ``tool_use`` ids (already appended to the assistant turn
-                    # via ``partial_blocks`` above) stay unpaired, and
-                    # ``_repair_outbound_tool_pairing`` forward-fills opaque
-                    # synthetic ``is_error`` placeholders on every subsequent
-                    # request — completed work is dropped and the model sees
-                    # synthetic errors, burning extra recovery rounds.
-                    # ``truncated_tool_calls`` already excludes the terminal raw
-                    # envelope; salvaged calls are a subset of it, so excluding
-                    # the truncated set excludes them too.
-                    truncated_ids = {tc.id for tc in truncated_tool_calls}
-                    sibling_pending = False
-                    sibling_terminal_completed = False
-                    for tool_call in stream_result.tool_calls:
-                        if tool_call.id in truncated_ids:
-                            continue
-                        # Re-check the cancel checkpoint before EACH sibling
-                        # dispatch: this is a distinct dispatch entry point
-                        # that runs after several await /
-                        # yield boundaries where a cancel can land. Route to the
-                        # CANCELLED terminal WITHOUT dispatching; the shared
-                        # teardown synthesises ``is_error`` results for any
-                        # already-appended-but-undispatched ``tool_use`` (the
-                        # truncated calls + the remaining siblings) so the
-                        # snapshot stays pairing-valid for a cross-pod resume.
-                        if engine.stop_requested:
-                            async for evt in _emit_dispatch_cancel_teardown(engine):
-                                yield evt
-                            return
-                        async for evt in _dispatch_tool(engine, tool_call):
-                            if evt.type is EventType.TOOL_CALL_PENDING:
-                                engine.mark_pending_approval(tool_call.id)
-                                engine.transition_to(LoopState.AWAITING)
-                                await engine._persist_snapshot()
-                                sibling_pending = True
-                                yield evt
-                                break
-                            yield evt
-                        if sibling_pending:
-                            break
-                        if _history_tool_result_is_terminal(engine, tool_call.id):
-                            sibling_terminal_completed = True
-                            break
-                    if sibling_pending:
-                        return
-                    if sibling_terminal_completed:
-                        # pair any unpaired tool_use (the unsalvaged
-                        # truncated tail blocks were appended above without a
-                        # paired result, and any undispatched siblings) before
-                        # driving the COMPLETED terminal. Same
-                        # pairing rationale as the main terminal-completion
-                        # site; without this call the persisted snapshot
-                        # carries orphan tool_use blocks whose only consumer
-                        # repair is the opaque wire-boundary
-                        # ``_repair_outbound_tool_pairing`` forward-fill.
-                        _synthesize_missing_tool_results(
-                            engine.history,
-                            error_content=engine.config.rc.tool_result_interrupted_placeholder,
-                        )
-                        # A sibling completed the run via the terminal tool.
-                        # Seal any truncation-gated complete-enough-but-unsealed
-                        # file (no-op when not eligible) then close the run —
-                        # the truncated tail call is moot once the model has
-                        # voluntarily finished. Mirrors the terminal seal at
-                        # the sibling truncated-recovery path.
-                        async for _seal_evt in _maybe_seal_longfile_at_voluntary_finish(
-                            engine
-                        ):
-                            yield _seal_evt
-                        async for _completion_evt in _emit_voluntary_completion(engine):
-                            yield _completion_evt
-                        engine.transition_to(LoopState.COMPLETED)
-                        return
-
-                    # Land each salvageable partial on disk (clean synthetic
-                    # write; sets the sticky truncation latch + active-path
-                    # handoff BEFORE dispatch; bytes + latch persist
-                    # atomically). The salvage dispatches ``preapproved=True``
-                    # (runtime-internal recovery of the model's OWN content), so
-                    # the dispatcher suppresses ``TOOL_CALL_PENDING`` and the
-                    # approval gate never fires — same policy as the guaranteed-
-                    # terminal synthetic dispatch. The pending guard below is
-                    # defensive (mirrors the normal serial-dispatch path) and is
-                    # never reached while salvage stays preapproved.
-                    for _stc, _salvaged in salvage_jobs:
-                        salvage_pending = False
-                        # PRE-DISPATCH cancel
-                        # checkpoint (mirrors the non-truncated dispatch path at
-                        # query.py:1869 and the sibling truncated-recovery
-                        # dispatch above at query.py:1199). The recovery turn
-                        # crosses several await / yield boundaries (the
-                        # recovery persist, the state-change event, the
-                        # ``_salvage_truncated_write_to_disk`` generator) where
-                        # a cancel can land; without this checkpoint the
-                        # synthetic salvage write still dispatches after
-                        # ``engine.stop_requested`` flips, mutating the
-                        # workspace AFTER cancellation. Route to the
-                        # CANCELLED terminal via the shared teardown (the
-                        # unrun salvage leaves no matching tool_result, so
-                        # ``_repair_outbound_tool_pairing`` forward-fills the
-                        # synthetic is_error on the NEXT outbound request if
-                        # needed; the previous continue / recovery messages
-                        # are already in durable history).
-                        if engine.stop_requested:
-                            async for evt in _emit_dispatch_cancel_teardown(engine):
-                                yield evt
-                            return
-                        async for _salvage_evt in _salvage_truncated_write_to_disk(
-                            engine, _stc, _salvaged
-                        ):
-                            if _salvage_evt.type is EventType.TOOL_CALL_PENDING:
-                                engine.mark_pending_approval(
-                                    str(_salvage_evt.payload.get("tool_call_id", ""))
-                                )
-                                engine.transition_to(LoopState.AWAITING)
-                                await engine._persist_snapshot()
-                                salvage_pending = True
-                            yield _salvage_evt
-                        if salvage_pending:
-                            return
-
-                    if salvage_jobs:
-                        # The original truncated tool calls are never dispatched.
-                        # Pair them durably with the canonical interrupted result;
-                        # this keeps the original provider attempt reload-safe while
-                        # the clean synthetic salvage pair records the mutation that
-                        # actually reached disk.
-                        _synthesize_missing_tool_results(
-                            engine.history,
-                            error_content=engine.config.rc.tool_result_interrupted_placeholder,
-                        )
-
-                    # The NON-salvaged truncated calls (content-absent /
-                    # ``__raw__`` / non-content): chunk-recovery protocol.
-                    # ``_build_truncation_chunk_recovery_text`` names the path +
-                    # the per-call ``write_chunk_token_budget`` and, on a REPEAT
-                    # content-absent truncation of a path, LOWERS the header
-                    # budget (``_lowered_header_budget``) so the retry writes a
-                    # SMALLER first chunk that fits under the cap, lands bytes,
-                    # and lets the driver engage next round (the "cut before any
-                    # body" shape). Skipped when everything was salvaged.
-                    unsalvaged = [
-                        tc for tc in truncated_tool_calls if tc.id not in salvaged_ids
-                    ]
-                    resume_text = ""
-                    if unsalvaged:
-                        resume_text = _build_truncation_chunk_recovery_text(
-                            engine, unsalvaged
-                        )
-                        # A content-absent chunkable write cut at the cap left
-                        # no bytes to salvage but IS a large-file-in-progress:
-                        # latch its REAL path (state-path, never the
-                        # ``"the target file"`` placeholder) so once the
-                        # smaller-chunk retry lands bytes the driver engages.
-                        # The INCOMPLETE-flavoured recovery message is preserved.
-                        for _tc in unsalvaged:
-                            if _is_content_mutation_truncation(engine, _tc):
-                                _longfile.note_truncated_mutation(
-                                    engine, _truncated_call_state_path(_tc)
-                                )
-                    # A-— a NON-salvage recovery turn added NO bytes and
-                    # ``continue``s below WITHOUT reaching the turn-end seam, so
-                    # advance the stall clock here. When a salvage DID land bytes,
-                    # ``observe_tool_result`` already reset the clock to 0, so the
-                    # advance is a correct no-op for that turn.
-                    _longfile.register_completed_turn(engine)
-                    if resume_text:
-                        engine.history.append(
-                            Message(
-                                role=MessageRole.user,
-                                content_blocks=[TextBlock(text=resume_text)],
-                                metadata={
-                                    SYNTHETIC_RECOVERY_METADATA_KEY: (
-                                        SYNTHETIC_RECOVERY_TRUNCATION_CONTINUE
-                                    )
-                                },
+                async for _policy_evt in policies.apply(_turn):
+                    yield _policy_evt
+                if _turn.stored_stream_error is not None:
+                    stored_stream_error = _turn.stored_stream_error
+                max_messages = _turn_budget_after(_turn.outcome, max_messages, flags)
+                if _turn.outcome.directive is TurnDirective.restart_turn:
+                    if _turn.outcome.rebuild_context:
+                        current_context = await _rebuild_context_for_recovery(engine)
+                    continue
+                if _turn.outcome.directive is TurnDirective.end_turn:
+                    if flags.terminal_yielded or flags.backstop_armed:
+                        if _turn.outcome.rebuild_context:
+                            current_context = await _rebuild_context_for_recovery(
+                                engine
                             )
-                        )
-                    recovery_payload: dict[str, Any] = {
-                        "from": engine.state.value,
-                        "to": engine.state.value,
-                        "reason": "tool_call_truncation_recovery",
-                        "round": engine._max_output_recovery_count,
-                        "tools": [tc.name for tc in truncated_tool_calls],
-                        "paths": _truncated_call_paths(truncated_tool_calls),
-                    }
-                    # Only add ``salvaged_paths`` key when at least one salvage
-                    # actually fired. A disabled driver never populates
-                    # ``salvage_jobs``, so its event payload stays BYTE-IDENTICAL
-                    # to the no-salvage case (no stray ``salvaged_paths: []``).
-                    if salvage_jobs:
-                        recovery_payload["salvaged_paths"] = _truncated_call_paths(
-                            [tc for tc, _ in salvage_jobs]
-                        )
-                    yield TurnEvent(
-                        type=EventType.STATE_CHANGED,
-                        run_id=engine.config.run_id,
-                        payload=recovery_payload,
-                    )
-                    current_context = await _rebuild_context_for_recovery(engine)
-                    continue
-                # Budget exhausted: the model packed an oversized terminal call
-                # (a large list argument, say) and ran out of output budget on
-                # every recovery round. Wind down so it is asked for a compact
-                # answer on a surface that has nothing else on it.
-                _truncation_windup = _enter_soft_stop(
-                    engine, cause=_soft_stop.CAUSE_OUTPUT_TOKEN_BUDGET
-                )
-                if _truncation_windup:
-                    max_messages = _soft_stop_turn_budget(
-                        engine, assistant_message_idx
-                    )
-                    # Pin the wind-down turns to the EXHAUSTED recovery counter:
-                    # the per-message ``reset_recovery_state`` would otherwise
-                    # hand them a fresh ``max_output_recovery_rounds`` budget and
-                    # let them re-enter the recovery loop. With the counter left
-                    # spent, a re-truncation during the wind-down re-reaches this
-                    # branch, where the wind-down is already armed and the
-                    # terminal below takes over with the original
-                    # ``output_length_exhausted`` kind.
-                    engine._terminal_backstop_turn_active = True
-                    for _evt in _truncation_windup:
-                        yield _evt
-                    await engine._persist_snapshot()
-                    current_context = await _rebuild_context_for_recovery(engine)
-                    backstop_armed = True
-                    break
-                # Backstop disabled / already used — terminal LLM error.
-                async for evt in _emit_llm_terminal(
-                    engine,
-                    MaxOutputTokensExhausted(
-                        "max_output_recovery_rounds exhausted (mid-tool-call truncation)"
-                    ),
-                    kind="output_length_exhausted",
-                ):
-                    yield evt
-                terminal_yielded = True
-                break
+                        break
+                    # Neither a terminal nor a wind-down: the run was closed on
+                    # an answer it had already delivered.
+                    return
+                # Nobody claimed the failure. Ending here would be the quietest
+                # possible outcome — no terminal, no state change, and the
+                # exception dropped — so the failure goes back to the caller
+                # as what it is.
+                raise
 
-            # Max-output-tokens recovery: model truncated mid-turn
-            # without yielding tool_calls. Synthesise a resume prompt
-            # and re-stream up to ``rc.max_output_recovery_rounds`` times.
-            #
-            # ``finish_reason is None`` is folded into this branch.
-            # ``result.finish_reason`` is set ONLY by a
-            # ``ProviderDeltaKind.finish`` delta (``_drive_one_stream``); the
-            # empirically-observed OpenRouter SSE tail-loss shape ends the
-            # upstream iterator cleanly (``data: [DONE]`` / EOF) with NO finish
-            # delta, leaving it ``None``. Treating that as a normal completion
-            # let a mid-sentence partial with no tool calls fall through to the
-            # no-tool ``end_turn`` branch below and the run COMPLETED with the
-            # truncated prefix persisted as the final answer. A finish-less,
-            # tool-call-less stream is an incomplete turn: drive the SAME
-            # bounded resume recovery as a ``length`` truncation (re-stream so
-            # the model finishes; exhaustion goes terminal, never a silent
-            # truncated completion).
-            #
-            # ``not engine.stop_requested`` keeps a cancel that broke the inner
-            # stream (also leaves ``finish_reason`` None — the per-delta stop
-            # check in ``_drive_one_stream``) on the dedicated CANCELLED path
-            # below; an interrupted turn must not be "recovered".
-            if (
-                stream_result.finish_reason in ("length", None)
-                and not stream_result.tool_calls
-                and not engine.stop_requested
-            ):
-                rc = engine.config.rc
-                _persist_partial_attempt_to_history(engine, stream_result)
-                if engine._max_output_recovery_count < rc.max_output_recovery_rounds:
-                    engine._max_output_recovery_count += 1
-                    # Append a resume nudge after the durable partial attempt.
-                    engine.history.append(
-                        Message(
-                            role=MessageRole.user,
-                            content_blocks=[
-                                TextBlock(
-                                    text=("Resume directly from where you left off, without preamble or repetition.")
-                                )
-                            ],
-                            metadata={
-                                SYNTHETIC_RECOVERY_METADATA_KEY: (
-                                    SYNTHETIC_RECOVERY_MAX_OUTPUT_CONTINUE
-                                )
-                            },
-                        )
-                    )
-                    yield TurnEvent(
-                        type=EventType.STATE_CHANGED,
-                        run_id=engine.config.run_id,
-                        payload={
-                            "from": engine.state.value,
-                            "to": engine.state.value,
-                            "reason": "max_output_token_recovery",
-                            "round": engine._max_output_recovery_count,
-                        },
-                    )
+
+            # ── The output budget ran out before the round finished ────
+            # Mid-sentence or mid-way through a tool call's arguments: either
+            # way this is not a finished turn, and neither shape may be
+            # accepted as one. Nothing has been dispatched yet, which is what
+            # makes the refusal of a half-written call possible at all.
+            _turn = _turn_at(
+                engine,
+                flags,
+                TurnCoordinate.output_truncated,
+                pending_tool_calls=stream_result.tool_calls,
+                finish_reason=stream_result.finish_reason or "",
+                record_partial_attempt=partial(
+                    _persist_partial_attempt_to_history, engine, stream_result
+                ),
+                cancel_checkpoint=partial(
+                    _cancel_checkpoint, engine, flags, policies
+                ),
+            )
+            async for _policy_evt in policies.apply(_turn):
+                yield _policy_evt
+            max_messages = _turn_budget_after(_turn.outcome, max_messages, flags)
+            if _turn.outcome.directive is TurnDirective.restart_turn:
+                if _turn.outcome.rebuild_context:
                     current_context = await _rebuild_context_for_recovery(engine)
-                    continue
-                # Budget exhausted (text-only max-output exhaustion). Same
-                # wind-down, same counter pin as the mid-tool-call branch above.
-                _max_output_windup = _enter_soft_stop(
-                    engine, cause=_soft_stop.CAUSE_OUTPUT_TOKEN_BUDGET
-                )
-                if _max_output_windup:
-                    max_messages = _soft_stop_turn_budget(
-                        engine, assistant_message_idx
-                    )
-                    engine._terminal_backstop_turn_active = True
-                    for _evt in _max_output_windup:
+                continue
+            if _turn.outcome.directive is TurnDirective.end_turn:
+                if flags.terminal_tool_completed:
+                    async for _evt in _complete_via_terminal_tool(
+                        engine, flags, policies
+                    ):
                         yield _evt
-                    await engine._persist_snapshot()
-                    current_context = await _rebuild_context_for_recovery(engine)
-                    backstop_armed = True
+                    return
+                if flags.terminal_yielded or flags.backstop_armed:
+                    if _turn.outcome.rebuild_context:
+                        current_context = await _rebuild_context_for_recovery(engine)
                     break
-                # Backstop disabled / already used — terminal LLM error.
-                async for evt in _emit_llm_terminal(
-                    engine,
-                    MaxOutputTokensExhausted("max_output_recovery_rounds exhausted"),
-                    kind="output_length_exhausted",
-                ):
-                    yield evt
-                terminal_yielded = True
-                break
+                return
 
             # Normal completion — collect the outcome and exit the
             # inner recovery loop.
@@ -2654,192 +3214,82 @@ async def _stream_one_assistant_message(
             history_tool_calls = list(stream_result.tool_calls)
             text_buffer = stream_result.text_buffer
             reasoning_buffer = stream_result.reasoning_buffer
-            guard_evt = _apply_stream_loop_guard(engine, stream_result)
-            if guard_evt is not None:
-                text_buffer = stream_result.text_buffer
-                reasoning_buffer = stream_result.reasoning_buffer
-                yield guard_evt
-                if engine._loop_guard_nudge_count > engine.config.rc.loop_guard_nudge_max:
-                    pending_tool_calls = []
-            executable, blocked_events = _block_identical_tools(
-                engine, pending_tool_calls
+            # A round that came back usable is not yet a round the run will
+            # act on: whether it is the model working or the model repeating
+            # itself — and what to do with what it asked for either way — is
+            # a decision with its own bounds, and it is made here.
+            _turn = _turn_at(
+                engine,
+                flags,
+                TurnCoordinate.stream_settled,
+                pending_tool_calls=pending_tool_calls,
+                finish_reason=stream_result.finish_reason or "",
+                stream_repeat_guard=partial(
+                    _strip_stream_repeat, engine, stream_result
+                ),
             )
-            for blocked_evt in blocked_events:
-                yield blocked_evt
-            pending_tool_calls = executable
+            async for _policy_evt in policies.apply(_turn):
+                yield _policy_evt
+            text_buffer = stream_result.text_buffer
+            reasoning_buffer = stream_result.reasoning_buffer
+            if _turn.outcome.tool_calls is not None:
+                pending_tool_calls = list(_turn.outcome.tool_calls)
             stream_result.tool_calls = history_tool_calls
             break
 
-        if terminal_yielded:
+        # The inner loop has stopped re-streaming, so this assistant message
+        # is finished however it got here — that is what ``turn_end`` means.
+        from protocore.runtime.correctness_bind import fire_lifecycle
+
+        _turn_end, turn_end_evt = await fire_lifecycle(
+            engine,
+            HookEvent.turn_end,
+            {
+                "assistant_message_idx": flags.assistant_message_idx,
+                "finish_reason": stream_result.finish_reason,
+                "tool_call_count": len(pending_tool_calls),
+                "terminal": flags.terminal_yielded,
+            },
+        )
+        if turn_end_evt is not None:
+            yield turn_end_evt
+
+        if flags.terminal_yielded:
             return
 
         # An exhaustion exit inside the inner stream loop armed the forced
         # terminal backstop. Restart the OUTER loop so the next assistant
         # turn streams with the injected nudge + the terminal-only latch
-        # active. The ``terminal_nudge_used`` latch already prevents
+        # active. The ``flags.terminal_nudge_used`` latch already prevents
         # this from looping more than once.
-        if backstop_armed:
+        if flags.backstop_armed:
             continue
 
-        # A real assistant stream completed — the transient-error streak is
-        # broken, so refresh the in-place retry budget for any later,
-        # independent 429 / timeout blip in this run.
-        engine._transient_stream_retry_count = 0
-
-        # ── Continue-prompt fallback ──
-        # When the assistant turn ends with:
-        #   * empty visible text (``not text_buffer``)
-        #   * no pending tool_calls (``not pending_tool_calls``)
-        #   * AND populated reasoning_content (``reasoning_buffer``)
-        # this is the "thinking-tokens trap" — the model burned its
-        # output budget on chain-of-thought and emitted nothing
-        # consumable. Recover by appending an assistant turn carrying
-        # ONLY the reasoning_content + a synthetic user "continue"
-        # nudge, then re-stream. Bounded by
-        # ``rc.max_consecutive_empty_responses`` (default 3); beyond
-        # → terminal FAILED with kind=``thinking_eats_all_tokens``.
-        #
-        # Ported from the reference implementation of thinking-tokens recovery.
-        rc = engine.config.rc
-        if not text_buffer and not pending_tool_calls and reasoning_buffer and rc.max_consecutive_empty_responses > 0:
-            engine._consecutive_empty_responses += 1
-            _persist_partial_attempt_to_history(engine, stream_result)
-            if engine._consecutive_empty_responses <= rc.max_consecutive_empty_responses:
-                # Persist the empty assistant turn carrying ONLY the
-                # reasoning_content so the next API call can re-inject
-                # it (DeepSeek / Kimi require this). No visible
-                # content_blocks — keeps the wire-format invariant
-                # (system/user/tool = at most one block).
-                # Inject synthetic continue-prompt user turn.
-                engine.history.append(
-                    Message(
-                        role=MessageRole.user,
-                        content_blocks=[TextBlock(text=rc.continue_prompt_text)],
-                        metadata={
-                            SYNTHETIC_RECOVERY_METADATA_KEY: (
-                                SYNTHETIC_RECOVERY_THINKING_CONTINUE
-                            )
-                        },
-                    )
-                )
-                yield TurnEvent(
-                    type=EventType.STATE_CHANGED,
-                    run_id=engine.config.run_id,
-                    payload={
-                        "from": engine.state.value,
-                        "to": engine.state.value,
-                        "reason": "continue_prompt_injected",
-                        "round": engine._consecutive_empty_responses,
-                        "reasoning_content_chars": len(reasoning_buffer),
-                    },
-                )
-                current_context = await _rebuild_context_for_recovery(engine)
-                # Loop iterates — opens the next assistant LLM stream.
-                continue
-            # Budget exhausted on the thinking-tokens trap: the model burned its
-            # output budget on chain-of-thought and emitted nothing consumable,
-            # round after round. Wind down so it is asked for the best answer its
-            # evidence supports rather than producing none at all.
-            # ``_consecutive_empty_responses`` is not reset by
-            # ``reset_recovery_state``, so it stays exhausted: another
-            # empty-reasoning response during the wind-down re-reaches this
-            # branch, where the wind-down is already armed and the terminal below
-            # takes over with the original ``thinking_eats_all_tokens`` kind.
-            _thinking_windup = _enter_soft_stop(
-                engine, cause=_soft_stop.CAUSE_PROVIDER_ERROR
-            )
-            if _thinking_windup:
-                max_messages = _soft_stop_turn_budget(engine, assistant_message_idx)
-                for _evt in _thinking_windup:
-                    yield _evt
-                await engine._persist_snapshot()
-                current_context = await _rebuild_context_for_recovery(engine)
-                continue
-            # Backstop disabled / already used — terminal LLM error.
-            async for evt in _emit_llm_terminal(
-                engine,
-                LLMProviderError(
-                    "consecutive empty responses with reasoning_content exceeded rc.max_consecutive_empty_responses"
-                ),
-                kind="thinking_eats_all_tokens",
-            ):
-                yield evt
+        # A round that came back with nothing the run can use: reasoning and
+        # no answer, or nothing at all right after tool results. Both are
+        # recovered by re-running the round, and both are bounded.
+        _turn = _turn_at(
+            engine,
+            flags,
+            TurnCoordinate.empty_model_turn,
+            text_emitted=bool(text_buffer),
+            reasoning_emitted=bool(reasoning_buffer),
+            reasoning_chars=len(reasoning_buffer),
+            tool_calls_pending=bool(pending_tool_calls),
+            tool_results_ready=tool_results_ready_at is not None,
+            record_partial_attempt=partial(
+                _persist_partial_attempt_to_history, engine, stream_result
+            ),
+        )
+        async for _policy_evt in policies.apply(_turn):
+            yield _policy_evt
+        max_messages = _turn_budget_after(_turn.outcome, max_messages, flags)
+        if _turn.outcome.directive is TurnDirective.end_turn:
             return
-
-        # Recovery succeeded (or never engaged) — reset the counter so a
-        # later turn that triggers the trap gets a fresh budget.
-        engine._consecutive_empty_responses = 0
-
-        # ── Post-tool empty-response nudge ──
-        # A model can return a FULLY-empty assistant turn (no text, no tool
-        # calls, AND no reasoning) right after executing tools — distinct
-        # from the thinking-tokens trap above (empty WITH reasoning, already
-        # handled + ``continue``d). Some providers (mimo-v2-pro / GLM-class)
-        # do this when they "expect" the tool result to be the final word.
-        # Without recovery the loop would fall through to the no-tool
-        # end-turn and COMPLETE with whatever (possibly nothing) is durable.
-        # Recover by injecting an API-VALID synthetic pair —
-        # assistant('(empty)') + user(nudge) — so the wire sequence stays
-        # tool->assistant->user (never tool->user) — then re-stream ONCE.
-        # Bounded by ``max_consecutive_empty_responses``. Default-off RC →
-        # bit-identical (the branch is skipped entirely).
-        rc = engine.config.rc
-        if (
-            rc.resilience_post_tool_empty_nudge_enabled
-            and not text_buffer
-            and not pending_tool_calls
-            and not reasoning_buffer
-            and tool_results_ready_at is not None
-            and rc.max_consecutive_empty_responses > 0
-        ):
-            engine._post_tool_empty_nudge_count += 1
-            if engine._post_tool_empty_nudge_count <= rc.max_consecutive_empty_responses:
-                # API-valid synthetic pair: an empty-text assistant turn
-                # (so the sequence is tool->assistant->user, never
-                # tool->user) followed by the corrective user nudge.
-                # Flag the synthetic assistant turn as recovery scaffolding so
-                # ``_latest_durable_answer_text`` never mistakes the marker
-                # (default ``(empty)``) for a real model answer that the
-                # guaranteed-terminal backstop could then submit.
-                engine.history.append(
-                    Message(
-                        role=MessageRole.assistant,
-                        content_blocks=[TextBlock(text=rc.post_tool_empty_nudge_assistant_text)],
-                        metadata={
-                            SYNTHETIC_RECOVERY_METADATA_KEY: (
-                                SYNTHETIC_RECOVERY_POST_TOOL_EMPTY_NUDGE
-                            )
-                        },
-                    )
-                )
-                engine.history.append(
-                    Message(
-                        role=MessageRole.user,
-                        content_blocks=[TextBlock(text=rc.post_tool_empty_nudge_user_text)],
-                        metadata={
-                            SYNTHETIC_RECOVERY_METADATA_KEY: (
-                                SYNTHETIC_RECOVERY_POST_TOOL_EMPTY_NUDGE
-                            )
-                        },
-                    )
-                )
-                yield _emit_state_change(
-                    engine,
-                    engine.state,
-                    engine.state,
-                    reason="post_tool_empty_nudge",
-                )
+        if _turn.outcome.directive is TurnDirective.restart_turn:
+            if _turn.outcome.rebuild_context:
                 current_context = await _rebuild_context_for_recovery(engine)
-                continue
-            # Budget exhausted — fall through to the normal no-tool end-turn
-            # path (which itself may fire the terminal nudge / guaranteed
-            # terminal). The latch is not reset so a tenant cannot loop here.
-
-        # A non-empty (or non-post-tool) turn clears the post-tool empty-nudge
-        # counter so a one-off empty early in the run does not permanently
-        # consume the budget (mirrors the thinking-trap reset).
-        if text_buffer or pending_tool_calls or reasoning_buffer:
-            engine._post_tool_empty_nudge_count = 0
+            continue
 
         # ── Append assistant message to history ─────────────────────
         assistant_blocks: list[ContentBlock] = []
@@ -2873,265 +3323,34 @@ async def _stream_one_assistant_message(
                 )
             )
 
-        # ── Truncated-tool-call recovery (args_partial_truncated) ──
-        # The model emitted a tool_use_start + partial args JSON, then
-        # ``finish_reason="stop"`` arrived before the args closed. The
-        # SSE parser's brace balancer salvaged a parseable dict by
-        # synthesising closers and set
-        # :attr:`ProviderDelta.args_partial_truncated`, which the loop
-        # propagated to :class:`ToolCall.args_partial_truncated` at
-        # delta-receipt time. The ``truncated_by_output_cap`` branch only
-        # fires on ``finish_reason="length"``; this branch handles the
-        # local-model variant where the model truncates with ``stop``.
-        # Without this check the loop dispatches a call with empty/malformed
-        # args, the tool fails on validation, and the agent never learns it
-        # has to chunk large outputs.
-        #
-        # Recovery: synthesize an ``is_error=True`` tool_result for each
-        # truncated call (skipping the real dispatch), append the result
-        # to history so the next LLM call sees the recovery instruction,
-        # and continue the outer loop so the agent gets a fresh stream.
-        #
-        # * Mixed-batch dispatch preserves ``TOOL_CALL_PENDING`` approval
-        #   semantics via the canonical guard.
-        # * Per-message budget bounded by
-        #   ``rc.tool_call_max_truncation_recoveries_per_message``;
-        #   exhaustion surfaces a terminal LLMProviderError.
-        # * M-3 — recovery message templated via RC fields
-        #   (``tool_call_truncation_recovery_message_en/_ru``);
-        #   chunk-byte ceiling reuses
-        #   ``rc.tool_call_max_input_chunk_bytes``; both halves emitted
-        #   bilingually, per the multilingual rule.
-        # * M-5 — ``MESSAGE_STOP(tool_use)`` yielded AFTER all
-        #   dispatches so non-truncated TOOL_RESULT events stay inside
-        #   the current assistant-message window for SSE consumers.
-        truncated_calls = [
-            tc
-            for tc in pending_tool_calls
-            if tc.args_partial_truncated and not tc.truncated_by_output_cap
-        ]
-        if truncated_calls and stream_result.finish_reason == "stop":
-            rc = engine.config.rc
-            # Budget guard: a model stuck in a ``{`` + stop loop would
-            # otherwise consume the entire ``max_turns_per_run``.
-            if (
-                engine._tool_call_truncated_recovery_count
-                >= rc.tool_call_max_truncation_recoveries_per_message
-            ):
-                async for evt in _emit_llm_terminal(
-                    engine,
-                    LLMProviderError(
-                        "tool_call_max_truncation_recoveries_per_message "
-                        "exhausted (model kept emitting partial tool args "
-                        "+ stop)"
-                    ),
-                    kind="tool_call_truncated_exhausted",
+        # ── A tool call the model started and never finished ────────
+        # Nothing is dispatched here until the policy has had its say: it is
+        # the last moment a call can be refused rather than run, and the
+        # refusal it makes is what teaches the model to chunk.
+        _turn = _turn_at(
+            engine,
+            flags,
+            TurnCoordinate.tool_calls_ready,
+            pending_tool_calls=pending_tool_calls,
+            finish_reason=stream_result.finish_reason or "",
+            cancel_checkpoint=partial(
+                _cancel_checkpoint, engine, flags, policies
+            ),
+        )
+        async for _policy_evt in policies.apply(_turn):
+            yield _policy_evt
+        if _turn.outcome.directive is TurnDirective.end_turn:
+            if flags.terminal_tool_completed:
+                async for _evt in _complete_via_terminal_tool(
+                    engine, flags, policies
                 ):
-                    yield evt
-                return
-            engine._tool_call_truncated_recovery_count += 1
-            chunk_bytes_hint = rc.tool_call_max_input_chunk_bytes
-            # Derived placeholders for the more-directive recovery message. ``chunk_bytes_lines`` is a
-            # rough lines-per-chunk proxy (~50 chars/line for source code
-            # and markdown — works well for both languages). The lower
-            # bound of 1 keeps the message intelligible for extremely
-            # small ``chunk_bytes`` overrides (< 50). ``chunk_count_estimate``
-            # gives the agent a concrete ceiling so it can plan multiple
-            # turns; the ``max(2, ...)`` floor guarantees the model is
-            # always told to expect at least two chunks (otherwise a
-            # large ``chunk_bytes`` override would render the estimate
-            # as "1 chunk", which contradicts the "do not retry" rule).
-            chunk_bytes_lines = max(1, chunk_bytes_hint // 50)
-            chunk_count_estimate = max(2, (10240 // chunk_bytes_hint) + 1)
-            for tc in truncated_calls:
-                partial_length = len(
-                    json.dumps(tc.arguments, ensure_ascii=False)
-                )
-                _logger.warning(
-                    "DIAG tool_dispatch.tool_call_truncated tool_name=%s "
-                    "partial_length=%d finish_reason=stop round=%d",
-                    tc.name,
-                    partial_length,
-                    engine._tool_call_truncated_recovery_count,
-                    extra={
-                        "tool_name": tc.name,
-                        "partial_length": partial_length,
-                        "finish_reason": "stop",
-                        "round": engine._tool_call_truncated_recovery_count,
-                    },
-                )
-                # M-3 — RC-templated bilingual recovery message. Both
-                # halves emitted together (EN first, RU second), per
-                # the multilingual rule. Per-half
-                # placeholders:
-                # ``{tool_name}`` (name of the truncated call),
-                # ``{partial_length}`` (bytes of args JSON the model
-                # emitted), ``{chunk_bytes}`` (sourced from
-                # ``rc.tool_call_max_input_chunk_bytes`` so operators
-                # can tune the per-chunk char target),
-                # ``{chunk_bytes_lines}`` (line-count proxy),
-                # ``{chunk_count_estimate}`` (concrete chunk-count
-                # ceiling for a 10 KB target). The more-directive
-                # template + lines/estimate hints fix the issue where
-                # models re-emit the same oversized Write on every
-                # recovery round.
-                recovery_message_en = rc.tool_call_truncation_recovery_message_en.format(
-                    tool_name=tc.name,
-                    partial_length=partial_length,
-                    chunk_bytes=chunk_bytes_hint,
-                    chunk_bytes_lines=chunk_bytes_lines,
-                    chunk_count_estimate=chunk_count_estimate,
-                )
-                recovery_message_ru = rc.tool_call_truncation_recovery_message_ru.format(
-                    tool_name=tc.name,
-                    partial_length=partial_length,
-                    chunk_bytes=chunk_bytes_hint,
-                    chunk_bytes_lines=chunk_bytes_lines,
-                    chunk_count_estimate=chunk_count_estimate,
-                )
-                recovery_message = (
-                    f"{recovery_message_en}\n\n{recovery_message_ru}"
-                )
-                # Surface as TOOL_RESULT envelope so SSE consumers (the
-                # eval rig + dashboard) see the failure with a real
-                # tool_call_id binding.
-                yield TurnEvent(
-                    type=EventType.TOOL_RESULT,
-                    run_id=engine.config.run_id,
-                    payload={
-                        "tool_call_id": tc.id,
-                        "success": False,
-                        "error": {
-                            "kind": "tool_call_truncated",
-                            "message": recovery_message,
-                        },
-                        "content_blocks": [
-                            {"type": "text", "text": recovery_message}
-                        ],
-                    },
-                )
-                # Persist the synthetic tool_result so the next LLM
-                # turn's history includes the recovery instruction.
-                engine.history.append(
-                    Message(
-                        role=MessageRole.tool,
-                        content_blocks=[
-                            ToolResultBlock(
-                                tool_call_id=tc.id,
-                                content=recovery_message,
-                                is_error=True,
-                            )
-                        ],
-                    )
-                )
-                # Symmetry with ``_dispatch_tool``'s post-dispatch
-                # cleanup (line ~1589) — once the synthetic tool_result
-                # has been emitted the dispatcher has no further need
-                # for this id → name mapping.
-                engine.forget_tool_name(tc.id)
-            await engine._persist_snapshot()
-            # Dispatch any non-truncated tool calls in this turn so we do
-            # not lose work the model legitimately completed alongside the
-            # truncated one. Mirror the canonical
-            # approval-pending guard from the normal dispatch path
-            # below so ``TOOL_CALL_PENDING`` / AWAITING semantics
-            # survive mixed batches. Truncated calls are already
-            # pinned to a synthetic error tool_result above.
-            approval_pending = False
-            terminal_tool_completed = False
-            for tool_call in pending_tool_calls:
-                if tool_call in truncated_calls:
-                    continue
-                # Re-check before EACH non-truncated dispatch in the
-                # truncated-tool recovery path. This dispatch loop is a SECOND
-                # dispatch entry point (distinct from the main
-                # loop below) and runs AFTER several await/yield boundaries
-                # where a cancel can land: the per-truncated-call TOOL_RESULT
-                # yields above, the ``await engine._persist_snapshot()`` right
-                # before this loop, and — between two non-truncated calls — a
-                # prior tool's own dispatch ``await``. Without this checkpoint a
-                # cancel that landed in any of those gaps would still dispatch a
-                # NEW (non-truncated) tool here, a side effect AFTER
-                # cancellation. Route to the CANCELLED terminal via the shared
-                # :func:`_emit_dispatch_cancel_teardown` helper WITHOUT
-                # dispatching: the truncated calls already hold synthetic
-                # ``is_error`` results (idempotently skipped) and every
-                # undispatched non-truncated ``tool_use`` (already appended to
-                # history above) is synthesised into an ``is_error`` result so
-                # the snapshot stays pairing-valid for a resume on another pod.
-                if engine.stop_requested:
-                    async for evt in _emit_dispatch_cancel_teardown(engine):
-                        yield evt
-                    return
-                async for evt in _dispatch_tool(engine, tool_call):
-                    if evt.type is EventType.TOOL_CALL_PENDING:
-                        engine.mark_pending_approval(tool_call.id)
-                        engine.transition_to(LoopState.AWAITING)
-                        await engine._persist_snapshot()
-                        approval_pending = True
-                        yield evt
-                        break
-                    yield evt
-                if approval_pending:
-                    break
-                if _history_tool_result_is_terminal(engine, tool_call.id):
-                    terminal_tool_completed = True
-                    break
-            if approval_pending:
-                return
-            if terminal_tool_completed:
-                # pair any unpaired tool_use (any undispatched
-                # non-truncated siblings that trailed the terminal one in the
-                # dispatch loop) before driving the COMPLETED terminal. Same
-                # pairing rationale as the main dispatch-loop site;
-                # truncated calls already have synthetic results appended
-                # above, so the synthesis helper is a no-op for them.
-                _synthesize_missing_tool_results(
-                    engine.history,
-                    error_content=engine.config.rc.tool_result_interrupted_placeholder,
-                )
-                # voluntary-finish terminal seal. The
-                # model VOLUNTARILY completed via the terminal tool on the
-                # truncated-tool recovery path; seal any truncation-gated
-                # complete-enough-but-unsealed file with a SYNTHETIC FinalizeFile
-                # before completing. No-op (zero-collateral) when not eligible.
-                async for _seal_evt in _maybe_seal_longfile_at_voluntary_finish(
-                    engine
-                ):
-                    yield _seal_evt
-                async for _completion_evt in _emit_voluntary_completion(engine):
-                    yield _completion_evt
-                engine.transition_to(LoopState.COMPLETED)
-                return
-            # M-5 — ``MESSAGE_STOP(tool_use)`` between assistant
-            # messages. Yielded AFTER all dispatches (truncated
-            # synthetic + non-truncated real) complete so the SSE
-            # consumer's "assistant message window" closes only after
-            # every TOOL_RESULT for this turn is on the wire.
-            # ``tokens_used`` / ``cache_hit_rate`` reflect partial
-            # usage for the truncated stream attempt only (single
-            # iteration) — full-run aggregates surface elsewhere.
+                    yield _evt
+            return
+        if _turn.outcome.directive is TurnDirective.restart_turn:
             previous_tool_results_ready_at = time.perf_counter()
-            yield TurnEvent(
-                type=EventType.MESSAGE_STOP,
-                run_id=engine.config.run_id,
-                payload={
-                    "turn_id": engine.turn_id(),
-                    "stop_reason": "tool_use",
-                    "tokens_used": _tokens_used_payload(engine),
-                    "cache_hit_rate": engine.total_usage.this_turn_cache_hit_rate(),
-                },
-            )
-            # Rebuild context and re-stream so the agent reads the
-            # error tool_result and can retry with chunked writes.
-            current_context = await _rebuild_context_for_recovery(engine)
+            if _turn.outcome.rebuild_context:
+                current_context = await _rebuild_context_for_recovery(engine)
             continue
-
-        # The model produced a clean (non-truncated) assistant turn. Reset
-        # the consecutive-truncations counter so a one-off truncation early
-        # in the run does not permanently consume a slot. Mirrors the
-        # ``_consecutive_empty_responses = 0`` reset pattern.
-        engine._tool_call_truncated_recovery_count = 0
 
         # ── No tool calls — end_turn (terminal) ─────────────────────
         if not pending_tool_calls:
@@ -3148,244 +3367,46 @@ async def _stream_one_assistant_message(
             # runs BEFORE the terminal-tool nudge so a cancelled run is never
             # nudged into one more turn. The outer ``query()`` finally-guard
             # then sees ``engine.is_terminal`` and emits nothing further.
-            if engine.stop_requested:
-                from_state = engine.state
-                engine.transition_to(LoopState.CANCELLED)
-                yield _emit_state_change(
-                    engine,
-                    from_state,
-                    LoopState.CANCELLED,
-                    reason="stop_requested",
-                )
-                yield TurnEvent(
-                    type=EventType.MESSAGE_STOP,
-                    run_id=engine.config.run_id,
-                    payload={
-                        "turn_id": engine.turn_id(),
-                        "stop_reason": StopReason.cancelled.value,
-                    },
-                )
+            async for _evt in _cancel_checkpoint(engine, flags, policies):
+                yield _evt
+            if flags.terminal_yielded:
                 return
 
-            # ── large-file convergence (prose / no-tool turn) ──
-            # The model ended the turn with prose and NO tool call while a large
-            # file is in flight — the dominant "write one header, then idle" /
-            # done-with-content-but-unsealed shape. Advance the stall clock and,
-            # on a detected stall/plateau/done, FORCE the next tool (AppendFile
-            # to drive more content / FinalizeFile to seal — empty-finalize
-            # guarded, bounded) and re-drive ONE more turn instead of completing
-            # an incomplete file. Runs BEFORE the terminal-tool nudge + the
-            # end_turn completion so a stalled large-file run is converged first.
-            # No-op when disabled / no stall — the run then completes normally.
-            _longfile_forced = False
-            async for _conv_evt in _maybe_drive_longfile_convergence(engine):
-                if isinstance(_conv_evt, bool):
-                    _longfile_forced = _conv_evt
-                else:
-                    yield _conv_evt
-            if _longfile_forced:
-                max_messages = max(max_messages, assistant_message_idx + 1)
-                current_context = await _rebuild_context_for_recovery(engine)
+            # The seams a finish passes through, in the order it passes
+            # them: the turn ends; the model is nudged towards the tool that
+            # ends runs (and the failure a wind-down was started for is
+            # reported here if the wind-down wrote nothing); the answer it
+            # gave is held to a floor; and only then is the finish itself
+            # allowed. Walking the list rather than writing four near-copies
+            # is what keeps the order a fact of the core rather than of
+            # whichever copy was edited last.
+            _restart_turn = False
+            for _seam in _FINISH_SEAMS:
+                _turn = _turn_at(
+                    engine,
+                    flags,
+                    _seam,
+                    stored_stream_error=stored_stream_error,
+                    text_emitted=bool(text_buffer),
+                    reasoning_emitted=bool(reasoning_buffer),
+                )
+                async for _policy_evt in policies.apply(_turn):
+                    yield _policy_evt
+                max_messages = _turn_budget_after(
+                    _turn.outcome, max_messages, flags
+                )
+                if _turn.outcome.directive is TurnDirective.end_turn:
+                    return
+                if _turn.outcome.directive is TurnDirective.restart_turn:
+                    if _turn.outcome.rebuild_context:
+                        current_context = await _rebuild_context_for_recovery(
+                            engine
+                        )
+                    _restart_turn = True
+                    break
+            if _restart_turn:
                 continue
 
-            # The terminal-tool nudge ALWAYS fires here (write-first recovery
-            # + typed Finalize both depend on it; a prose-only "Done, I
-            # created the file" with 0 tools MUST still be nudged into the
-            # actual Write + Finalize). The post-answer META prose the nudge
-            # can manufacture is instead suppressed AT THE STREAM (text-only,
-            # not the tool calls) by :func:`_suppress_terminal_only_meta_text`
-            # — see the ``_drive_one_stream`` text-delta path. So the nudge
-            # turn still writes the file + runs Finalize, but its redundant
-            # meta narration never reaches live SSE nor durable history.
-            if _terminal_tool_nudge_required(engine) and not terminal_nudge_used:
-                terminal_nudge_used = True
-                max_messages = max(max_messages, assistant_message_idx + 1)
-                _append_terminal_tool_nudge(engine)
-                current_context = await _rebuild_context_for_recovery(engine)
-                yield _emit_state_change(
-                    engine,
-                    engine.state,
-                    engine.state,
-                    reason="terminal_tool_nudge",
-                )
-                continue
-
-            # The model produced a no-tool end-turn. If a backstop was armed
-            # from a typed stream error and the run still has no terminal
-            # answer (e.g. the best-effort forced turn emitted text / called
-            # a non-terminal tool and then ended), surface the stored original
-            # error rather than silently
-            # completing with no answer.
-            # The stored error is the run's outcome ONLY if the wind-down it
-            # started produced nothing. A wind-down that got the model to write
-            # its answer did the job it exists for, and re-raising the upstream
-            # failure over that answer would throw away the recovery and report
-            # a run that answered as a run that failed.
-            if (
-                stored_stream_error is not None
-                and not _history_has_terminal_tool_result(engine)
-                and not run_has_final_answer(engine)
-            ):
-                _exc, _kind = stored_stream_error
-                async for evt in _emit_llm_terminal(engine, _exc, kind=_kind):
-                    yield evt
-                return
-
-            # ── Substantive-answer floor on the plain-stop path ──
-            # The model stopped without calling any tool, so the prose gate at
-            # the dispatch seam never sees this run — and a run that delegated,
-            # produced files and then said under a hundred characters about
-            # them completes here, silently, as a success. Apply the SAME floor
-            # at this completion: when the work produced nothing the user can
-            # actually read, grant a bounded repair turn and re-drive. An answer
-            # that is merely too SHORT shares the gate's durable latch, so that
-            # test fires at most once per run across BOTH paths; an answer that
-            # is only a POINTER to a file the reader cannot open draws on its
-            # own attempt budget instead, because one repair turn was measured
-            # to detect that failure without fixing it. Both are bounded, so
-            # neither can loop, and the same RC kill switch leaves this path
-            # untouched when the gate is off.
-            #
-            # It never competes with the empty-completion guard further down:
-            # that guard owns the turn with NO visible answer at all, and this
-            # predicate requires one, so the two are exact complements.
-            if _plain_stop_answer_floor_applies(engine):
-                repair_text = engine.config.rc.finalize_prose_gate_repair_text
-                # An empty repair text would inject an empty user turn —
-                # degrade to a no-op (complete as before) and leave the latch
-                # unspent and the attempt uncharged, mirroring "the gate did not
-                # fire" on the terminal path.
-                if repair_text:
-                    # Read the pointer evidence BEFORE anything is appended:
-                    # the measurement is taken over the answer window, and the
-                    # repair turn is part of history the moment it lands.
-                    pointer = _pointer_answer_evidence(engine)
-                    # Which of the two tests fired decides which bound pays for
-                    # the turn: the short-answer floor spends its single shot,
-                    # the pointer refusal one attempt of its own budget. Keeping
-                    # them apart is what lets the pointer test ask more than
-                    # once without also handing the floor a second veto it was
-                    # never measured to need.
-                    _attempt = 0
-                    if pointer is None:
-                        engine._finalize_prose_gate_used = True
-                    else:
-                        _attempt = _charge_pointer_answer_repair(engine)
-                    max_messages = max(max_messages, assistant_message_idx + 1)
-                    _append_answer_floor_repair_turn(engine)
-                    # Persist IMMEDIATELY after the latch + injection so a
-                    # crash / cross-pod resume in the gap cannot lose the latch
-                    # (and re-fire the repair) or the correction.
-                    await engine._persist_snapshot()
-                    current_context = await _rebuild_context_for_recovery(engine)
-                    # Two ways to get here, and they need opposite reading. The
-                    # floor line says the answer was too short and repeats the
-                    # threshold it was measured against; the pointer line says
-                    # the answer was long enough and still delivered nothing,
-                    # and carries the two sizes that make that case. When both
-                    # hold, the pointer line is the one that explains the run.
-                    if pointer is None:
-                        _logger.warning(
-                            "DIAG query.finalize_prose_gate.plain_stop_repair "
-                            "run=%s tenant=%s turn=%s floor=%d",
-                            engine.config.run_id,
-                            engine.config.tenant_id,
-                            engine.turn_id(),
-                            engine.config.rc.finalize_prose_gate_min_chars,
-                        )
-                    else:
-                        _pointer_path, _answer_chars, _written_chars = pointer
-                        _rc = engine.config.rc
-                        _logger.warning(
-                            "DIAG query.finalize_prose_gate.pointer_answer_repair "
-                            "run=%s tenant=%s turn=%s attempt=%d/%d "
-                            "answer_chars=%d written_chars=%d max_fraction=%.3f "
-                            "path=%s",
-                            engine.config.run_id,
-                            engine.config.tenant_id,
-                            engine.turn_id(),
-                            _attempt,
-                            _rc.finalize_prose_gate_pointer_max_repair_attempts,
-                            _answer_chars,
-                            _written_chars,
-                            _rc.finalize_prose_gate_pointer_max_answer_fraction,
-                            _pointer_path,
-                        )
-                    yield _emit_state_change(
-                        engine,
-                        engine.state,
-                        engine.state,
-                        reason="finalize_prose_gate_plain_stop_repair",
-                    )
-                    continue
-
-            # Reached only when the floor did NOT take this completion. If the
-            # pointer refusal spent its whole budget and the answer is STILL a
-            # filing notice, this is the moment the run gives up and hands the
-            # user that notice — the one outcome the mechanism exists to make
-            # visible, and invisible everywhere else (a run that finishes on a
-            # repaired answer looks identical from here on).
-            _release_pointer_answer_repair(engine)
-
-            # ── voluntary-finish terminal seal ──
-            # The model is completing the run VOLUNTARILY with a prose
-            # ``end_turn``. The stall-driver above (L~1861) correctly stayed
-            # silent for the 004-shape (the model self-continued with steady
-            # AppendFile progress so no stall registered), but a truncation-gated
-            # file may be complete-enough yet UNSEALED. Dispatch a SYNTHETIC
-            # FinalizeFile to seal it BEFORE completing — no LLM call, no extra
-            # turn. No-op (zero-collateral) when not eligible (disabled / not
-            # truncation-gated / below-floor / already finalized / no budget /
-            # FinalizeFile not on the surface). Runs BEFORE the empty-completion
-            # guard so a longfile run whose seal produces a terminal result is
-            # not misread as an unanswered empty turn.
-            async for _seal_evt in _maybe_seal_longfile_at_voluntary_finish(engine):
-                yield _seal_evt
-
-            # ── Empty-completion guard ──
-            # The model ended the turn with ``finish_reason='stop'`` but emitted
-            # NO visible text, NO tool calls and NO reasoning, and the run has
-            # neither a visible assistant answer nor a terminal tool result yet.
-            # Sealing this as COMPLETED loses the turn silently — the empty
-            # ``assistant_blocks`` appended nothing to history, so a reload shows
-            # a completed run with no answer. Grant a bounded re-drive so the
-            # model gets another chance to answer; once that budget is spent,
-            # terminate FAILED with a self-evident reason rather than reporting
-            # the empty turn as a clean answer. Default-on RC ⟹ this is the safe
-            # default. A turn that already delivered an answer (or carried
-            # text / reasoning), or a run already sealed by a terminal tool
-            # result (incl. the longfile seal above), never reaches here.
-            rc = engine.config.rc
-            if (
-                rc.empty_completion_guard_enabled
-                and not text_buffer
-                and not reasoning_buffer
-                and not _history_has_terminal_tool_result(engine)
-                and not run_has_final_answer(engine)
-            ):
-                if (
-                    engine._empty_completion_redrive_count
-                    < rc.empty_completion_guard_max_redrives
-                ):
-                    engine._empty_completion_redrive_count += 1
-                    max_messages = max(max_messages, assistant_message_idx + 1)
-                    _append_empty_completion_redrive_nudge(engine)
-                    current_context = await _rebuild_context_for_recovery(engine)
-                    yield _emit_state_change(
-                        engine,
-                        engine.state,
-                        engine.state,
-                        reason="empty_completion_redrive",
-                    )
-                    continue
-                # Re-drive budget exhausted and still no answer — fail loudly
-                # instead of sealing a silent empty COMPLETED.
-                async for evt in _emit_empty_completion_terminal(engine):
-                    yield evt
-                return
-
-            async for _completion_evt in _emit_voluntary_completion(engine):
-                yield _completion_evt
             settled = _maybe_run_settled_event(engine)
             if settled is not None:
                 yield settled
@@ -3395,7 +3416,7 @@ async def _stream_one_assistant_message(
                 yield follow_evt
                 await _persist_live_control(engine)
                 engine._run_settled_emitted = False
-                max_messages = max(max_messages, assistant_message_idx + 1)
+                max_messages = max(max_messages, flags.assistant_message_idx + 1)
                 current_context = await _rebuild_context_for_recovery(engine)
                 continue
             engine.transition_to(LoopState.COMPLETED)
@@ -3418,9 +3439,9 @@ async def _stream_one_assistant_message(
         # AFTER the awaited hook predicate and before EACH individual tool
         # dispatch, so a cancel that lands in any
         # await gap of the dispatch prelude/loop cannot dispatch a NEW tool.
-        if engine.stop_requested:
-            async for evt in _emit_dispatch_cancel_teardown(engine):
-                yield evt
+        async for _evt in _cancel_checkpoint(engine, flags, policies):
+            yield _evt
+        if flags.terminal_yielded:
             return
 
         # ── Dispatch each tool call ─────────────────────────────────
@@ -3445,14 +3466,18 @@ async def _stream_one_assistant_message(
         # :func:`_apply_deferred_tool_history`. Event emission also
         # follows the original order: gather completion order is
         # discarded.
-        approval_pending = False
-        terminal_tool_completed = False
+        flags.approval_pending = False
+        flags.terminal_tool_completed = False
         # Set True when a bounded pre-terminal self-verify turn was injected
         # at a would-be-terminal site. It breaks the dispatch loop WITHOUT
         # finalising; flow then falls through to the
         # ``message_stop(tool_use)`` + context-rebuild path so the outer loop
         # re-drives one corrective turn. Default False = no self-verify.
         self_verify_injected = False
+        # Every call of this message a gate held, in the order the model asked
+        # for them. The turn announces the whole set once rather than one card
+        # per call, and the first one parked is the one the envelope names.
+        parked_calls: list[PendingInterrupt] = []
 
         # Pre-compute, once per turn, a predicate that tells us whether a
         # given tool name could be matched by any enabled ``PreToolUse`` hook
@@ -3470,9 +3495,9 @@ async def _stream_one_assistant_message(
         # abort BEFORE any dispatch. Without this checkpoint a cancel in that
         # await gap would fall through and dispatch the pending tools (side
         # effect after cancellation). Route to CANCELLED here instead.
-        if engine.stop_requested:
-            async for evt in _emit_dispatch_cancel_teardown(engine):
-                yield evt
+        async for _evt in _cancel_checkpoint(engine, flags, policies):
+            yield _evt
+        if flags.terminal_yielded:
             return
 
         # Pre-compute eligibility for every call so we do not call into
@@ -3555,9 +3580,16 @@ async def _stream_one_assistant_message(
             # (still in history, unpaired) are synthesised into ``is_error``
             # results by the shared teardown so the snapshot stays
             # pairing-valid, then the run routes to CANCELLED.
-            if engine.stop_requested:
-                async for evt in _emit_dispatch_cancel_teardown(engine):
-                    yield evt
+            if engine.stop_requested and parked_calls:
+                # A cancelled run waits for nothing: the decisions this
+                # same message parked earlier can no longer be acted on.
+                for _held in parked_calls:
+                    engine.release_interrupt(_held.interrupt_id)
+                parked_calls.clear()
+                flags.approval_pending = False
+            async for _evt in _cancel_checkpoint(engine, flags, policies):
+                yield _evt
+            if flags.terminal_yielded:
                 return
             if parallel_eligible[idx]:
                 batch_start = idx
@@ -3573,17 +3605,20 @@ async def _stream_one_assistant_message(
                     # dispatcher so behaviour is identical to the
                     # pre-Wave-10 path (no asyncio.gather overhead,
                     # event ordering is trivially preserved).
-                    async for evt in _dispatch_tool(engine, batch[0]):
-                        if evt.type is EventType.TOOL_CALL_PENDING:
-                            engine.mark_pending_approval(batch[0].id)
-                            engine.transition_to(LoopState.AWAITING)
-                            await engine._persist_snapshot()
-                            approval_pending = True
-                            yield evt
-                            break
+                    held_count = len(parked_calls)
+                    async for evt in dispatch_parking_holds(
+                        engine,
+                        batch[0],
+                        dispatch=_dispatch_tool,
+                        park=_park_pause_interrupt,
+                        parked=parked_calls,
+                    ):
                         yield evt
-                    if approval_pending:
-                        break
+                    if len(parked_calls) > held_count:
+                        flags.approval_pending = True
+                        continue
+                    if flags.approval_pending:
+                        continue
                     if _history_tool_result_is_terminal(engine, batch[0].id):
                         # One bounded self-verify turn before finalising. If a
                         # corrective turn is injected, do NOT finalise: break
@@ -3591,16 +3626,11 @@ async def _stream_one_assistant_message(
                         # bounded turn with the correction in history. The
                         # helper persists the snapshot itself on injection so
                         # the correction + latch survive a crash/resume.
-                        if await _maybe_inject_pre_terminal_self_verify(engine):
-                            # The corrective turn must be granted a fresh
-                            # ``max_messages`` slot, or the next outer
-                            # iteration immediately exceeds the budget and the
-                            # run exits FAILED(max_turns) despite the
-                            # already-submitted terminal answer.
-                            max_messages = max(max_messages, assistant_message_idx + 1)
+                        if await _finalise_or_verify_first(engine, flags):
+                            max_messages = max(
+                                max_messages, flags.assistant_message_idx + 1
+                            )
                             self_verify_injected = True
-                            break
-                        terminal_tool_completed = True
                         break
                     continue
 
@@ -3608,23 +3638,22 @@ async def _stream_one_assistant_message(
                 # ``asyncio.gather`` so each PCM/HTTP RPC waits in
                 # parallel rather than serialising the timeouts.
                 #
-                # Snapshot the per-run helper-bag streak + satisfaction state
-                # BEFORE gather so we can restore it afterwards and replay
-                # the state-transitions in the LLM-requested order. Without
-                # the snapshot the streak state would track gather completion
-                # order, not transcript order — see
-                # :func:`_snapshot_dispatcher_helper_state` /
-                # :func:`_replay_dispatcher_helper_state` for the contract.
-                helpers_snapshot = _snapshot_dispatcher_helper_state(engine)
+                # Take the transcript-order state BEFORE gather so it can be
+                # put back afterwards and the state transitions replayed in the
+                # LLM-requested order. Without that, the streaks would track
+                # gather completion order rather than the order the run is a
+                # record of — see :meth:`RunScopedState.transcript_state` and
+                # :func:`_replay_dispatch_state` for the contract.
+                transcript_state = engine.run_state.transcript_state()
+                await _record_batch_tool_intents(engine, batch)
                 results = await asyncio.gather(
                     *(_drain_dispatch_tool_deferred(engine, tc) for tc in batch),
                     return_exceptions=False,
                 )
-                # Restore the helper-bag streak/satisfaction state to
-                # pre-gather. The parallel mutations are discarded; the
-                # replay below applies the deterministic transcript-order
-                # state transitions.
-                _restore_dispatcher_helper_state(engine, helpers_snapshot)
+                # Put the streak/satisfaction state back to pre-gather. The
+                # parallel mutations are discarded; the replay below applies the
+                # deterministic transcript-order state transitions.
+                engine.run_state.restore_transcript_state(transcript_state)
                 _logger.warning(
                     "DIAG query.parallel_batch.entered run=%s tenant=%s "
                     "turn=%s batch_size=%d tools=%s",
@@ -3637,17 +3666,14 @@ async def _stream_one_assistant_message(
                 # Emit events + apply deferred history mutations in the
                 # ORIGINAL tool-call order regardless of gather
                 # completion order — preserves the LLM-facing invariant.
-                first_approval_seen = False
+                batch_drained = False
                 for tool_call, (events, outcome) in zip(batch, results, strict=True):
-                    if first_approval_seen:
-                        # Once a tool in the batch has surfaced approval in
-                        # LLM order, any further outcomes are discarded so
-                        # the serial path's "stop on first pending" invariant
-                        # is honoured. The discarded tools are
-                        # concurrent-safe + non-destructive by construction
-                        # so dropping their results has no external side
-                        # effect (no history append, no event yield, no
-                        # helper-bag replay).
+                    if batch_drained:
+                        # A tool in this batch ended the turn, so what the
+                        # ones behind it produced is no longer part of the
+                        # run. They are concurrent-safe and non-destructive
+                        # by construction, so dropping their results has no
+                        # external effect.
                         engine.forget_tool_name(tool_call.id)
                         continue
                     if outcome is None:
@@ -3663,15 +3689,13 @@ async def _stream_one_assistant_message(
                         continue
                     if outcome.approval_required:
                         # The hook match predicate should have steered any
-                        # hook-gated tool onto the serial path, so we only
-                        # reach this branch when a hook was added mid-turn
-                        # (race) or a hook unexpectedly emitted approval for
-                        # a tool whose matchers do not mention it. Mark ONLY
-                        # the first approval in LLM order as pending (parity
-                        # with the serial path's stop-on-first behaviour) and
-                        # discard the rest of the batch.
+                        # hook-gated tool onto the serial path, so this branch
+                        # is a mid-turn hook race. Every held call of the
+                        # batch is parked, in LLM order — the same guarantee
+                        # the serial path gives, rather than the "first one
+                        # only" it used to have.
                         _logger.warning(
-                            "DIAG query.parallel_batch.approval_first_pending "
+                            "DIAG query.parallel_batch.approval_parked "
                             "run=%s tenant=%s turn=%s tool=%s call_id=%s",
                             engine.config.run_id,
                             engine.config.tenant_id,
@@ -3679,24 +3703,17 @@ async def _stream_one_assistant_message(
                             tool_call.name,
                             tool_call.id,
                         )
-                        approval_pending = True
-                        first_approval_seen = True
-                        pending_event_seen = False
-                        for evt in events:
-                            if evt.type is EventType.TOOL_CALL_PENDING and not pending_event_seen:
-                                engine.mark_pending_approval(tool_call.id)
-                                engine.transition_to(LoopState.AWAITING)
-                                await engine._persist_snapshot()
-                                pending_event_seen = True
+                        flags.approval_pending = True
+                        async for evt in park_deferred_hold(
+                            engine,
+                            tool_call.id,
+                            events,
+                            park=_park_pause_interrupt,
+                            parked=parked_calls,
+                        ):
                             yield evt
-                        if not pending_event_seen:
-                            engine.mark_pending_approval(tool_call.id)
-                            engine.transition_to(LoopState.AWAITING)
-                            await engine._persist_snapshot()
-                        # Do not append a tool_result for an
-                        # approval-pending call (parity with the serial
-                        # path which short-circuits before history
-                        # mutation).
+                        # No tool_result is appended for a call that has not
+                        # run; the decision produces one, or the abandon does.
                         continue
                     # a terminal-only-blocked tool produced a
                     # SYNTHETIC outcome (success=False, is_error=True) WITHOUT
@@ -3731,7 +3748,7 @@ async def _stream_one_assistant_message(
                         )
                         continue
                     # Replay the streak + satisfaction state transitions
-                    # against the REAL helper bag in LLM-requested order so
+                    # against the REAL run state in LLM-requested order so
                     # both the visible transcript and next-turn caps follow
                     # transcript-correct counts regardless of gather
                     # completion order.
@@ -3745,7 +3762,7 @@ async def _stream_one_assistant_message(
                         tool_call.id,
                         outcome.success,
                     )
-                    adjusted_outcome = _replay_dispatcher_helper_state(
+                    adjusted_outcome = _replay_dispatch_state(
                         engine, tool_call, outcome
                     )
                     for evt in _rewrite_deferred_tool_result_events(
@@ -3753,37 +3770,29 @@ async def _stream_one_assistant_message(
                     ):
                         yield evt
                     _apply_deferred_tool_history(engine, tool_call, adjusted_outcome)
-                    if _dispatch_outcome_is_terminal(
+                    if not flags.approval_pending and _dispatch_outcome_is_terminal(
                         adjusted_outcome,
                         engine=engine,
                         tool_name=tool_call.name,
                     ):
-                        # One bounded self-verify turn before finalising.
-                        # ``first_approval_seen`` is reused as the "stop
-                        # draining the rest of this batch" signal; set it
-                        # whether or not we finalise. When a corrective turn is
-                        # injected we set ``self_verify_injected`` instead of
-                        # ``terminal_tool_completed`` so the post-batch check
-                        # breaks the dispatch loop WITHOUT finalising, and the
-                        # outer loop re-drives the corrective turn. The helper
-                        # persists the snapshot itself on injection.
-                        if await _maybe_inject_pre_terminal_self_verify(engine):
-                            # The corrective turn must be granted a fresh
-                            # ``max_messages`` slot, or the next outer
-                            # iteration immediately exceeds the budget and the
-                            # run exits FAILED(max_turns) despite the
-                            # already-submitted terminal answer.
-                            max_messages = max(max_messages, assistant_message_idx + 1)
+                        # Nothing ends the run while a call of the same message
+                        # is still held for a decision: the run is waiting, and
+                        # a seal over a wait is a run nothing comes back for.
+                        # ``batch_drained`` stops the rest of the batch either
+                        # way. When a corrective turn is injected the turn is
+                        # NOT finalised — the outer loop re-drives it — and the
+                        # helper persists the snapshot itself on injection.
+                        if await _finalise_or_verify_first(engine, flags):
+                            max_messages = max(
+                                max_messages, flags.assistant_message_idx + 1
+                            )
                             self_verify_injected = True
-                            first_approval_seen = True
-                        else:
-                            terminal_tool_completed = True
-                            first_approval_seen = True
+                        batch_drained = True
                 # One snapshot per batch instead of one per tool —
                 # parity with the serial path's per-tool persist but
                 # batched to amortise the PG/Redis round-trip.
                 await engine._persist_snapshot()
-                if approval_pending or terminal_tool_completed or self_verify_injected:
+                if flags.approval_pending or flags.terminal_tool_completed or self_verify_injected:
                     break
                 continue
 
@@ -3805,7 +3814,7 @@ async def _stream_one_assistant_message(
                     # group finishes (blocking join). Delegation tools are NOT
                     # ``is_concurrent_safe`` so this is a SEPARATE path from the
                     # read fan-out above — but the leader's dispatcher mutates the
-                    # shared per-run helper bag (consecutive-error streak,
+                    # shared per-run state (consecutive-error streak,
                     # cumulative tool-call soft cap, satisfied-precondition set) per
                     # child, so we snapshot that transcript-order state BEFORE the
                     # gather, restore it AFTER, and replay the transitions in
@@ -3838,7 +3847,7 @@ async def _stream_one_assistant_message(
                     # on descendants — and no holder needs a further slot to finish
                     # its current slice; the budget can never form an acquisition
                     # cycle. ``budget`` is resolved (minted at the first parallel
-                    # fan-out from the RC, then found in the helper bag) so the
+                    # fan-out from the RC, then found on the run state) so the
                     # whole parallel-dispatched subtree shares the SAME object;
                     # ``tree_permit`` is THIS run's own slot (None for a run that
                     # was never dispatched under the budget — e.g. the root, or a
@@ -3847,7 +3856,7 @@ async def _stream_one_assistant_message(
                     semaphore = asyncio.Semaphore(subagent_concurrency_cap)
                     budget = _resolve_subagent_tree_budget(engine)
                     tree_permit = _resolve_subagent_tree_permit(engine)
-                    helpers_snapshot = _snapshot_dispatcher_helper_state(engine)
+                    transcript_state = engine.run_state.transcript_state()
                     # Stable id for THIS fan-out group, shared by every child and
                     # distinct across groups/turns (tool_call ids are unique per
                     # run). Lets the parent ledger scope same-path batch-order
@@ -3861,6 +3870,7 @@ async def _stream_one_assistant_message(
                     # sentinel.
                     if tree_permit is not None:
                         await tree_permit.release_while_waiting()
+                    await _record_batch_tool_intents(engine, batch)
                     try:
                         gathered = await asyncio.gather(
                             *(
@@ -3879,7 +3889,7 @@ async def _stream_one_assistant_message(
                     finally:
                         if tree_permit is not None:
                             await tree_permit.reacquire()
-                    _restore_dispatcher_helper_state(engine, helpers_snapshot)
+                    engine.run_state.restore_transcript_state(transcript_state)
                     _logger.warning(
                         "DIAG query.parallel_subagents.entered run=%s tenant=%s "
                         "turn=%s batch_size=%d cap=%d tools=%s",
@@ -3923,11 +3933,14 @@ async def _stream_one_assistant_message(
 
                     # Emit events + apply deferred history in the ORIGINAL
                     # tool-call order regardless of gather completion order.
-                    first_approval_seen = False
+                    batch_drained = False
                     for tool_call, (events, outcome) in zip(
                         batch, normalised_results, strict=True
                     ):
-                        if first_approval_seen:
+                        if batch_drained:
+                            # A child in this group ended the turn; what the
+                            # groups behind it produced is no longer part of
+                            # the run.
                             engine.forget_tool_name(tool_call.id)
                             continue
                         if outcome is None:
@@ -3939,28 +3952,22 @@ async def _stream_one_assistant_message(
                             engine.forget_tool_name(tool_call.id)
                             continue
                         if outcome.approval_required:
-                            # Defensive: the eligibility predicate steers any
-                            # hook-gated delegation call onto the serial path, so
-                            # this only fires on a mid-turn hook race. Mark ONLY
-                            # the first approval in LLM order as pending (serial
-                            # parity) and discard the rest of the batch.
-                            approval_pending = True
-                            first_approval_seen = True
-                            pending_event_seen = False
-                            for evt in events:
-                                if (
-                                    evt.type is EventType.TOOL_CALL_PENDING
-                                    and not pending_event_seen
-                                ):
-                                    engine.mark_pending_approval(tool_call.id)
-                                    engine.transition_to(LoopState.AWAITING)
-                                    await engine._persist_snapshot()
-                                    pending_event_seen = True
+                            # The eligibility predicate steers a hook-gated
+                            # delegation call onto the serial path, so this is
+                            # a gate registered mid-turn. Every held child is
+                            # parked, in the order the model asked for them —
+                            # a group answered one decision at a time would
+                            # cost one stop, one snapshot and one redraw per
+                            # child.
+                            flags.approval_pending = True
+                            async for evt in park_deferred_hold(
+                                engine,
+                                tool_call.id,
+                                events,
+                                park=_park_pause_interrupt,
+                                parked=parked_calls,
+                            ):
                                 yield evt
-                            if not pending_event_seen:
-                                engine.mark_pending_approval(tool_call.id)
-                                engine.transition_to(LoopState.AWAITING)
-                                await engine._persist_snapshot()
                             continue
                         if _terminal_only_blocks(engine, tool_call):
                             # Synthetic terminal-only veto (no dispatcher
@@ -3977,10 +3984,10 @@ async def _stream_one_assistant_message(
                             )
                             continue
                         # Replay the streak + satisfaction + soft-cap transitions
-                        # against the REAL helper bag in LLM-requested order so
+                        # against the run's own state in LLM-requested order so
                         # the transcript and next-turn caps follow transcript-order
                         # counts regardless of gather completion order.
-                        adjusted_outcome = _replay_dispatcher_helper_state(
+                        adjusted_outcome = _replay_dispatch_state(
                             engine, tool_call, outcome
                         )
                         for evt in _rewrite_deferred_tool_result_events(
@@ -3990,27 +3997,29 @@ async def _stream_one_assistant_message(
                         _apply_deferred_tool_history(
                             engine, tool_call, adjusted_outcome
                         )
-                        if _dispatch_outcome_is_terminal(
-                            adjusted_outcome,
-                            engine=engine,
-                            tool_name=tool_call.name,
+                        if (
+                            not flags.approval_pending
+                            and _dispatch_outcome_is_terminal(
+                                adjusted_outcome,
+                                engine=engine,
+                                tool_name=tool_call.name,
+                            )
                         ):
-                            # One bounded self-verify turn before finalising —
-                            # parity with the read/serial paths.
-                            if await _maybe_inject_pre_terminal_self_verify(engine):
+                            # Nothing seals the run while a child of the same
+                            # message is still held for a decision. One bounded
+                            # self-verify turn before finalising otherwise —
+                            # parity with the read and serial paths.
+                            if await _finalise_or_verify_first(engine, flags):
                                 max_messages = max(
-                                    max_messages, assistant_message_idx + 1
+                                    max_messages, flags.assistant_message_idx + 1
                                 )
                                 self_verify_injected = True
-                                first_approval_seen = True
-                            else:
-                                terminal_tool_completed = True
-                                first_approval_seen = True
+                            batch_drained = True
                     # One snapshot per batch (parity with the read fan-out).
                     await engine._persist_snapshot()
                     if (
-                        approval_pending
-                        or terminal_tool_completed
+                        flags.approval_pending
+                        or flags.terminal_tool_completed
                         or self_verify_injected
                     ):
                         break
@@ -4028,17 +4037,29 @@ async def _stream_one_assistant_message(
             # needs no permit handling of its own.
             tool_call = pending_tool_calls[idx]
             idx += 1
-            async for evt in _dispatch_tool(engine, tool_call):
-                if evt.type is EventType.TOOL_CALL_PENDING:
-                    engine.mark_pending_approval(tool_call.id)
-                    engine.transition_to(LoopState.AWAITING)
-                    await engine._persist_snapshot()
-                    approval_pending = True
-                    yield evt
-                    break
+            held_count = len(parked_calls)
+            async for evt in dispatch_parking_holds(
+                engine,
+                tool_call,
+                dispatch=_dispatch_tool,
+                park=_park_pause_interrupt,
+                parked=parked_calls,
+            ):
                 yield evt
-            if approval_pending:
-                break
+            if len(parked_calls) > held_count:
+                # Every call a gate holds is parked, not only the first one of
+                # the message. Stopping at the first left the rest of the batch
+                # to the wire repair: an operator was shown one card, approved
+                # it, and resumed into a run that had quietly dropped the
+                # calls behind it. The walk carries on so the whole message is
+                # decided in one round of asking.
+                flags.approval_pending = True
+                continue
+            if flags.approval_pending:
+                # Something in this message is already held for a decision, so
+                # nothing here may end the run: the terminal below and the
+                # corrective re-drive both assume the turn is free to move on.
+                continue
             #  — if ``_dispatch_tool`` vetoed this
             # terminal via the prose-gate (appended its non-terminal error
             # result + the corrective user turn), STOP draining the rest of this
@@ -4048,56 +4069,35 @@ async def _stream_one_assistant_message(
             # Mirror ``self_verify_injected`` — break WITHOUT finalising; the
             # outer loop re-drives one corrective turn.
             if _prose_gate_just_injected(engine):
-                max_messages = max(max_messages, assistant_message_idx + 1)
+                max_messages = max(max_messages, flags.assistant_message_idx + 1)
                 self_verify_injected = True
                 break
             if _history_tool_result_is_terminal(engine, tool_call.id):
                 # One bounded self-verify turn before finalising (serial
                 # path). The helper persists the snapshot itself on injection.
-                if await _maybe_inject_pre_terminal_self_verify(engine):
-                    # The corrective turn must be granted a fresh
-                    # ``max_messages`` slot, or the next outer iteration
-                    # immediately exceeds the budget and the run exits
-                    # FAILED(max_turns) despite the already-submitted terminal
-                    # answer.
-                    max_messages = max(max_messages, assistant_message_idx + 1)
+                if await _finalise_or_verify_first(engine, flags):
+                    max_messages = max(
+                        max_messages, flags.assistant_message_idx + 1
+                    )
                     self_verify_injected = True
-                    break
-                terminal_tool_completed = True
                 break
-        if approval_pending:
+        if flags.approval_pending:
+            if parked_calls:
+                # One announcement for the whole message: the run goes to
+                # AWAITING once, with everything it is waiting on visible in a
+                # single envelope, so a host draws its cards in one pass.
+                engine.transition_to(LoopState.AWAITING)
+                await engine._persist_snapshot()
+                yield _interrupt_parked_event(engine, parked_calls[0])
             return
 
-        if terminal_tool_completed:
-            # Pair any already-appended tool_use that never received a result
-            # before driving the COMPLETED terminal. The dispatch loop walked
-            # ``pending_tool_calls`` in order and broke on the terminal tool
-            # result; any sibling tool_use blocks ALREADY in
-            # ``engine.history`` (appended to the assistant turn above) were
-            # never dispatched and have no paired ``ToolResultBlock``. The
-            # unconditional outbound wire repair (``_repair_outbound_tool_pairing``)
-            # would still forward-fill an opaque synthetic so a re-stream
-            # does not 400, but the durable ``engine.history`` mirror carries
-            # the orphan — a session-transcript consumer (chat reducer,
-            # dashboard) renders a tool call with no result. Call the same
-            # pairing helper the cancel/LLM-error/compaction teardowns use
-            # so every exit path leaves a pairing-valid history.
-            _synthesize_missing_tool_results(
-                engine.history,
-                error_content=engine.config.rc.tool_result_interrupted_placeholder,
-            )
-            # ── voluntary-finish terminal seal ──
-            # The model VOLUNTARILY completed the run by calling the run-terminal
-            # tool. A truncation-gated large file may be complete-enough but
-            # UNSEALED (the model appended chunks then ended via the terminal
-            # tool without FinalizeFile). Dispatch a SYNTHETIC FinalizeFile to
-            # seal it BEFORE the run completes — no LLM call, no extra turn.
-            # No-op (zero-collateral) when not eligible.
-            async for _seal_evt in _maybe_seal_longfile_at_voluntary_finish(engine):
-                yield _seal_evt
-            async for _completion_evt in _emit_voluntary_completion(engine):
-                yield _completion_evt
-            engine.transition_to(LoopState.COMPLETED)
+        if flags.terminal_tool_completed:
+            # The model completed the run of its own accord by calling the
+            # run-terminal tool. What that ending IS — the pairing of the
+            # calls the turn abandoned, and the seal — belongs to the finish
+            # policies, so every dispatch path that reaches it ends the same.
+            async for _evt in _complete_via_terminal_tool(engine, flags, policies):
+                yield _evt
             return
 
         # ── message_stop (tool_use) — between assistant messages ────
@@ -4113,95 +4113,35 @@ async def _stream_one_assistant_message(
             },
         )
 
-        # ── Proactive per-iteration compaction gate ──
-        # The tool result(s) are now in ``engine.history``; BEFORE rebuilding
-        # the wire payload for the next assistant stream, run compaction if the
-        # live history has crossed the trigger (routine) or emergency cliff
-        # (proactive force). Without this gate the inner loop rebuilds context
-        # from the FULL history with no compaction check (12K→39K per-
-        # iteration inflation until a reactive 413). RC kill-switch
-        # ``compaction_per_iteration_enabled`` (default on); idempotent via
-        # the stable-key dedup + already-summary skip so re-running the gate
-        # every iteration does not thrash already-compacted content.
-        #
-        # The result(s) just appended are the CURRENT iteration's tool batch
-        # — freshly produced and not yet consumed by the model.
-        # ``keep_recent_turns`` (default 4) only protects the trailing N
-        # messages, so a parallel batch of >keep tool calls would leave the
-        # 5th-from-last (and earlier) fresh result eligible for compaction IN
-        # THIS SAME ITERATION. We pass ``protect_tail_from_index`` = the
-        # index of the current assistant ``tool_use`` turn so the whole
-        # in-flight batch (any size) is exempt on top of the keep window.
-        # The protection is inherently kill-switched by
-        # ``compaction_per_iteration_enabled``: when off, this gate never
-        # fires, so no in-iteration batch compaction can occur at all.
-        if engine.config.rc.compaction_per_iteration_enabled:
-            _iter_emergency = (
-                engine.config.rc.compaction_emergency_proactive_enabled
-                and engine.needs_emergency_compaction()
-            )
-            if _iter_emergency or engine.needs_compaction():
-                _batch_protect_index = current_tool_batch_protect_index(engine.history)
-                async for evt in _run_compaction(
-                    engine,
-                    force=_iter_emergency,
-                    reason=(
-                        "proactive_per_iteration_emergency"
-                        if _iter_emergency
-                        else "proactive_per_iteration"
-                    ),
-                    protect_tail_from_index=_batch_protect_index,
-                ):
-                    yield evt
-                # A compaction-exhausted FAILED terminal bails out of the loop
-                # — mirror the turn-start gate. Pair any dangling tool_use so
-                # the FAILED snapshot is wire-valid .
-                if engine.state is LoopState.FAILED:
-                    _synthesize_missing_tool_results(
-                        engine.history,
-                        error_content=engine.config.rc.tool_result_interrupted_placeholder,
-                    )
-                    yield TurnEvent(
-                        type=EventType.MESSAGE_STOP,
-                        run_id=engine.config.run_id,
-                        payload={
-                            "turn_id": engine.turn_id(),
-                            "stop_reason": StopReason.error.value,
-                        },
-                    )
-                    return
+        # The results of the batch just dispatched are in history and the
+        # next stream is about to be built from all of it — the seam where
+        # the transcript grows, and so the seam the compaction gate sits at.
+        _turn = _turn_at(engine, flags, TurnCoordinate.iteration_end)
+        async for _policy_evt in policies.apply(_turn):
+            yield _policy_evt
+        max_messages = _turn_budget_after(_turn.outcome, max_messages, flags)
+        if _turn.outcome.directive is TurnDirective.end_turn:
+            return
+        if _turn.outcome.directive is TurnDirective.restart_turn:
+            if _turn.outcome.rebuild_context:
+                current_context = await _rebuild_context_for_recovery(engine)
+            continue
 
-        # ── large-file convergence (tool-call-turn end) ──
-        # The just-completed turn dispatched tools; advance the stall clock and,
-        # on a detected stall/plateau, FORCE the next tool (AppendFile to drive
-        # content / FinalizeFile to seal — empty-finalize guarded, bounded). The
-        # injected continue message + forced tool_choice are picked up by the
-        # context rebuild + next stream below. No-op when disabled / no stall.
-        _longfile_forced = False
-        async for _conv_evt in _maybe_drive_longfile_convergence(engine):
-            if isinstance(_conv_evt, bool):
-                _longfile_forced = _conv_evt
-            else:
-                yield _conv_evt
-        if _longfile_forced:
-            # Mirror the prose/no-tool seam above: a forced turn at the
-            # message-budget boundary must be GRANTED an extra slot, or the
-            # next outer iteration immediately exceeds ``max_messages`` and
-            # the forced stream is silently killed by ``max_turns`` before
-            # the model can respond (forced budget charged + history mutated,
-            # but no output). No explicit ``continue`` is needed here — the
-            # loop already iterates after the context rebuild below.
-            max_messages = max(max_messages, assistant_message_idx + 1)
+        _turn = _turn_at(engine, flags, TurnCoordinate.turn_end, dispatched_tools=True)
+        async for _policy_evt in policies.apply(_turn):
+            yield _policy_evt
+        max_messages = _turn_budget_after(_turn.outcome, max_messages, flags)
+        if _turn.outcome.directive is TurnDirective.end_turn:
+            return
+        if _turn.outcome.directive is TurnDirective.restart_turn:
+            if _turn.outcome.rebuild_context:
+                current_context = await _rebuild_context_for_recovery(engine)
+            continue
 
         # ── Build next context (tool_results now in history) ────────
         await _reload_live_control(engine)
-        wake_ids = await _maybe_place_background_wakes(engine)
-        if wake_ids:
-            yield TurnEvent(
-                type=EventType.BACKGROUND_WAKE,
-                run_id=engine.config.run_id,
-                payload={"task_ids": wake_ids},
-            )
+        async for _bg_evt in _background_wake_events(engine):
+            yield _bg_evt
         steer_evt = _inject_steer_into_history(engine)
         if steer_evt is not None:
             yield steer_evt
@@ -4360,7 +4300,7 @@ async def _drive_one_stream(
     # address the final outbound list.
     full_messages = _repair_outbound_tool_pairing(
         full_messages,
-        placeholder=rc.tool_result_pairing_repair_placeholder,
+        placeholder=engine.prompt_text("tool_result_pairing_repair"),
     )
 
     # vLLM-400 backstop — normalize any non-leading ``system`` message to
@@ -4394,19 +4334,12 @@ async def _drive_one_stream(
     # ``cache_control`` block per its detected
     # :class:`CachePolicy`.
     cache_breakpoints = apply_system_and_3(list(full_messages))
-    extra: dict[str, object] = {"cache_breakpoints": cache_breakpoints}
-    # Thread the native-thinking axis onto every
-    # assistant stream so the host vLLM adapter can translate the
-    # keys to ``chat_template_kwargs.enable_thinking`` + top-level
-    # ``reasoning_effort``. ``reasoning_effort`` is ALWAYS sent alongside
-    # ``enable_thinking`` so CoT stays bounded even when thinking is on
-    # (measured: ``enable_thinking`` alone truncates the answer). When
-    # thinking is off the adapter keeps its default-disable path; the effort
-    # value is inert there. Adapters that do not recognise the keys ignore
-    # them (bit-identical for non-vLLM providers).
-    extra["enable_thinking"] = engine.effective_thinking_enabled
-    extra["reasoning_effort"] = engine.effective_reasoning_effort
-    # ``extra["forced_tool_choice"]`` is a SINGLE slot carrying the tool NAME
+    # The forced-tool slot. ``build_llm_request`` places it on
+    # ``extra["forced_tool_choice"]``; the native-thinking axis it threads
+    # alongside (``enable_thinking`` + ``reasoning_effort``, always as a pair
+    # so CoT stays bounded) comes straight off the engine's live controls.
+    forced_tool_choice: str | None = None
+    # The forced-tool slot is a SINGLE slot carrying the tool NAME
     # the host vLLM/OpenAI-compatible adapter translates into a native
     # ``tool_choice={type:function, function:{name}}``; a provider/adapter that
     # does not recognise the key ignores it. Three independent mechanisms want
@@ -4437,7 +4370,7 @@ async def _drive_one_stream(
         if any(
             getattr(t, "name", None) == precondition_tool for t in context.tools
         ):
-            extra["forced_tool_choice"] = precondition_tool
+            forced_tool_choice = precondition_tool
             _preconditions.charge_attempt(engine)
         else:
             _preconditions.charge_attempt(
@@ -4465,7 +4398,7 @@ async def _drive_one_stream(
         ):
             # Surface includes the tool — consume the hint exactly once.
             _longfile.take_force_next_tool(engine)
-            extra["forced_tool_choice"] = forced_tool
+            forced_tool_choice = forced_tool
         else:
             # Nothing else wants the slot — a convergence hint that could not
             # be forced this turn has left it empty and kept its own state, so
@@ -4511,24 +4444,23 @@ async def _drive_one_stream(
                     )
                 else:
                     _pending_reads.charge_forced_attempt(engine)
-                    extra["forced_tool_choice"] = readback_tool
+                    forced_tool_choice = readback_tool
     yield TurnEvent(
         type=EventType.TOOL_SURFACE_ADVERTISED,
         run_id=engine.config.run_id,
         payload=_tool_surface_advertised_payload(engine, context),
     )
-    request = LLMRequest(
+    request = build_llm_request(
         model=engine.effective_model_name,
         messages=full_messages,
-        tools=list(context.tools),
+        tools=context.tools,
         max_tokens=max_output_tokens,
-        extra=extra,
-        observability=LLMObservabilityContext(
-            tenant_id=engine.config.tenant_id,
-            run_id=engine.config.run_id,
-            parent_run_id=engine.config.parent_run_id,
-            session_id=engine.config.session_id,
-            agent_id=engine.config.subagent_id,
+        thinking_enabled=engine.effective_thinking_enabled,
+        reasoning_effort=engine.effective_reasoning_effort,
+        forced_tool_choice=forced_tool_choice,
+        cache_breakpoints=cache_breakpoints,
+        observability=_observability_context(
+            engine,
             call_purpose="run",
             call_category=_provider_call_category(engine),
         ),
@@ -4578,6 +4510,8 @@ async def _drive_one_stream(
             len(context.tools),
             len(engine.history),
         )
+    await _manifest_request(engine, request, call_purpose="run")
+
     upstream = engine.llm.stream_with_tools(request)
 
     # Decide ONCE, up-front, whether this turn's visible assistant TEXT is the
@@ -4989,11 +4923,12 @@ async def _handle_context_window_exceeded(
     yield _emit_state_change(engine, from_state, LoopState.COMPACTING, reason="reactive_413")
 
     from protocore.runtime.context.budgets import derive_budgets
-    from protocore.runtime.context.manager import estimate_history_tokens
 
     rc = engine.context_manager._rc
     budgets = derive_budgets(rc)
-    tokens_before_value = estimate_history_tokens(engine.history, rc)
+    tokens_before_value = engine.context_manager.token_estimator.estimate_history(
+        engine.history, rc
+    )
     yield TurnEvent(
         type=EventType.COMPACTION_STARTED,
         run_id=engine.config.run_id,
@@ -5011,7 +4946,7 @@ async def _handle_context_window_exceeded(
             history=engine.history,
             compaction_state=engine.compaction_state,
             tenant_id=engine.config.tenant_id,
-            model_name=engine.config.model_name,
+            model_name=engine.effective_model_name,
             observability=_observability_context(
                 engine,
                 call_purpose="structured",
@@ -5131,11 +5066,21 @@ async def _iter_with_idle_watchdog(
             return
         except TimeoutError as exc:
             kind_hint = "reasoning" if in_reasoning_window else "baseline"
-            raise LLMStreamIdleError(
+            idle_error = LLMStreamIdleError(
                 f"LLM stream idle for >{active_timeout:.1f}s "
                 f"(window={kind_hint}, last_delta_seen=thinking={in_reasoning_window}) "
                 "— terminating"
-            ) from exc
+            )
+            # This watchdog is the only thing that raises the idle error, so it
+            # is the only place a verdict on it can come from. Without one the
+            # loop's chain step reads the failure as uncharacterised and leaves
+            # the run on the provider that just went silent — the branch that
+            # exists to move it would then be unreachable by construction. A
+            # stream that stopped speaking is a statement about the endpoint,
+            # exactly like a timeout, so it is classified as one and the next
+            # provider gets its turn.
+            object.__setattr__(idle_error, "classified", _IdleStreamVerdict())
+            raise idle_error from exc
 
         now = loop.time()
         gap = None if last_delta_at is None else now - last_delta_at
@@ -5198,7 +5143,7 @@ async def _emit_llm_terminal(
  invoke) sees a consistent value.
 
  The guard is opt-out via
- :attr:`RuntimeConstants.skip_terminal_hooks_on_llm_error` for
+ :attr:`LoopConstants.skip_terminal_hooks_on_llm_error` for
  diagnostic deployments where Stop hooks SHOULD see the LLM error.
 
  The classifier verdict (when present) is surfaced in the ERROR event
@@ -5250,7 +5195,7 @@ async def _emit_llm_terminal(
     # a resume must not replay a dangling tool_use.
     _synthesize_missing_tool_results(
         engine.history,
-        error_content=engine.config.rc.tool_result_interrupted_placeholder,
+        error_content=engine.prompt_text("tool_result_interrupted"),
     )
     from_state = engine.state
     # Engage the death-spiral guard BEFORE the state transition. It exists to
@@ -5404,26 +5349,25 @@ def _is_delegation_parallel_safe(
     READ tools). A delegation call — the subagent-dispatch tool — is deliberately
     NOT ``is_concurrent_safe`` (each child spawns a full nested run), so it is
     excluded from the read fan-out and keeps its serial-path safety wiring. This
-    predicate instead identifies the delegation tool GENERICALLY via the
-    ``is_parallel_delegation`` class flag (set only on the host dispatch
-    tool) so core hardcodes no tool name, and permits fanning several ADJACENT
+    predicate instead identifies the delegation tool GENERICALLY, through the
+    delegation contract (:func:`_tool_is_delegation`), so core hardcodes no tool
+    name, and permits fanning several ADJACENT
     delegation calls emitted in one assistant turn out under a bounded semaphore
     (see the delegation branch in :func:`_stream_one_assistant_message`).
 
     ``True`` only when ALL hold:
 
     * ``parallel_subagents_enabled`` — master gate (default on).
-    * The registry has a tool under ``tool_call.name`` whose
-      ``is_parallel_delegation`` flag is ``True``.
+    * The registry has a tool under ``tool_call.name`` that satisfies the
+      delegation contract, or that the host declared in the delegating role.
     * No enabled ``PreToolUse`` hook for this tenant could match the tool name
       (same predicate the read fan-out uses; a hook-gated delegation call MUST
       stay serial so its approval surface is honoured).
 
     The effective concurrency cap (``max_concurrent_subagents``) is applied by
     the caller: a cap resolving to ``< 2`` disables the fan-out so a single
-    delegation call (or a cap of 1) runs on the exact serial path. Uses
-    ``getattr(..., False)`` so a registry that pre-dates the delegation contract
-    (legacy adapters / focused unit fixtures) conservatively stays serial.
+    delegation call (or a cap of 1) runs on the exact serial path. A registry
+    whose tools declare nothing conservatively stays serial.
     """
     if not engine.config.rc.parallel_subagents_enabled:
         return False
@@ -5434,22 +5378,92 @@ def _is_delegation_parallel_safe(
     return True
 
 
+def _delegation_tool(
+    engine: QueryEngine, tool_call: ToolCall
+) -> IDelegationTool | None:
+    """The registered tool behind ``tool_call``, if it can answer the contract.
+
+    Recognition is by CONTRACT (:class:`IDelegationTool`), not by a boolean
+    attribute. A flag says a class was marked; it does not say the object can
+    answer the two questions the loop has to ask before it dispatches — how many
+    child runs this call starts, and whether the caller waits for them. Reading
+    a flag meant anything carrying an attribute of that name was treated as
+    spawning child runs, and that the real obligations were written down
+    nowhere, so a host could set the flag and satisfy none of them.
+
+    ``None`` for a tool the host declared in the delegating ROLE without
+    implementing the contract: it still delegates
+    (:func:`_tool_is_delegation`), and the two helpers below give it the
+    conservative defaults — one child run, and a caller that waits.
+    """
+    tool = engine.tools.get(tool_call.name)
+    if isinstance(tool, IDelegationTool):
+        return tool
+    return None
+
+
 def _tool_is_delegation(engine: QueryEngine, tool_call: ToolCall) -> bool:
     """Return ``True`` iff ``tool_call`` targets a delegation (subagent) tool.
 
-    The RAW structural check — the ``is_parallel_delegation`` class flag on the
-    registered tool — WITHOUT the ``parallel_subagents_enabled`` gate or the
-    hook-steering check that :func:`_is_delegation_parallel_safe` layers on top.
-    Those gates decide whether adjacent delegation calls FAN OUT concurrently;
-    they do NOT change the fact that a delegation call blocks its caller on a full
+    The RAW structural check — the delegation contract on the registered tool,
+    or the host's declaration of that name in the delegating role — WITHOUT the
+    ``parallel_subagents_enabled`` gate or the hook-steering check that
+    :func:`_is_delegation_parallel_safe` layers on top. Those gates decide
+    whether adjacent delegation calls FAN OUT concurrently; they do NOT change
+    the fact that a foreground delegation call blocks its caller on a full
     nested child run. A run holding a tree-budget slot must therefore release it
     around ANY such join — the concurrent gather AND a single hook-gated or
     gate-disabled serial dispatch — or it pins a slot while blocked on a
-    descendant and the tree can wedge at the cap. ``getattr(..., False)`` keeps a
-    registry that pre-dates the delegation contract conservatively non-delegation.
+    descendant and the tree can wedge at the cap.
     """
     tool = engine.tools.get(tool_call.name)
-    return tool is not None and bool(getattr(tool, "is_parallel_delegation", False))
+    if tool is None:
+        return False
+    return isinstance(tool, IDelegationTool) or engine.config.tool_roles.has_role(
+        tool_call.name, ToolRole.delegates_work
+    )
+
+
+def _delegation_child_run_count(engine: QueryEngine, tool_call: ToolCall) -> int:
+    """How many child runs ONE delegation call starts. ``1`` unless it says.
+
+    One delegation call is not one child run. A delegation tool whose arguments
+    carry a LIST of tasks starts one full child run per element, and a tree
+    charged once for that call is bounded by the number of CALLS rather than the
+    number of runs — the cap it advertises off by the batch width.
+
+    How the arguments map to runs lives in the tool's own schema, which core
+    deliberately knows nothing about, so the tool is ASKED rather than parsed —
+    ``child_run_count(arguments)``, one half of :class:`IDelegationTool`. A tool
+    known to delegate only by its declared role, or a counter that answers with
+    nonsense, reads as one.
+    """
+    tool = _delegation_tool(engine, tool_call)
+    if tool is None:
+        return 1
+    try:
+        return max(1, int(tool.child_run_count(tool_call.arguments)))
+    except (TypeError, ValueError):
+        return 1
+
+
+def _delegation_is_background(engine: QueryEngine, tool_call: ToolCall) -> bool:
+    """Whether this delegation call returns without waiting for its children.
+
+    The other half of :class:`IDelegationTool`, and the question that decides
+    whether the parent's turn and its slot in the tree budget are held for the
+    whole descendant run. A tool that cannot answer is treated as waiting, which
+    is the conservative reading: a caller assumed to be waiting keeps the bounds
+    it always had, whereas one wrongly assumed to have returned would release a
+    slot it still occupies and a turn it is still inside.
+    """
+    tool = _delegation_tool(engine, tool_call)
+    if tool is None:
+        return False
+    try:
+        return bool(tool.is_background_call(tool_call.arguments))
+    except (TypeError, ValueError):
+        return False
 
 
 # Operator subset needed by :func:`_hook_matchers_could_match_tool` —
@@ -5582,6 +5596,46 @@ async def _pre_tool_use_match_predicate(
     return _predicate
 
 
+async def _record_batch_tool_intents(
+    engine: QueryEngine,
+    tool_calls: Sequence[ToolCall],
+) -> None:
+    """Make a whole parallel batch durable in one snapshot, before it runs.
+
+    The serial path writes its record from inside the dispatch, at the last
+    moment before the tool is touched. A batch cannot: each call runs in its
+    own coroutine under a gather, and an await placed before the invoke
+    decides which sibling reaches its tool first. So the batch is recorded
+    together, here, one snapshot for all of it, before any of it is dispatched.
+
+    Recorded, not marked in flight. Between this snapshot and the tool there
+    is still a permission gate, a hook and a precondition check, any of which
+    can refuse the call outright. A record that already said "dispatched"
+    would, after a crash in that window, tell the model the outcome of a call
+    the gate refused is unknown and its effects may be in place. Each call
+    marks its own record as it passes the last of those checks, in memory,
+    where no await can reorder the siblings.
+    """
+    recorded = False
+    for tool_call in tool_calls:
+        if find_intent(engine.open_intents, tool_call.id) is not None:
+            continue
+        intent = commit_intent(
+            tool_name=tool_call.name,
+            tool_call_id=tool_call.id,
+            rc=engine.config.rc,
+            arguments=tool_call.arguments,
+            state=RESERVED,
+            roles=engine.config.tool_roles,
+        )
+        if intent.repeat_is_safe:
+            continue
+        engine.open_intents.append(intent)
+        recorded = True
+    if recorded:
+        await engine._persist_snapshot()
+
+
 async def _drain_dispatch_tool_deferred(
     engine: QueryEngine,
     tool_call: ToolCall,
@@ -5617,6 +5671,7 @@ async def _drain_dispatch_tool_deferred(
             payload={
                 "tool_call_id": tool_call.id,
                 "success": False,
+                "is_error": True,
                 "error": {
                     "kind": "terminal_only",
                     "message": error_message,
@@ -5636,35 +5691,40 @@ async def _drain_dispatch_tool_deferred(
     # Cumulative total-work guard, same synthetic shape as the terminal-only
     # veto above and for the same reason: no dispatcher invocation, so a tree
     # that has spent its delegation budget pays nothing more to be told so.
-    refusal, refusal_reason = _run_work_delegation_refusal(engine, tool_call)
-    if refusal:
+    #
+    # ONE act, not a gate followed by a charge. Reserving is itself the
+    # question — it grants all the child runs this call starts or none of
+    # them, and names the budget that refused — so asking first and charging
+    # second would be the same question twice with nothing able to run between
+    # the two: there is no await here, so no sibling can spend the budget in
+    # the gap. A second, separately-worded refusal for that impossible gap is
+    # what this branch used to carry, and it was never reached.
+    grant = _charge_child_run_start(engine, tool_call)
+    if grant is not None and not grant.fully_granted:
         _logger.warning(
             "DIAG query.run_work_budget.delegation_refused run=%s tenant=%s "
             "tool=%s reason=%s %s",
             engine.config.run_id,
             engine.config.tenant_id,
             tool_call.name,
-            refusal_reason,
+            grant.reason,
             _resolve_run_work_ledger(engine).spent_summary(),
         )
         return _run_work_refusal_dispatch(
-            engine, tool_call, refusal, refusal_reason
+            engine,
+            tool_call,
+            _run_work_refusal_text(engine, tool_call, grant.reason),
+            grant.reason,
         )
-    helpers = getattr(engine, "_helpers", None)
+    # Seed the run's satisfied set from the durable ``engine.history`` when the
+    # state is fresh (cross-process re-drive). This MUST run before the
+    # dispatcher reads that set on the parallel branch.
+    _rehydrate_satisfied_from_history(engine)
     metadata: dict[str, Any] = {}
-    if helpers:
-        # seed the per-run satisfied set from the durable
-        # ``engine.history`` when the helper bag is fresh (cross-pod
-        # re-drive). The dispatcher reads it from
-        # ``ctx.metadata["protocore.helpers"]["tool_preconditions.satisfied"]``
-        # so this MUST run before the dispatcher reads it on the
-        # parallel branch.
-        _rehydrate_satisfied_from_history(helpers, engine)
-        metadata[_HELPERS_METADATA_KEY] = helpers
-        # : skip runtime-internal keys so a forged operator
-        # ``run_metadata`` cannot shadow ``tool_call_id`` / ``protocore.*``
-        # on the parallel-dispatch path either.
-        _merge_run_metadata_into(metadata, helpers)
+    # Runtime-internal names are skipped, so a forged operator ``run_metadata``
+    # cannot shadow ``tool_call_id`` / ``protocore.*`` on the parallel-dispatch
+    # path either.
+    _merge_run_metadata_into(metadata, engine.run_state)
     # Carry the child's LLM-requested batch position + its fan-out group id so
     # the host runner can declare its deliverables into the parent ledger in
     # batch order (not gather completion order), scoped per group so a later
@@ -5677,8 +5737,8 @@ async def _drain_dispatch_tool_deferred(
     if dispatch_group is not None:
         metadata[SUBAGENT_DISPATCH_GROUP_METADATA_KEY] = dispatch_group
     # Carry THIS child's tree-budget permit handle (an in-memory object, not
-    # serialized — like the cancel Event on the helper bag) so the host
-    # runner can lodge it in the child's helper bag and the child engine can
+    # serialized — like the cancel Event on the run state) so the host
+    # runner can put it on the child's run state and the child engine can
     # release-while-awaiting around its own nested delegation gather. Set AFTER
     # the run-metadata merge so a forged ``run_metadata`` cannot shadow it; absent
     # (serial/single dispatch) means the child holds no tree slot.
@@ -5686,17 +5746,44 @@ async def _drain_dispatch_tool_deferred(
         metadata[SUBAGENT_TREE_PERMIT_METADATA_KEY] = tree_permit
     ctx = ToolContext(
         tenant_id=engine.config.tenant_id,
-        account_id=engine.config.account_id,
         run_id=engine.config.run_id,
         session_id=engine.config.session_id,
-        evidence_origin=engine._engine_evidence_origin(),
-        evidence_admission_deferred=True,
+        work_scope=engine.config.work_session_id,
+        evidence=ToolEvidenceContext(
+            origin=engine._engine_evidence_origin(), admission_deferred=True
+        ),
+        run_state=engine.run_state,
         metadata=metadata,
     )
 
     dispatcher = _ensure_tool_dispatcher(engine)
     events: list[TurnEvent] = []
     outcome: DispatchOutcome | None = None
+    # Same durable record as the serial path: a call in a parallel batch is
+    # every bit as capable of dying in flight, and a delegation repeated after
+    # a restart starts a whole second subtree.
+    intent = find_intent(engine.open_intents, tool_call.id)
+    if intent is None:
+        intent = commit_intent(
+            tool_name=tool_call.name,
+            tool_call_id=tool_call.id,
+            rc=engine.config.rc,
+            arguments=tool_call.arguments,
+            state=RESERVED,
+            roles=engine.config.tool_roles,
+        )
+        engine.open_intents.append(intent)
+
+    async def _mark_in_flight(_call: ToolCall) -> None:
+        """Move this call's record past every gate that could still stop it.
+
+        In memory only. The batch was made durable before the gather; writing
+        a snapshot here would place an await ahead of the invoke and decide
+        which sibling reaches its tool first, which is the ordering the batch
+        write exists to avoid.
+        """
+        mark_dispatched(intent)
+
     async for item in dispatcher.dispatch(
         tool_call=tool_call,
         ctx=ctx,
@@ -5711,16 +5798,27 @@ async def _drain_dispatch_tool_deferred(
         # declared one. Empty declaration ⇒ ``None`` ⇒ the gate's allow-list
         # stage stays off, exactly as before it was wired.
         subagent_whitelist=engine.effective_subagent_tool_allowlist,
+        child_run=engine.config.parent_run_id is not None,
         timeout_seconds=engine.config.rc.tool_timeout_seconds,
         preapproved_tool_call_id=None,
         admit_evidence=lambda records, producer: engine.append_tool_evidence(
             records, producer=producer
         ),
+        # No per-call snapshot here, unlike the serial path: this coroutine is
+        # one of several under a gather, and an await placed before the tool
+        # is invoked reorders which sibling starts first. The batch is made
+        # durable once, before the gather, by the caller; this callback only
+        # moves the already-durable record out of its reserved state.
+        on_dispatch_start=_mark_in_flight,
+        lifecycle=_lifecycle_registry(engine),
     ):
         if isinstance(item, DispatchOutcome):
             outcome = item
             break
         events.append(item)
+    if outcome is not None and not outcome.approval_required:
+        settle_intent(intent, result=str(outcome.content or "")[:200])
+        _forget_intent(engine, intent)
     return events, outcome
 
 
@@ -5752,6 +5850,7 @@ def _synthesize_delegation_error_result(
         payload={
             "tool_call_id": tool_call.id,
             "success": False,
+            "is_error": True,
             "error": {"kind": "execution", "message": message},
             "content_blocks": [{"type": "text", "text": message}],
         },
@@ -5771,47 +5870,39 @@ def _resolve_subagent_tree_budget(engine: QueryEngine) -> SubagentTreeBudget:
     """Resolve the shared tree-wide subagent budget, minting it at first fan-out.
 
     The budget is ONE object per maximal parallel-dispatched subtree, shared by
-    reference. When the helper bag already carries it (a run whose ancestor
-    already minted it — the parent-helpers dict-copy propagates the SAME object
-    the way ``cancel_event`` / ``root_run_id`` flow), return that. Otherwise mint
-    from ``rc.max_concurrent_subagents_per_tree`` and store it back into the bag
-    BEFORE any child is dispatched, so the very first ``dict(helpers)`` copy taken
-    by the dispatch path carries it downward. The minting run is simply the first
-    to reach a parallel fan-out without a budget in its bag — usually the root,
+    reference. When the run's state already carries it (a run whose ancestor
+    already minted it — a child state inherits the SAME object the way
+    ``cancel_event`` / ``root_run_id`` do), return that. Otherwise mint
+    from ``rc.max_concurrent_subagents_per_tree`` and store it back on the state
+    BEFORE any child is dispatched, so the first child state composed from it
+    carries the budget downward. The minting run is simply the first
+    to reach a parallel fan-out with no budget on its state — usually the root,
     but deeper if the root only ever delegates serially; either way, any two
     concurrently-executing runs share one budget (they branched at a common
     fan-out ancestor that minted it before dispatching them). When the engine has
-    no helper bag (unit tests / degenerate callers) fall back to a local budget
+    no run state (unit tests / degenerate callers) fall back to a local budget
     that still bounds THIS group but cannot propagate to descendants.
     """
-    helpers = getattr(engine, "_helpers", None)
-    if isinstance(helpers, dict):
-        existing = helpers.get(HELPER_SUBAGENT_TREE_BUDGET_KEY)
-        if isinstance(existing, SubagentTreeBudget):
-            return existing
-        budget = SubagentTreeBudget(
-            engine.config.rc.max_concurrent_subagents_per_tree
-        )
-        helpers[HELPER_SUBAGENT_TREE_BUDGET_KEY] = budget
-        return budget
-    return SubagentTreeBudget(engine.config.rc.max_concurrent_subagents_per_tree)
+    return engine.run_state.ensure_subagent_tree_budget(
+        engine.config.rc.max_concurrent_subagents_per_tree
+    )
 
 
 def _resolve_run_work_ledger(engine: QueryEngine) -> RunWorkLedger:
-    """Resolve the tree's CUMULATIVE work ledger, minting it if the bag has none.
+    """Resolve the tree's CUMULATIVE work ledger, minting one if the state has none.
 
     The live path finds one already there: the host composition root mints
-    it for the root run when it builds the helper bag, and every descendant
+    it for the root run when it builds the run's state, and every descendant
     inherits that same object by reference. Minting here is the fallback for a
-    caller that never composed a bag — it still bounds the caller's own subtree,
-    which is the most a run with no shared bag can be held to.
+    caller that never composed one — it still bounds the caller's own subtree,
+    which is the most a run with nothing shared can be held to.
 
     Unlike :func:`_resolve_subagent_tree_budget` this must NOT be minted lazily
     at the first parallel fan-out. A leader that emits one delegation call per
     turn never fans out, and that serial wave-after-wave shape is precisely the
     one an instantaneous concurrency cap cannot see.
     """
-    return resolve_run_work_ledger(getattr(engine, "_helpers", None), engine.config.rc)
+    return engine.run_state.ensure_run_work_ledger(engine.config.rc)
 
 
 def _charge_run_work_tokens(
@@ -5849,10 +5940,40 @@ def _run_work_delegation_refusal(
     """
     if not _tool_is_delegation(engine, tool_call):
         return "", ""
-    ledger = _resolve_run_work_ledger(engine)
-    reason = ledger.delegation_refusal_reason()
+    requested = _delegation_child_run_count(engine, tool_call)
+    reason = _resolve_run_work_ledger(engine).delegation_refusal_reason(requested)
     if not reason:
         return "", ""
+    return _run_work_refusal_text(engine, tool_call, reason), reason
+
+
+def _run_work_refusal_text(
+    engine: QueryEngine, tool_call: ToolCall, reason: str
+) -> str:
+    """The message a leader reads when the tree cannot pay for ``tool_call``.
+
+    Split out of :func:`_run_work_delegation_refusal` because the refusal is
+    reached two ways — the gate ASKS the ledger, the charge is TOLD by it — and
+    the advice must not depend on which one spoke. The advice differs by reason,
+    not by site: exhaustion means stop delegating, a short budget means ask for
+    fewer, and a caller that wrote its own text got one of those wrong.
+    """
+    ledger = _resolve_run_work_ledger(engine)
+    requested = _delegation_child_run_count(engine, tool_call)
+    if reason == SUBAGENT_RUN_BUDGET_SHORT:
+        # Not exhaustion, and the opposite advice: the tree can still pay for
+        # some of this, just not all of it at once. Saying "give up" here would
+        # throw away work the budget covers, so the text names the number that
+        # would be admitted and asks for a smaller call instead.
+        return (
+            f"Delegation budget too small for this call ({reason}: "
+            f"{ledger.spent_summary()}). This call asked to start {requested} "
+            f"child runs and the tree can still afford "
+            f"{ledger.remaining_child_runs}. The budget is cumulative over the "
+            "whole run and does NOT refill. Re-issue this call with at most "
+            f"{ledger.remaining_child_runs} of the most important tasks, or "
+            "finalize from what you already have."
+        )
     return (
         f"Delegation budget exhausted ({reason}: {ledger.spent_summary()}). "
         "This budget is cumulative over the whole run and does NOT refill — no "
@@ -5861,7 +5982,7 @@ def _run_work_delegation_refusal(
         "will still return. Finalize your answer now from the results you "
         "already have; if something is missing, say what is missing rather than "
         "delegating again."
-    ), reason
+    )
 
 
 def _run_work_refusal_dispatch(
@@ -5881,6 +6002,7 @@ def _run_work_refusal_dispatch(
         payload={
             "tool_call_id": tool_call.id,
             "success": False,
+            "is_error": True,
             "error": {"kind": "execution", "message": message},
             "content_blocks": [{"type": "text", "text": message}],
         },
@@ -5901,20 +6023,49 @@ def _run_work_refusal_dispatch(
     return [event], outcome
 
 
-def _resolve_subagent_tree_permit(engine: QueryEngine) -> SubagentTreePermit | None:
-    """Return THIS run's own tree permit from the helper bag, or None.
+def _charge_child_run_start(
+    engine: QueryEngine, tool_call: ToolCall
+) -> ChildRunGrant | None:
+    """Charge the tree's cumulative ledger for the child runs about to start.
 
-    Present only for a run that was itself dispatched under the budget (
-    the host runner lodges the child's permit in its fresh helper bag). The root
+    Called at the places a child run actually begins — the concurrent delegation
+    fan-out and the serial dispatch, the latter only once every seam that can
+    still refuse the call has let it past — so a call that was refused, denied
+    or parked for approval is never charged.
+
+    The amount is what the TOOL says the call starts
+    (:func:`_delegation_child_run_count`), not one per call: a batch that starts
+    thirty-two child runs costs the tree thirty-two, or the cap bounds calls
+    rather than runs and is off by the batch width.
+
+    The charge deliberately does NOT live inside :func:`_tool_is_delegation`.
+    That is a pure predicate, consulted several times per dispatch (fan-out
+    classification, permit resolution) and on every tool call rather than every
+    child run; charging there would debit the tree several times for one child
+    — the same over-counting this bound exists to prevent, only from the inside.
+
+    The grant comes back so the caller can act on a refusal: the ledger is the
+    authority on whether the call is affordable, and a caller that ignored a
+    zero grant would start work the tree did not pay for. Charging is keyed on
+    the call id, so one call reaching here twice — dispatched, parked for
+    approval, dispatched again — is charged once.
+    """
+    if not _tool_is_delegation(engine, tool_call):
+        return None
+    return _resolve_run_work_ledger(engine).reserve_child_runs(
+        _delegation_child_run_count(engine, tool_call), call_id=tool_call.id
+    )
+
+
+def _resolve_subagent_tree_permit(engine: QueryEngine) -> SubagentTreePermit | None:
+    """Return THIS run's own tree permit from the run's state, or None.
+
+    Present only for a run that was itself dispatched under the budget (the host
+    runner puts the child's permit on its fresh run state). The root
     leader — which was never dispatched as a subagent — holds none, so it returns
     None and neither releases nor reacquires a tree slot while awaiting children.
     """
-    helpers = getattr(engine, "_helpers", None)
-    if isinstance(helpers, dict):
-        permit = helpers.get(HELPER_SUBAGENT_TREE_PERMIT_KEY)
-        if isinstance(permit, SubagentTreePermit):
-            return permit
-    return None
+    return engine.run_state.subagent_tree_permit
 
 
 async def _dispatch_subagent_under_semaphore(
@@ -5950,6 +6101,24 @@ async def _dispatch_subagent_under_semaphore(
     """
     async with semaphore:
         permit = await budget.acquire()
+        # The tree budget is an in-process object, so how many slots a fan-out
+        # actually charged is otherwise readable only from inside the process
+        # that holds it — and a completed run never writes it anywhere, because
+        # only a run that PAUSES snapshots the count. That left the bound with
+        # no evidence but wall-clock timing, which is not evidence. One line per
+        # charged slot, naming the group and the capacity it was charged
+        # against, so a fan-out of N children is N lines under one group id.
+        _logger.warning(
+            "DIAG query.subagent_tree_budget.charged run=%s tenant=%s group=%s "
+            "order=%s capacity=%d charged=%d unlimited=%s",
+            engine.config.run_id,
+            engine.config.tenant_id,
+            dispatch_group,
+            dispatch_order,
+            budget.capacity,
+            budget.in_use,
+            budget.unlimited,
+        )
         try:
             return await _drain_dispatch_tool_deferred(
                 engine,
@@ -6046,6 +6215,32 @@ def _tool_result_content_with_finalization_hint(outcome: DispatchOutcome) -> str
     return f"{content}\n\n{hint}" if content else hint
 
 
+def _result_block_from_outcome(
+    tool_call_id: str, outcome: DispatchOutcome
+) -> ToolResultBlock:
+    """The transcript's projection of one dispatched call.
+
+    Every path that records a result goes through here, so the transcript
+    carries the same shape wherever the result came from: the text for the
+    model, the value that text was projected from while nothing has stored it,
+    and the two references that say where the whole value can be fetched from
+    and which file it describes. Built separately at four call sites, those
+    fields were dropped at three of them, and a dropped reference is
+    indistinguishable from a result that never had one.
+    """
+    return ToolResultBlock(
+        tool_call_id=tool_call_id,
+        content=_tool_result_content_with_finalization_hint(outcome),
+        is_error=outcome.is_error,
+        metadata=outcome.metadata or {},
+        canonical_content=(
+            outcome.canonical_content if outcome.canonical_ref is None else None
+        ),
+        canonical_ref=outcome.canonical_ref,
+        path=outcome.path,
+    )
+
+
 def _apply_deferred_tool_history(
     engine: QueryEngine,
     tool_call: ToolCall,
@@ -6094,12 +6289,7 @@ def _apply_deferred_tool_history(
         Message(
             role=MessageRole.tool,
             content_blocks=[
-                ToolResultBlock(
-                    tool_call_id=tool_call.id,
-                    content=_tool_result_content_with_finalization_hint(outcome),
-                    is_error=outcome.is_error,
-                    metadata=outcome.metadata or {},
-                )
+                _result_block_from_outcome(tool_call.id, outcome)
             ],
         )
     )
@@ -6255,7 +6445,7 @@ def _this_run_messages(engine: QueryEngine) -> list[Message]:
 # Any tenant declares its terminal tool name via
 # ``QueryEngineConfig.expected_terminal_tool`` (routed from
 # ``leader_config.expected_terminal_tool``). When set, the universal
-# ``RuntimeConstants.terminal_tool_nudge_enabled`` knob gates the
+# ``LoopConstants.terminal_tool_nudge_enabled`` knob gates the
 # contract-repair nudge.
 
 
@@ -6273,16 +6463,9 @@ def _resolved_terminal_tool_name(engine: QueryEngine) -> str | None:
 def _tool_name_for_call_id(
     engine: QueryEngine, tool_call_id: str
 ) -> str | None:
-    """Walk history to find the assistant tool_use block matching ``tool_call_id``."""
+    """The tool name behind ``tool_call_id`` in this engine's history, or None."""
 
-    for message in reversed(engine.history):
-        for block in reversed(message.content_blocks):
-            if (
-                isinstance(block, ToolUseBlock)
-                and block.tool_call_id == tool_call_id
-            ):
-                return block.name
-    return None
+    return tool_name_for_result(engine.history, tool_call_id)
 
 
 def _history_has_terminal_tool_result(engine: QueryEngine) -> bool:
@@ -6483,55 +6666,36 @@ def _history_has_file_write_result(engine: QueryEngine) -> bool:
 def _resolved_terminal_tool_nudge_text(engine: QueryEngine) -> str:
     """Resolve the message body for the terminal-tool nudge.
 
-    Order: universal RC ``terminal_tool_nudge_text`` (when non-empty) →
-    templated generic fallback keyed on the resolved tool name. Tenants
-    that only flip ``terminal_tool_nudge_enabled`` without supplying
-    override text still receive a usable nudge.
+    The body comes from the ``terminal_tool_nudge`` template, which is handed
+    the live terminal tool name so nothing has to hard-code it. An operator who
+    wants different wording, or the same wording in another language, replaces
+    the template — there is no second copy of the text in configuration to keep
+    in step with it.
 
-    When ``terminal_tool_nudge_write_first_enabled``
-    is set AND no file-write deliverable is in history yet
-    (:func:`_history_has_file_write_result`), the resolved body is PREFIXED
-    with ``terminal_tool_nudge_write_first_text`` so a model that narrated
-    "now let me write this file" and fired 0 tools is steered to the actual
-    write tool first, not just the terminal tool. The prefix is bounded by the
-    single-shot nudge latch (it never loops) and is a no-op for a run that has
-    already written its deliverable.
+    When ``terminal_tool_nudge_write_first_enabled`` is set AND no file-write
+    deliverable is in history yet (:func:`_history_has_file_write_result`), the
+    body is PREFIXED with the ``terminal_tool_nudge_write_first`` template so a
+    model that narrated "now let me write this file" and fired 0 tools is
+    steered to the actual write tool first, not just the terminal tool. The
+    prefix is bounded by the single-shot nudge latch (it never loops) and is a
+    no-op for a run that has already written its deliverable.
+
+    The wording is deliberately an internal control note rather than a
+    second-person imperative. A weak model in a looping state used to
+    PARAPHRASE the imperative straight into its visible answer; a note that is
+    self-evidently not answer prose is harmless when echoed verbatim, and the
+    functional trigger is unchanged — the run still finishes by calling the
+    terminal tool with its best supported answer.
     """
 
     rc = engine.config.rc
     tool_name = _resolved_terminal_tool_name(engine) or "the configured terminal tool"
-    universal_text = rc.terminal_tool_nudge_text
-    if universal_text:
-        # Resolve the live terminal tool name DYNAMICALLY. The RC text MAY
-        # carry a ``{terminal_tool}`` placeholder so a tenant never has to
-        # hard-code the tool name; core fills it from
-        # ``expected_terminal_tool`` at runtime. No placeholder ⟹ verbatim
-        # (bit-identical for existing RC values).
-        body = universal_text.replace("{terminal_tool}", tool_name)
-    else:
-        # Anti-echo wording: a weak model in a looping/confused state used
-        # to PARAPHRASE the prior second-person imperative ("You have not called
-        # X yet … Do not write normal final text.") straight into its visible
-        # answer. This recasts the nudge as a self-evidently INTERNAL control
-        # note (the ``[internal control — …]`` frame is obviously not answer
-        # prose, so a verbatim echo is harmless), describes the run state in the
-        # third person instead of commanding the model, and drops the
-        # echo-attractive negative imperative — while keeping the SAME functional
-        # trigger: the run still finishes by calling the terminal tool with its
-        # best supported answer. Keeps the literal "Finish now by calling
-        # {tool_name}" the forced-backstop test keys on.
-        body = (
-            f"[internal control — not part of the reply] The run is ending and "
-            f"the {tool_name} tool has not been called yet. Finish now by calling "
-            f"{tool_name} with the best supported answer already prepared; the "
-            "answer text belongs in the reply itself, not in this note."
-        )
-    if (
-        rc.terminal_tool_nudge_write_first_enabled
-        and rc.terminal_tool_nudge_write_first_text
-        and not _history_has_file_write_result(engine)
+    body = engine.prompt_text("terminal_tool_nudge", terminal_tool=tool_name)
+    if rc.terminal_tool_nudge_write_first_enabled and not _history_has_file_write_result(
+        engine
     ):
-        return f"{rc.terminal_tool_nudge_write_first_text}\n\n{body}"
+        prefix = engine.prompt_text("terminal_tool_nudge_write_first")
+        return f"{prefix}\n\n{body}"
     return body
 
 
@@ -7021,7 +7185,7 @@ async def _complete_run_on_preserved_answer(
 
 
 def _transient_retry_backoff_seconds(
-    rc: RuntimeConstants, attempt: int, exc: BaseException
+    rc: LoopConstants, attempt: int, exc: BaseException
 ) -> float:
     """Backoff (seconds) before the ``attempt``-th transient-error retry.
 
@@ -7164,7 +7328,7 @@ async def _emit_empty_completion_terminal(
     # resumed snapshot never carries a dangling call).
     _synthesize_missing_tool_results(
         engine.history,
-        error_content=engine.config.rc.tool_result_interrupted_placeholder,
+        error_content=engine.prompt_text("tool_result_interrupted"),
     )
     from_state = engine.state
     reason = "no_answer_empty_completion"
@@ -7212,7 +7376,7 @@ async def _emit_tool_precondition_terminal(
     # have appended a tool_use whose result never came back.
     _synthesize_missing_tool_results(
         engine.history,
-        error_content=engine.config.rc.tool_result_interrupted_placeholder,
+        error_content=engine.prompt_text("tool_result_interrupted"),
     )
     from_state = engine.state
     reason = "tool_precondition_unsatisfied"
@@ -7245,14 +7409,7 @@ def _prose_gate_just_injected(engine: QueryEngine) -> bool:
     is the tail, the loop breaks the batch (does NOT dispatch later sibling tool
     calls AFTER the user-repair turn) and re-drives. Pure / total."""
 
-    if not engine.history:
-        return False
-    last = engine.history[-1]
-    return (
-        last.role is MessageRole.user
-        and last.metadata.get(SYNTHETIC_RECOVERY_METADATA_KEY)
-        == SYNTHETIC_RECOVERY_PROSE_GATE_REPAIR
-    )
+    return _prose_gate_injected(engine)
 
 
 def _terminal_tool_carries_answer_field(
@@ -7266,7 +7423,7 @@ def _terminal_tool_carries_answer_field(
  ``final_answer`` / ``Finalize.answer``) legitimately
  answers via its args and emits no prose — vetoing it would withhold a
  valid answer submission. Reuses the SAME schema signal as the synthesiser
- (:data:`_TERMINAL_TOOL_ANSWER_ARG_NAMES` = ``("message","answer","text"``).
+ (the answer-carrying argument names the host declared).
 
  Fails SAFE (returns ``True`` ⟹ EXEMPT ⟹ no prose-gate) for multi-tenant
  safety whenever the schema cannot be introspected: no core registry, the
@@ -7291,7 +7448,13 @@ def _terminal_tool_carries_answer_field(
         properties = tool.definition.parameters.properties
     except Exception:  # pragma: no cover - defensive
         return True
-    return any(name in properties for name in _TERMINAL_TOOL_ANSWER_ARG_NAMES)
+    answer_names = argument_names(ToolArgumentSlot.answer, roles=engine.config.tool_roles)
+    if not answer_names:
+        # The host named no answer-carrying arguments, so nothing here can
+        # prove this tool is a background one. Fail SAFE, exactly as an
+        # unreadable schema does: exempt, no prose gate.
+        return True
+    return any(name in properties for name in answer_names)
 
 
 def _finalize_prose_gate_applies(
@@ -7495,14 +7658,9 @@ def _run_did_non_terminal_work(engine: QueryEngine, terminal_tool: str) -> bool:
     return False
 
 
-#: The two spellings a write tool's target path arrives under. The canonical
-#: field is ``path`` with ``file_path`` as a validation alias, and the model
-#: reaches for either — the same pair :mod:`protocore.runtime.pending_reads` and
-#: :mod:`protocore.runtime.longfile_convergence` resolve for their own reasons.
-_WRITE_PATH_ARG_NAMES: Final[tuple[str, ...]] = ("file_path", "path")
-
-
-def _parse_write_call(arguments_json: str) -> tuple[str, int] | None:
+def _parse_write_call(
+    engine: QueryEngine, arguments_json: str
+) -> tuple[str, int] | None:
     """The ``(path, content_chars)`` a write call carries, or None.
 
     Reads the call's OWN arguments, which is where the content the run produced
@@ -7527,7 +7685,7 @@ def _parse_write_call(arguments_json: str) -> tuple[str, int] | None:
     content = arguments.get(CHUNKABLE_CONTENT_FIELD)
     if not isinstance(content, str) or not content:
         return None
-    for key in _WRITE_PATH_ARG_NAMES:
+    for key in argument_names(ToolArgumentSlot.path, roles=engine.config.tool_roles):
         value = arguments.get(key)
         if isinstance(value, str) and value.strip():
             return value.strip(), len(content)
@@ -7568,7 +7726,7 @@ def _run_written_content_by_path(engine: QueryEngine) -> dict[str, int]:
             if isinstance(block, ToolUseBlock):
                 if _strip_tool_name_prefix(block.name) not in write_names:
                     continue
-                parsed = _parse_write_call(block.arguments_json)
+                parsed = _parse_write_call(engine, block.arguments_json)
                 if parsed is not None:
                     attempted[block.tool_call_id] = parsed
             elif isinstance(block, ToolResultBlock) and not block.is_error:
@@ -7866,7 +8024,7 @@ def _append_answer_floor_repair_turn(engine: QueryEngine) -> None:
         Message(
             role=MessageRole.user,
             content_blocks=[
-                TextBlock(text=engine.config.rc.finalize_prose_gate_repair_text)
+                TextBlock(text=engine.prompt_text("finalize_prose_gate_repair"))
             ],
             metadata={
                 SYNTHETIC_RECOVERY_METADATA_KEY: (
@@ -7899,66 +8057,6 @@ def _count_terminal_answer_cited_refs(tool_call: ToolCall) -> int:
             if count:
                 return count
     return 0
-
-
-def _observed_ref_ledger_size(engine: QueryEngine) -> int:
-    """Best-effort size of the per-run observed-ref ledger.
-
-    Reads the ledger off the OPAQUE helper bag (``engine._helpers``) that core
-    forwards verbatim into ``ToolContext.metadata``; the host read tools
-    populate it under :data:`_OBSERVED_REF_LEDGER_HELPER_KEY` (a ``set[str]``).
-    This is a plain mapping lookup, NOT a host import, so core stays
-    import-boundary-pure. Returns :data:`_HEARTBEAT_OBSERVED_UNAVAILABLE`
-    (``-1``) when the bag/ledger is absent or not a sized collection — the
-    heartbeat then reports "observed not cheaply visible from core" rather than
-    a misleading 0. Pure / total — never raises, no behavioural effect.
-    """
-
-    helpers = getattr(engine, "_helpers", None)
-    if not isinstance(helpers, Mapping):
-        return _HEARTBEAT_OBSERVED_UNAVAILABLE
-    bucket = helpers.get(_OBSERVED_REF_LEDGER_HELPER_KEY)
-    try:
-        return len(bucket)  # type: ignore[arg-type]
-    except TypeError:
-        return _HEARTBEAT_OBSERVED_UNAVAILABLE
-
-
-def _observed_ref_ledger_refs(engine: QueryEngine) -> list[str]:
-    """Return the real banked paths for the guaranteed-terminal backstop refs.
-
-    Returns the sorted union of the per-run CONTENT-READ ledger (paths whose
-    BODY the run actually read) and the path-OBSERVED ledger, read off the
-    OPAQUE helper bag (``engine._helpers``) that core forwards verbatim —
-    the host read/list/tree tools populate these buckets under
-    :data:`_CONTENT_READ_LEDGER_HELPER_KEY` / :data:`_OBSERVED_REF_LEDGER_HELPER_KEY`
-    (``set[str]``). The content-read set is preferred (those are the files the
-    model truly opened); the path-observed set is appended only as a fallback so
-    a run that listed but never full-read still cites something real.
-
-    These are the REAL, harness-returned paths the run banked — NEVER fabricated.
-    This is a plain mapping lookup, NOT a host import, so core stays
-    import-boundary-pure (guard: ``tests/test_core_import_boundary.py``). Returns
-    an empty list when the bag/ledgers are absent or not iterable string sets —
-    the backstop then submits a message-only answer (degrades gracefully, never
-    raises, no fabrication). Pure / total.
-    """
-
-    helpers = getattr(engine, "_helpers", None)
-    if not isinstance(helpers, Mapping):
-        return []
-
-    def _string_set(key: str) -> set[str]:
-        bucket = helpers.get(key)
-        if not isinstance(bucket, (set, frozenset, list, tuple)):
-            return set()
-        return {item for item in bucket if isinstance(item, str) and item.strip()}
-
-    content_read = _string_set(_CONTENT_READ_LEDGER_HELPER_KEY)
-    path_observed = _string_set(_OBSERVED_REF_LEDGER_HELPER_KEY)
-    # Content-read first (the files the model truly opened), then any path-only
-    # observation as a real fallback. Deterministic order for stable history.
-    return sorted(content_read | path_observed)
 
 
 def _pre_dispatch_terminal_verify_applies(
@@ -8058,26 +8156,7 @@ def _append_terminal_tool_nudge(engine: QueryEngine) -> None:
     engine._terminal_only_active = True
 
 
-# Answer-carrying field names a terminal tool may expose, in priority order.
-# The guaranteed-terminal synthesiser maps the last-resort answer text to the
-# FIRST of these that the terminal tool actually declares — so a legacy lean
-# message-carrying contract (``message``) still receives the text in its own
-# schema, with no per-tool hard-coding in core. A BACKGROUND terminal tool (the
-# ``Finalize`` shape: its ``answer`` field removed, only
-# ``declared_deliverables`` remaining) declares NONE of these names, so the
-# synthesiser injects NO answer text and the prose-gate guarantees the
-# answer is the model's prose. This same signal gates the prose-gate itself
-# (:func:`_terminal_tool_carries_answer_field`).
-_TERMINAL_TOOL_ANSWER_ARG_NAMES: tuple[str, ...] = ("message", "answer", "text")
-
-
-# The file-target arg names the write-family tools use. They accept both
-# ``path`` and the ``file_path`` alias, so recovery message/shape
-# detection checks either.
-_WRITE_PATH_KEYS: tuple[str, ...] = ("path", "file_path")
-
-
-def _truncated_call_state_path(tool_call: ToolCall) -> str | None:
+def _truncated_call_state_path(engine: QueryEngine, tool_call: ToolCall) -> str | None:
     """The REAL file-target of a truncated mutation call, or ``None``.
 
     The state-only twin of :func:`_truncated_call_path`: it NEVER returns the
@@ -8086,16 +8165,12 @@ def _truncated_call_state_path(tool_call: ToolCall) -> str | None:
     handoff) — latching the placeholder would poison ``_longfile_active_path``
     so a later real Write to the actual file is ignored as off-path.
     """
-    args = tool_call.arguments
-    if isinstance(args, dict):
-        for key in _WRITE_PATH_KEYS:
-            value = args.get(key)
-            if isinstance(value, str) and value:
-                return value
-    return None
+    return string_argument(
+        tool_call.arguments, ToolArgumentSlot.path, roles=engine.config.tool_roles
+    )
 
 
-def _truncated_call_path(tool_call: ToolCall) -> str:
+def _truncated_call_path(engine: QueryEngine, tool_call: ToolCall) -> str:
     """Best-effort extract the file-target of a truncated mutation call (display).
 
     The chunk-recovery message names the file path so the model resumes the
@@ -8107,14 +8182,14 @@ def _truncated_call_path(tool_call: ToolCall) -> str:
     the MODEL-VISIBLE display path; convergence STATE must use
     :func:`_truncated_call_state_path` (which never returns the placeholder).
     """
-    return _truncated_call_state_path(tool_call) or "the target file"
+    return _truncated_call_state_path(engine, tool_call) or "the target file"
 
 
-def _truncated_call_paths(tool_calls: list[ToolCall]) -> list[str]:
+def _truncated_call_paths(engine: QueryEngine, tool_calls: list[ToolCall]) -> list[str]:
     """Ordered, de-duplicated list of recoverable paths for telemetry."""
     seen: list[str] = []
     for tc in tool_calls:
-        path = _truncated_call_path(tc)
+        path = _truncated_call_path(engine, tc)
         if path not in seen:
             seen.append(path)
     return seen
@@ -8129,8 +8204,8 @@ def _is_content_mutation_truncation(engine: QueryEngine, tool_call: ToolCall) ->
  (:func:`protocore.contracts.tool_chunking.is_chunkable_content_mutation`)
  that the host LLM client uses too, so both layers route identically:
  the call's tool must REQUIRE ``content`` (the body the cap cut) AND be
- explicitly flagged (``ToolParameterSchema.chunkable_content_mutation``) OR on
- the narrow built-in allowlist (``Write``/``AppendFile``). The call must also
+ explicitly flagged (``ToolParameterSchema.chunkable_content_mutation``) OR
+ declared by the host as byte-producing. The call must also
  be missing ``content`` (the cut-body shape). This EXCLUDES a tool like
  ``Read`` (no ``content``) and — the fix — a dynamic/tenant tool that
  merely declares a ``content`` field without opting in: such a call gets the
@@ -8149,6 +8224,7 @@ def _is_content_mutation_truncation(engine: QueryEngine, tool_call: ToolCall) ->
         tool_name=tool_call.name,
         required=required,
         chunkable_flag=chunkable_flag,
+        roles=engine.config.tool_roles,
     )
 
 
@@ -8209,7 +8285,7 @@ def _build_truncation_chunk_recovery_text(
  the structured Write->AppendFile->FinalizeFile message naming the PATH + the
  per-call ``write_chunk_token_budget`` (the 0/4 -> 4/4 chunking protocol).
  Any OTHER truncated call (e.g. a non-content tool whose args were cut) gets
- the generic ``tool_call_truncation_resume_prompt`` so it is not misrouted
+ the generic ``tool_call_truncation_resume`` template so it is not misrouted
  into an irrelevant file-chunk workflow. Both EN and RU
  halves are emitted for the chunk message (EN first), per the
  multilingual rule.
@@ -8231,10 +8307,10 @@ def _build_truncation_chunk_recovery_text(
         if not _is_content_mutation_truncation(engine, tc):
             # Non-content truncation — generic resume, no file-chunk protocol.
             sections.append(
-                rc.tool_call_truncation_resume_prompt.format(tool_name=tc.name)
+                engine.prompt_text("tool_call_truncation_resume", tool_name=tc.name)
             )
             continue
-        path = _truncated_call_path(tc)
+        path = _truncated_call_path(engine, tc)
         already_chunking = path in engine._mid_chunked_write_paths
         if already_chunking:
             # A chunk has really been written → steer to AppendFile, full budget.
@@ -8269,7 +8345,7 @@ def _build_truncation_chunk_recovery_text(
     return "\n\n".join(sections)
 
 
-def _lowered_header_budget(rc: RuntimeConstants, prior_prompts: int) -> int:
+def _lowered_header_budget(rc: LoopConstants, prior_prompts: int) -> int:
     """Header chunk budget for a repeat truncation before any chunk was written.
 
  Integer-divide ``write_chunk_token_budget`` by
@@ -8302,15 +8378,15 @@ def _record_chunk_write_success(engine: QueryEngine, tool_call: ToolCall) -> Non
  target cannot be resolved, is a no-op.
  """
     name = tool_call.name
-    if name not in CHUNKABLE_CONTENT_MUTATION_ALLOWLIST:
-        # Only the runtime's own chunk tools advance the "chunking started"
-        # state; a per-tenant flagged tool drives recovery wording but its
-        # append-resume semantics are tool-specific, so it is not tracked here.
+    if name not in chunkable_content_mutation_names(engine.config.tool_roles):
+        # Only a host tool declared as byte-producing advances the "chunking
+        # started" state; a per-tenant flagged tool drives recovery wording but
+        # its append-resume semantics are tool-specific, so it is not tracked.
         return
     args = tool_call.arguments
     if not isinstance(args, dict) or "content" not in args:
         return
-    path = _truncated_call_path(tool_call)
+    path = _truncated_call_path(engine, tool_call)
     if path == "the target file":
         return
     engine._mid_chunked_write_paths.add(path)
@@ -8359,7 +8435,7 @@ async def _salvage_truncated_write_to_disk(
  Yields the dispatch events. The caller treats it as ONE recovery round
  (the shared ``_max_output_recovery_count`` is already debited by the branch).
  """
-    state_path = _truncated_call_state_path(tool_call)
+    state_path = _truncated_call_state_path(engine, tool_call)
     if state_path is None:
         # Defensive: the caller's classifier already requires a resolvable path,
         # so this never fires for a salvage_job — but never dispatch without one.
@@ -8488,8 +8564,8 @@ async def _maybe_seal_longfile_at_voluntary_finish(
     one-shot ``_longfile_voluntary_seal_used`` latch caps it to ONCE per run, and
     ``commit_forced_finalize`` charges the seal against the finalize budget.
 
-    FinalizeFile must be on the run's tool surface for dispatch — if the tool is
-    NOT in the registry (``engine.tools.get("FinalizeFile") is None``) the seal
+    The sealing tool must be on the run's tool surface for dispatch — if the
+    host named none, or the tool is not in the registry, the seal
     is skipped SILENTLY (no crash): a tenant without the chunk-protocol tools
     simply cannot be sealed this way, and that is correct (the run completes as
     before). Yields any dispatch events; no-op (yields nothing) when not eligible.
@@ -8524,10 +8600,11 @@ async def _maybe_seal_longfile_at_voluntary_finish(
         # Defensive: ``terminal_seal_required`` implies a truncation-gated active
         # path, but never dispatch FinalizeFile without a concrete target.
         return
-    # FinalizeFile must be advertised on this run's tool surface to dispatch.
-    # A run whose tenant has no chunk-protocol tools simply cannot be sealed —
-    # skip silently (the run completes as it would have without the seal).
-    if engine.tools.get("FinalizeFile") is None:
+    # The sealing tool must be advertised on this run's tool surface to
+    # dispatch. A run whose tenant has no chunk-protocol tools simply cannot be
+    # sealed — skip (the run completes as it would have without the seal).
+    seal_tool_name = _longfile.sealing_tool_name(engine)
+    if seal_tool_name is None or engine.tools.get(seal_tool_name) is None:
         return
 
     engine._longfile_voluntary_seal_used = True
@@ -8537,10 +8614,10 @@ async def _maybe_seal_longfile_at_voluntary_finish(
     )
     seal_call = ToolCall(
         id=synthetic_id,
-        name="FinalizeFile",
+        name=seal_tool_name,
         arguments={"path": path},
     )
-    engine.remember_tool_name(synthetic_id, "FinalizeFile")
+    engine.remember_tool_name(synthetic_id, seal_tool_name)
     # Append the matching assistant tool_use FIRST (scaffold-flagged) so the
     # tool result ``_dispatch_tool`` appends is paired in durable history.
     engine.history.append(
@@ -8549,7 +8626,7 @@ async def _maybe_seal_longfile_at_voluntary_finish(
             content_blocks=[
                 ToolUseBlock(
                     tool_call_id=synthetic_id,
-                    name="FinalizeFile",
+                    name=seal_tool_name,
                     arguments_json=json.dumps(seal_call.arguments, ensure_ascii=False),
                 )
             ],
@@ -8639,9 +8716,17 @@ async def _maybe_drive_longfile_convergence(
     if forced is None:
         yield False
         return
+    forced_name = _longfile.forced_tool_name(engine, forced)
+    if forced_name is None:
+        # The decision stands but this run has no single tool to carry it: the
+        # host declared none for the role, or declared two. Charge nothing and
+        # inject nothing — a continue message whose forced choice cannot be set
+        # is the drop the forcing exists to prevent.
+        yield False
+        return
 
     # Inject the INCOMPLETE continue message — bilingual, tail-anchored,
-    # never "safe on disk". The forced AppendFile/FinalizeFile directive rides
+    # never "safe on disk". The forced continue/seal directive rides
     # on the native ``tool_choice`` set below (the message is the continuation
     # hint, the forcing is the active ingredient).
     continue_text = _longfile.build_continue_message(engine)
@@ -8654,8 +8739,8 @@ async def _maybe_drive_longfile_convergence(
             },
         )
     )
-    _longfile.set_force_next_tool(engine, forced)
-    if forced == "AppendFile":
+    _longfile.set_force_next_tool(engine, forced_name)
+    if forced is ToolRole.appends_path:
         _longfile.commit_forced_append(engine)
     else:
         _longfile.commit_forced_finalize(engine)
@@ -8666,7 +8751,7 @@ async def _maybe_drive_longfile_convergence(
         engine.state,
         reason=(
             "longfile_forced_append"
-            if forced == "AppendFile"
+            if forced is ToolRole.appends_path
             else "longfile_forced_finalize"
         ),
     )
@@ -8838,99 +8923,31 @@ def _rewrite_deferred_tool_result_events(
     return rewritten
 
 
-# The dispatcher mutates per-run helper-bag state mid-execution
-# (consecutive-error streak, SANDBOX_DOWN streak, string_type streak,
-# satisfied-precondition set). Under ``asyncio.gather`` those mutations
-# race on the shared dict and the final state depends on gather completion
-# order, not the LLM-requested order. The snapshot/restore/replay helpers
-# below let the parallel branch (a) preserve the pre-gather state,
-# (b) restore it after gather, and (c) deterministically replay the state
-# transitions in transcript order so the next-turn caps fire on the
-# correct count.
-
-_DISPATCHER_HELPER_KEYS_TO_SNAPSHOT: tuple[str, ...] = (
-    "tool_dispatch.consecutive_error_state",
-    "tool_dispatch.sandbox_down_streak",
-    "tool_dispatch.sandbox_down_injection_pending",
-    "tool_dispatch.string_type_streak",
-    "tool_preconditions.satisfied",
-)
-"""Per-run helper-bag keys whose semantics are "transcript-order".
-
-Mirrors the constants in :mod:`protocore.runtime.tool_dispatch` /
-:mod:`protocore.runtime.tool_preconditions`. Kept as a separate tuple
-so a regression in the dispatcher keys is caught by the parallel-batch
-state replay tests rather than silently producing wrong streaks. New
-helper-bag keys with transcript-order semantics MUST be added here.
-"""
+# The dispatcher mutates per-run state mid-execution (the consecutive-error
+# streak, the transport-down streak, the string_type streak, the satisfied
+# preconditions, the soft-cap counts). Under ``asyncio.gather`` those mutations
+# happen in gather completion order, not in the order the model asked for the
+# calls, so the final state depends on which tool finished first. The run state
+# copies that group of cells out before the gather and puts it back after, and
+# the replay below re-applies the transitions in transcript order so the next
+# turn's caps fire on the correct count.
 
 
-def _snapshot_dispatcher_helper_state(
-    engine: QueryEngine,
-) -> dict[str, Any]:
-    """Deep-copy the dispatcher's transcript-order helper-bag keys.
-
-    Returns a dict ``{key: value}`` capturing only the keys present in
-    the bag prior to gather. Missing keys are NOT recorded so the
-    matching :func:`_restore_dispatcher_helper_state` can ``pop`` keys
-    introduced by the parallel mutations. ``getattr(engine, '_helpers',
-    None)`` falls through to an empty snapshot when the bag is not
-    wired (legacy tests).
-    """
-    helpers = getattr(engine, "_helpers", None)
-    if not isinstance(helpers, dict):
-        return {}
-    snapshot: dict[str, Any] = {}
-    for key in _DISPATCHER_HELPER_KEYS_TO_SNAPSHOT:
-        if key in helpers:
-            # Deep-copy because the values are mutable dicts/sets/lists
-            # — a shallow copy would alias to the same nested object
-            # and parallel mutations would leak into the snapshot.
-            snapshot[key] = _deep_copy_helper_value(
-                helpers[key], max_depth=engine.config.rc.max_data_nesting_depth
-            )
-    return snapshot
-
-
-def _restore_dispatcher_helper_state(
-    engine: QueryEngine,
-    snapshot: Mapping[str, Any],
-) -> None:
-    """Restore the helper bag to the snapshot, discarding parallel mutations.
-
-    Keys absent from the snapshot are ``pop``'d from the bag so any new
-    keys introduced by the parallel mutations are wiped — the replay
-    in :func:`_replay_dispatcher_helper_state` re-introduces them in
-    LLM-requested order.
-    """
-    helpers = getattr(engine, "_helpers", None)
-    if not isinstance(helpers, dict):
-        return
-    for key in _DISPATCHER_HELPER_KEYS_TO_SNAPSHOT:
-        if key in snapshot:
-            helpers[key] = _deep_copy_helper_value(
-                snapshot[key], max_depth=engine.config.rc.max_data_nesting_depth
-            )
-        else:
-            helpers.pop(key, None)
-
-
-def _replay_dispatcher_helper_state(
+def _replay_dispatch_state(
     engine: QueryEngine,
     tool_call: ToolCall,
     outcome: DispatchOutcome,
 ) -> DispatchOutcome:
     """Apply transcript-order state transitions for one (tool_call, outcome).
 
-    Called by the parallel-dispatch orchestrator in LLM-requested order
-    after :func:`_restore_dispatcher_helper_state` has put the bag back
-    into its pre-gather state. Delegates to the same classmethods on
+    Called by the parallel-dispatch orchestrator in LLM-requested order after
+    :meth:`RunScopedState.restore_transcript_state` has put the run's state back
+    the way it was before the gather. Delegates to the same classmethods on
     :class:`ToolDispatcher` that the serial dispatch path runs so the
     cap / satisfaction semantics stay defined in ONE place
     (:mod:`protocore.runtime.tool_dispatch`).
 
     Skips silently when:
-    * The helper bag is not wired (legacy tests).
     * ``outcome`` is ``None`` (defensive — dispatcher must yield one).
     * ``outcome.approval_required`` (the caller already handled this
       before invoking us — replay would be wrong because the gate
@@ -8951,28 +8968,24 @@ def _replay_dispatcher_helper_state(
     # or snapshot side effect can observe success.
     outcome = _ingest_tool_evidence(engine, outcome)
 
-    helpers = getattr(engine, "_helpers", None)
-    if not isinstance(helpers, dict):
-        return outcome
-
     # Lazy import to keep the module-level import graph clean and
     # avoid any chance of a circular import via
     # ``tool_dispatch.py`` re-exporting.
     from protocore.runtime.tool_dispatch import DispatchErrorKind, ToolDispatcher
 
-    helpers_metadata = _build_replay_metadata(engine)
     ctx = ToolContext(
         tenant_id=engine.config.tenant_id,
-        account_id=engine.config.account_id,
         run_id=engine.config.run_id,
         session_id=engine.config.session_id,
-        evidence_origin=engine._engine_evidence_origin(),
-        metadata=helpers_metadata,
+        work_scope=engine.config.work_session_id,
+        evidence=ToolEvidenceContext(origin=engine._engine_evidence_origin()),
+        run_state=engine.run_state,
+        metadata=_build_replay_metadata(engine),
     )
 
     # Cumulative tool-call soft cap — count THIS executed tool call in
-    # transcript order. The concurrent gather did NOT count it (the counter is a
-    # snapshotted transcript-order key restored to its pre-gather value above),
+    # transcript order. The concurrent gather did NOT count it (the count is a
+    # transcript-order cell restored to its pre-gather value above),
     # so the increment happens HERE, once per replayed call, in LLM-requested
     # order — mirroring the serial path's per-call count. Advisory only; the
     # warning (if any) is appended to the surfaced outcome via ``_finalize``.
@@ -8994,7 +9007,7 @@ def _replay_dispatcher_helper_state(
         return outcome
 
     # Error path — replay the consecutive-error cap from the original
-    # pre-rewrite `(kind, message)` tuple so restored helper state matches the
+    # pre-rewrite `(kind, message)` tuple so the restored state matches the
     # transcript-order serial path even when the gathered dispatch already hit
     # the cap locally.
     metadata = outcome.metadata or {}
@@ -9009,7 +9022,7 @@ def _replay_dispatcher_helper_state(
     if kind is None:
         kind = outcome.error_kind or DispatchErrorKind.execution
     message = raw_message if isinstance(raw_message, str) else outcome.content
-    final_kind, final_message = ToolDispatcher._apply_consecutive_error_cap(
+    final_kind, final_message = _ensure_tool_dispatcher(engine)._apply_consecutive_error_cap(
         ctx,
         tool_call.name,
         kind,
@@ -9033,12 +9046,11 @@ def _replay_dispatcher_helper_state(
 
 # the per-run ``run_metadata`` envelope is OPERATOR-supplied via the
 # public ``POST /v1/runs.metadata`` API. It must never be allowed to shadow a
-# RUNTIME-INTERNAL ``ToolContext.metadata`` key: those keys (the helper-bag
-# namespace, the authoritative ``tool_call_id`` consumed by tool-result
-# correlation / subagent-parent edges / answer-RPC binding, and any
-# ``protocore.*`` control key such as synthetic-recovery / suppress-grounding)
-# carry runtime trust. The merge below copies only NON-internal envelope keys.
-_HELPERS_METADATA_KEY: Final[str] = "protocore.helpers"
+# RUNTIME-INTERNAL ``ToolContext.metadata`` key: the authoritative
+# ``tool_call_id`` consumed by tool-result correlation / subagent-parent edges /
+# answer-RPC binding, and any ``protocore.*`` control key such as
+# synthetic-recovery / suppress-grounding, carry runtime trust. The merge below
+# copies only NON-internal envelope keys.
 _TOOL_CALL_ID_METADATA_KEY: Final[str] = "tool_call_id"
 _RUNTIME_INTERNAL_METADATA_PREFIX: Final[str] = "protocore."
 
@@ -9048,7 +9060,7 @@ def _is_runtime_internal_metadata_key(key: str) -> bool:
  NOT be able to set/shadow on ``ToolContext.metadata`` .
 
  Covers the authoritative ``tool_call_id`` and every ``protocore.*``
- runtime-internal control key (which includes ``protocore.helpers``).
+ runtime-internal control key.
  """
     return key == _TOOL_CALL_ID_METADATA_KEY or key.startswith(
         _RUNTIME_INTERNAL_METADATA_PREFIX
@@ -9056,129 +9068,52 @@ def _is_runtime_internal_metadata_key(key: str) -> bool:
 
 
 def _merge_run_metadata_into(
-    metadata: dict[str, Any], helpers: object
+    metadata: dict[str, Any], state: RunScopedState
 ) -> None:
-    """Merge the per-run ``run_metadata`` envelope onto ``metadata`` in place,
- skipping runtime-internal keys so an operator-forgeable envelope cannot
- shadow trusted runtime state .
-
- ``helpers`` is the opaque engine helper bag; only a plain ``dict`` carries a
- ``run_metadata`` sub-mapping. Non-dict bags (TypedDict-like Mappings) are a
- no-op, matching the prior guarded behaviour.
+    """Merge the run's operator-supplied envelope onto ``metadata`` in place,
+ skipping runtime-internal keys so a forgeable envelope cannot shadow trusted
+ runtime state.
  """
-    if not isinstance(helpers, dict):
-        return
-    run_metadata = helpers.get("run_metadata")
-    if not isinstance(run_metadata, dict):
-        return
-    for key, value in run_metadata.items():
+    for key, value in state.run_metadata.items():
         if _is_runtime_internal_metadata_key(key):
             continue
         metadata[key] = value
 
 
-class HelperStateTooDeep(RuntimeError):
-    """Raised when a helper-bag value nests deeper than the copier will walk.
-
-    The bag holds tool-supplied state — a tool decides what it writes there and
-    the model decides what the tool is called with — so its depth is not a
-    property this module controls. Naming the condition keeps it out of the
-    ``RecursionError`` class, which reaches the run loop with no attribution.
-    """
-
-
-def _deep_copy_helper_value(
-    value: Any,
-    *,
-    max_depth: int = MAX_DATA_NESTING_DEPTH,
-    _depth: int = 0,
-) -> Any:
-    """Helper-bag value deep copy that handles dicts / sets / lists / scalars.
-
-    The dispatcher stores small dicts (streak state), sets (satisfied
-    preconditions — though :func:`store_satisfied_set` normalises to a
-    sorted list on persist), and scalars. A full :func:`copy.deepcopy`
-    would suffice but pulls in the entire stdlib module; the explicit
-    shapes here are cheap + keep the snapshot/restore path importing
-    no new modules.
-
-    Depth-bounded. This runs on the parallel-dispatch path, over values a tool
-    wrote into the bag from arguments the model supplied; unbounded recursion
-    there turns a nested payload into a ``RecursionError`` raised mid-dispatch,
-    which the loop then reports as a provider failure. Past ``max_depth`` the
-    copy raises :class:`HelperStateTooDeep` instead.
-    """
-    if _depth > max_depth:
-        raise HelperStateTooDeep(
-            f"helper-bag value nests deeper than {max_depth} levels — "
-            "refusing to copy it for the parallel-dispatch snapshot"
-        )
-    if isinstance(value, dict):
-        return {
-            k: _deep_copy_helper_value(v, max_depth=max_depth, _depth=_depth + 1)
-            for k, v in value.items()
-        }
-    if isinstance(value, list):
-        return [
-            _deep_copy_helper_value(v, max_depth=max_depth, _depth=_depth + 1)
-            for v in value
-        ]
-    if isinstance(value, set):
-        return set(value)
-    if isinstance(value, tuple):
-        return tuple(
-            _deep_copy_helper_value(v, max_depth=max_depth, _depth=_depth + 1)
-            for v in value
-        )
-    return value
-
-
 def _build_replay_metadata(engine: QueryEngine) -> dict[str, Any]:
-    """Build a ``ToolContext.metadata`` dict that wraps the engine's helper bag.
+    """Build the ``ToolContext.metadata`` dict the replay's context carries.
 
     Mirrors the metadata construction in
-    :func:`_drain_dispatch_tool_deferred` (and :func:`_dispatch_tool`)
-    so the replay's ``ToolContext`` exposes the same ``protocore.helpers``
-    namespace + per-run metadata envelope the dispatcher would have seen.
+    :func:`_drain_dispatch_tool_deferred` (and :func:`_dispatch_tool`) so the
+    replay's ``ToolContext`` exposes the same per-run envelope the dispatcher
+    would have seen — runtime-internal names skipped, so an operator's envelope
+    cannot shadow trusted state on the replay path either.
     """
-    helpers = getattr(engine, "_helpers", None)
+    # Seed the cross-process re-drive satisfaction set so a precondition check
+    # on the replay path sees the same set the live recording produced.
+    _rehydrate_satisfied_from_history(engine)
     metadata: dict[str, Any] = {}
-    if helpers:
-        # replay the cross-pod re-drive seed so a
-        # precondition check on the replay path sees the same set the
-        # live recording would have produced.
-        _rehydrate_satisfied_from_history(helpers, engine)
-        metadata[_HELPERS_METADATA_KEY] = helpers
-        # : skip runtime-internal keys on the replay path too so the
-        # replay's ``ToolContext`` matches the dispatcher's sanitised one.
-        _merge_run_metadata_into(metadata, helpers)
+    _merge_run_metadata_into(metadata, engine.run_state)
     return metadata
 
 
-def _rehydrate_satisfied_from_history(
-    helpers: dict[str, Any] | None,
-    engine: QueryEngine,
-) -> None:
-    """Seed the helper-bag satisfied set from ``engine.history`` when empty.
+def _rehydrate_satisfied_from_history(engine: QueryEngine) -> None:
+    """Seed the run's satisfied set from ``engine.history`` when it is empty.
 
- the helper bag is built per-pod by
- ``service_runtime.build_helper_bag`` and is NOT carried in the
- engine snapshot. On a cross-pod re-drive a fresh pod sees an
+ The run's state is composed per process and is NOT carried in the
+ engine snapshot. On a cross-process re-drive a fresh process sees an
  empty satisfied set even when ``engine.history`` already contains
  a long transcript of ``AppendFile(foo)``/``Write(...)``/etc.
  Without rehydration a follow-up ``FinalizeFile(foo)`` call would
  be blocked with ``[PRECONDITION NOT MET: AppendFile:foo]`` even
  though the prereq is right there in the durable transcript.
 
- Reads :data:`engine.history` and writes the rebuilt set into the
- helper bag's :data:`SATISFIED_PRECONDITIONS_KEY` only when the key
- is absent or empty — a populated in-bag set always wins (in-process
- dispatches have already recorded the live satisfaction entries).
+ Reads :data:`engine.history` and writes the rebuilt set onto the run's
+ state only when that set is empty — a populated one always wins, since
+ in-process dispatches have already recorded the live satisfaction entries.
 
- The engine reference is the only piece of cross-pod-durable state
- for a resumed run (the helper bag itself is rebuilt by the new
- pod), so the history is the canonical source of truth for the
- satisfied set on the re-drive path.
+ The history is the only cross-process-durable record for a resumed run,
+ so it is the canonical source of truth on the re-drive path.
 
  Rebuilt from :func:`_this_run_messages`, not from the whole
  transcript. A tool precondition is a statement about what THIS run
@@ -9189,26 +9124,21 @@ def _rehydrate_satisfied_from_history(
  anything, which is the same class of error as a failed call
  authorising a dependent one.
  """
-    if helpers is None:
-        return
-    existing = helpers.get("tool_preconditions.satisfied")
-    if isinstance(existing, (list, tuple, set)) and len(existing) > 0:
+    state = engine.run_state
+    if state.satisfied_preconditions:
         return
     # Late import to avoid a circular import: tool_preconditions does
     # not import from this module, but the engine → query → preconditions
     # direction is cleaner at call-site.
-    from protocore.runtime.tool_preconditions import (
-        SATISFIED_PRECONDITIONS_KEY,
-        record_satisfaction,
-    )
+    from protocore.runtime.tool_preconditions import record_satisfaction
 
     run_messages = _this_run_messages(engine)
     if not run_messages:
         return
     # A tool-use block merely records the model's request.  Rehydrating it as
     # satisfaction would let a failed tool (including evidence rejection)
-    # authorize a dependent call after the helper bag is rebuilt.  Pair the
-    # request with its durable non-error result instead.
+    # authorize a dependent call after the state is rebuilt.  Pair the request
+    # with its durable non-error result instead.
     pending_calls: dict[str, tuple[str, dict[str, Any]]] = {}
     rebuilt: set[str] = set()
     for message in run_messages:
@@ -9232,7 +9162,7 @@ def _rehydrate_satisfied_from_history(
                         satisfied=rebuilt,
                     )
     if rebuilt:
-        helpers[SATISFIED_PRECONDITIONS_KEY] = sorted(rebuilt)
+        state.satisfied_preconditions = rebuilt
 
 
 # ---------------------------------------------------------------------------
@@ -9379,6 +9309,331 @@ def _circuit_breaker_track_and_maybe_trip(
     return _circuit_breaker_corrective_text(tool_name)
 
 
+def _message_text(message: Message) -> str:
+    """The plain text of a message, as the reply to a question the tool asked."""
+    return "\n".join(
+        block.text for block in message.content_blocks if isinstance(block, TextBlock)
+    )
+
+
+def _park_pause_interrupt(
+    engine: QueryEngine,
+    tool_call_id: str,
+    *,
+    event: TurnEvent | None = None,
+    tool_name: str = "",
+) -> PendingInterrupt:
+    """Record what the loop is now waiting for, reading the kind off the pause.
+
+    Both pauses announce themselves with the same ``tool_call_pending``
+    envelope; only its contents say which of the two happened. An envelope
+    tagged as an ask carries a question a tool already asked and is waiting on;
+    anything else is a call parked at a gate that has not run. The loop used to
+    treat both as the second, so an answer arriving for the first was refused
+    as "not the pending approval", and the operator's card described a call as
+    awaiting a decision when what it awaited was a reply.
+    """
+    payload = dict(event.payload) if event is not None and event.payload else {}
+    name = tool_name or str(payload.get("tool_name") or "")
+    if payload.get("ask_user") or payload.get("kind") == "ask_user":
+        return engine.mark_awaiting_answer(tool_call_id, tool_name=name, payload=payload)
+    return engine.mark_pending_approval(tool_call_id, tool_name=name, payload=payload)
+
+
+def _interrupt_parked_event(
+    engine: QueryEngine, interrupt: PendingInterrupt
+) -> TurnEvent:
+    """Tell the host what the run is waiting for, and for how many things.
+
+    The whole open set travels beside the one just parked: a host that renders
+    a card per wait can draw a parked batch in one pass instead of learning
+    about the second and third calls only when it tries to resume past them.
+    """
+    return TurnEvent(
+        type=EventType.INTERRUPT_PARKED,
+        run_id=engine.config.run_id,
+        payload={
+            "turn_id": engine.turn_id(),
+            "interrupt": interrupt.to_dict(),
+            "pending_interrupts": [
+                item.to_dict() for item in engine.pending_interrupts
+            ],
+        },
+    )
+
+
+def _tool_call_from_history(engine: QueryEngine, tool_call_id: str) -> ToolCall:
+    """Rebuild the parked call from the transcript that recorded it.
+
+    The transcript is the authority here rather than anything the caller sends
+    with the resolution: the resolution names an interrupt, and what that
+    interrupt parked is whatever the assistant actually asked for. A caller
+    that could also supply the call would be a caller that could substitute one.
+    """
+    for message in engine.history:
+        for block in message.content_blocks:
+            if isinstance(block, ToolUseBlock) and block.tool_call_id == tool_call_id:
+                try:
+                    arguments = json.loads(block.arguments_json or "{}")
+                except (TypeError, ValueError):
+                    arguments = {}
+                return ToolCall(
+                    id=tool_call_id,
+                    name=block.name,
+                    arguments=arguments if isinstance(arguments, dict) else {},
+                )
+    raise InterruptResolutionError(
+        f"the call {tool_call_id!r} an interrupt parked is not in this run's "
+        "history; the snapshot and the interrupt describe different runs"
+    )
+
+
+def _apply_updated_input(
+    engine: QueryEngine,
+    tool_call: ToolCall,
+    updated_input: dict[str, Any],
+) -> ToolCall:
+    """Run the approved call with the arguments a person corrected.
+
+    Three things have to agree afterwards or the correction is a lie somewhere:
+    the call that is dispatched, the ``tool_use`` block the model is shown, and
+    the durable record written before the call. The block is rewritten so the
+    transcript says what was really run rather than what was proposed, and the
+    record's fingerprint is rewritten with it so the pause check does not
+    refuse the very call the operator just fixed.
+    """
+    corrected = ToolCall(id=tool_call.id, name=tool_call.name, arguments=dict(updated_input))
+    arguments_json = json.dumps(corrected.arguments, ensure_ascii=False)
+    for index, message in enumerate(engine.history):
+        rewritten = [
+            (
+                block.model_copy(update={"arguments_json": arguments_json})
+                if isinstance(block, ToolUseBlock)
+                and block.tool_call_id == tool_call.id
+                else block
+            )
+            for block in message.content_blocks
+        ]
+        if rewritten != list(message.content_blocks):
+            engine.history[index] = message.model_copy(
+                update={"content_blocks": rewritten}
+            )
+    intent = find_intent(engine.open_intents, tool_call.id)
+    if intent is not None:
+        intent.arguments_fingerprint = _intent_fingerprint(
+            corrected.name, corrected.arguments
+        )
+    return corrected
+
+
+def _settle_parked_call(
+    engine: QueryEngine,
+    *,
+    tool_call_id: str,
+    content: str,
+    is_error: bool,
+) -> None:
+    """Close a parked call with the result a person's decision produced.
+
+    Both halves are needed. A ``tool_use`` left unpaired is filled in on the
+    wire with a synthetic failure, which says the opposite of what a denial or
+    an answer means; and a durable record left standing keeps the call open
+    forever, so the next resume finds a wait nobody is going to answer.
+    """
+    _insert_tool_result_after_use(
+        engine.history,
+        tool_call_id=tool_call_id,
+        content=content,
+        is_error=is_error,
+    )
+    intent = find_intent(engine.open_intents, tool_call_id)
+    if intent is not None:
+        settle_intent(intent, result=content)
+        _forget_intent(engine, intent)
+    engine.forget_tool_name(tool_call_id)
+
+
+def _forget_intent(engine: QueryEngine, intent: IntentRecord) -> None:
+    """Drop a record whose call is durably answered by history."""
+    engine.open_intents = [
+        item for item in engine.open_intents if item is not intent
+    ]
+
+
+def _assert_pause_envelope_matches_intent(
+    intent: IntentRecord,
+    buffered: list[TurnEvent],
+) -> None:
+    """Refuse a pause whose envelope contradicts the record it pauses.
+
+    Both the approval park and the ask-user park announce themselves with a
+    ``tool_call_pending`` envelope naming the call, the tool and the input.
+    When that envelope and the record written before the dispatch disagree,
+    there is no principled way to choose between them: one of them describes
+    the call an operator is about to approve, the other describes something
+    else, and executing either is a coin flip on which. So the run stops
+    instead, loudly, with both readings in the message.
+    """
+    for evt in buffered:
+        if evt.type is not EventType.TOOL_CALL_PENDING:
+            continue
+        payload = evt.payload or {}
+        call_id = payload.get("tool_call_id")
+        if not isinstance(call_id, str):
+            continue
+        assert_pause_matches(
+            intent,
+            tool_call_id=call_id,
+            tool_name=str(payload.get("tool_name", intent.tool_name)),
+            arguments=payload.get("tool_input"),
+        )
+
+
+def _durable_dispatch_start(
+    engine: QueryEngine,
+    intent: IntentRecord,
+) -> Callable[[ToolCall], Awaitable[None]] | None:
+    """Build the callback that makes the intent durable before the tool runs.
+
+    Returns ``None`` for a tool whose repeat is harmless. Durability here buys
+    exactly one thing — not applying a side effect twice — and a tool that only
+    reads state has no side effect to apply twice, so paying for a snapshot
+    write per call to buy nothing is the wrong trade on the hottest path in the
+    loop.
+    """
+    if intent.repeat_is_safe:
+        return None
+
+    async def _start(_call: ToolCall) -> None:
+        mark_dispatched(intent)
+        await engine._persist_snapshot()
+
+    return _start
+
+
+async def _settle_interrupted_tool_intents(
+    engine: QueryEngine,
+) -> AsyncIterator[TurnEvent]:
+    """Close out records left by a run that stopped while a tool was in flight.
+
+    Runs at the top of every turn, which is where a run picked up on another
+    pod first gets the chance to say something true about what it was doing
+    when it died.
+
+    A record still reading ``DISPATCHED`` with no result anywhere in history
+    describes a call that was handed to a tool and never came back. The tool
+    may well have done its work — written the file, sent the request — and the
+    only honest thing to tell the model is that the outcome was never recorded.
+    Telling it the call FAILED, which is what a synthetic error result says,
+    invites precisely the repeat that doubles the effect.
+
+    Records parked at an approval gate or waiting on a user's answer are never
+    given an outcome here: neither has an unknown one, and neither may be
+    executed by a resume. They are still dropped once history answers them —
+    the answer to a paused question arrives as a tool result appended by the
+    layer that collected it, and a record whose result is in history has
+    nothing left to say. Keeping it would put one more entry in every snapshot
+    the run writes from then on, for the life of the run.
+    """
+    resolved: set[str] = set()
+    for message in engine.history:
+        for block in message.content_blocks:
+            if isinstance(block, ToolResultBlock):
+                resolved.add(block.tool_call_id)
+
+    stale = orphaned_intents(list(engine.open_intents), resolved_tool_call_ids=resolved)
+    settled_by_history = [
+        item
+        for item in engine.open_intents
+        if item.state != SETTLED and item.tool_call_id in resolved
+    ]
+    for item in settled_by_history:
+        _forget_intent(engine, item)
+    if not stale:
+        if settled_by_history:
+            await engine._persist_snapshot()
+        return
+
+    for item in stale:
+        text = unknown_outcome_text(item, engine.config.rc)
+        _insert_tool_result_after_use(
+            engine.history,
+            tool_call_id=item.tool_call_id,
+            content=text,
+            is_error=False,
+        )
+        settle_unknown(item)
+        item.reported = True
+        _logger.warning(
+            "DIAG query.tool_intent.outcome_unknown run=%s tool=%s call_id=%s "
+            "idempotency_key=%s repeat_safe=%s",
+            engine.config.run_id,
+            item.tool_name,
+            item.tool_call_id,
+            item.idempotency_key,
+            item.repeat_is_safe,
+        )
+        yield TurnEvent(
+            type=EventType.TOOL_RESULT,
+            run_id=engine.config.run_id,
+            payload={
+                "tool_call_id": item.tool_call_id,
+                "content": text,
+                "is_error": False,
+                "outcome": "unknown",
+                "idempotency_key": item.idempotency_key,
+            },
+        )
+        if engine.config.rc.intent_settlement_enabled:
+            from protocore.runtime.correctness_bind import mark_intent_recovery
+
+            for rec_evt in mark_intent_recovery(engine, item):
+                yield rec_evt
+    if engine.config.rc.intent_settlement_enabled:
+        from protocore.runtime.correctness_bind import persist_correctness
+
+        persist_correctness(engine)
+    await engine._persist_snapshot()
+
+
+def _insert_tool_result_after_use(
+    history: list[Message],
+    *,
+    tool_call_id: str,
+    content: str,
+    is_error: bool,
+) -> bool:
+    """Place a tool result directly after the assistant turn that called it.
+
+    Appending at the tail instead would leave the pair out of order whenever a
+    recovery or user message already follows the call, and a provider rejects
+    that outright.
+    """
+    for index, message in enumerate(history):
+        if message.role is not MessageRole.assistant:
+            continue
+        if not any(
+            isinstance(block, ToolUseBlock) and block.tool_call_id == tool_call_id
+            for block in message.content_blocks
+        ):
+            continue
+        history.insert(
+            index + 1,
+            Message(
+                role=MessageRole.tool,
+                content_blocks=[
+                    ToolResultBlock(
+                        tool_call_id=tool_call_id,
+                        content=content,
+                        is_error=is_error,
+                    )
+                ],
+            ),
+        )
+        return True
+    return False
+
+
 async def _dispatch_tool(
     engine: QueryEngine,
     tool_call: ToolCall,
@@ -9401,8 +9656,8 @@ async def _dispatch_tool(
  (dispatcher) hook_fired(pre) →
  (tool_call_pending | hook_fired(post) + tool_result)
 
- ``sandbox_starting`` is emitted by the **sandbox adapter** (not core)
- on cold start only.
+ ``tool_transport_starting`` is emitted by the **host's transport**
+ (never by core) on cold start only.
  """
     _pin_keep_flag(engine, tool_call)
     # Terminal-only finalisation guard. Once the terminal-answer nudge has
@@ -9419,6 +9674,7 @@ async def _dispatch_tool(
             payload={
                 "tool_call_id": tool_call.id,
                 "success": False,
+                "is_error": True,
                 "error": {
                     "kind": "terminal_only",
                     "message": error_message,
@@ -9469,13 +9725,7 @@ async def _dispatch_tool(
             Message(
                 role=MessageRole.tool,
                 content_blocks=[
-                    ToolResultBlock(
-                        tool_call_id=tool_call.id,
-                        content=_tool_result_content_with_finalization_hint(
-                            refusal_outcome
-                        ),
-                        is_error=True,
-                    )
+                    _result_block_from_outcome(tool_call.id, refusal_outcome)
                 ],
             )
         )
@@ -9510,7 +9760,7 @@ async def _dispatch_tool(
     # healthy prose-then-terminal shape and once the relevant bound is spent, so
     # an uncorrected terminal eventually finalises rather than looping.
     if _finalize_prose_gate_applies(engine, tool_call):
-        repair_text = engine.config.rc.finalize_prose_gate_repair_text
+        repair_text = engine.prompt_text("finalize_prose_gate_repair")
         # An empty repair text would inject an empty user turn — degrade to a
         # no-op (let the terminal dispatch through) instead. Nothing is latched
         # or charged in that case, mirroring "the gate did not fire".
@@ -9540,6 +9790,7 @@ async def _dispatch_tool(
                 payload={
                     "tool_call_id": tool_call.id,
                     "success": False,
+                    "is_error": True,
                     "error": {
                         "kind": "finalize_prose_gate",
                         "message": veto_error,
@@ -9668,6 +9919,7 @@ async def _dispatch_tool(
                 payload={
                     "tool_call_id": tool_call.id,
                     "success": False,
+                    "is_error": True,
                     "error": {
                         "kind": "terminal_candidate_repair_reveto",
                         "message": veto_error,
@@ -9739,15 +9991,13 @@ async def _dispatch_tool(
         # when ``_pre_dispatch_terminal_verify_applies`` already returned
         # True. ``verdict`` = ``veto`` when a corrective was produced
         # (terminal submission withheld below) else ``no_veto``. ``cited``
-        # is exact; ``observed`` is best-effort off the opaque helper bag
-        # (``-1`` when not cheaply visible from core).
+        # is exact.
         _logger.warning(
             "DIAG query.pre_dispatch_terminal_verify.applied run=%s "
-            "verdict=%s cited=%d observed=%d",
+            "verdict=%s cited=%d",
             engine.config.run_id,
             "veto" if corrective else "no_veto",
             _count_terminal_answer_cited_refs(tool_call),
-            _observed_ref_ledger_size(engine),
         )
         if corrective:
             engine._pre_dispatch_terminal_verify_used = True
@@ -9766,6 +10016,7 @@ async def _dispatch_tool(
                 payload={
                     "tool_call_id": tool_call.id,
                     "success": False,
+                    "is_error": True,
                     "error": {
                         "kind": "pre_dispatch_terminal_verify",
                         "message": veto_error,
@@ -9813,37 +10064,18 @@ async def _dispatch_tool(
             return
 
     dispatcher = _ensure_tool_dispatcher(engine)
-    # Thread the engine's helper bag into ToolContext.metadata under the
-    # canonical ``protocore.helpers`` namespace. Without this, every tool
-    # that reads adapters from the bag (workspace, todo_storage, registry,
-    # sandbox etc.) hits ``ToolInvocationError: X not wired into ToolContext``.
-    # The bag is attached to the engine by the executor pod via
-    # ``setattr(engine, "_helpers", helpers)`` in service_runtime.build_helper_bag.
-    # Core never constructs or mutates the bag — it just forwards the
-    # opaque mapping.
-    helpers = getattr(engine, "_helpers", None)
+    # Seed the run's satisfied set from the durable ``engine.history`` when the
+    # state is fresh (cross-process re-drive). The dispatcher's
+    # :meth:`_check_tool_preconditions` reads that set, so this MUST run first.
+    _rehydrate_satisfied_from_history(engine)
     metadata: dict[str, Any] = {}
-    if helpers:
-        # seed the per-run satisfied set from the durable
-        # ``engine.history`` when the helper bag is fresh (cross-pod
-        # re-drive). The dispatcher's
-        # :meth:`_check_tool_preconditions` reads it from
-        # ``ctx.metadata["protocore.helpers"]["tool_preconditions.satisfied"]``
-        # so this MUST run before the dispatcher reads it.
-        _rehydrate_satisfied_from_history(helpers, engine)
-        metadata[_HELPERS_METADATA_KEY] = helpers
-        # Merge the per-run metadata
-        # envelope (admitted by ``POST /v1/runs.metadata`` and persisted
-        # onto the Redis run-state Hash) onto ``ToolContext.metadata`` so
-        # tools (e.g. PCM remote backend) can read trial-scoped values
-        # like ``pac_harness_url`` and ``pac_trial_id``. : the merge
-        # skips RUNTIME-INTERNAL keys (the helper-bag namespace, the
-        # authoritative ``tool_call_id``, and any ``protocore.*`` control
-        # key) so a forged operator envelope cannot shadow trusted runtime
-        # state. The authoritative ``tool_call_id`` is then set by the
-        # dispatcher (``tool_dispatch.py`` ``metadata.setdefault``) from the
-        # real ``tool_call.id``.
-        _merge_run_metadata_into(metadata, helpers)
+    # Merge the run's operator-supplied envelope onto ``ToolContext.metadata``
+    # so tools can read the values it carries. The merge skips RUNTIME-INTERNAL
+    # names (the authoritative ``tool_call_id`` and any ``protocore.*`` control
+    # key) so a forged envelope cannot shadow trusted runtime state. The
+    # authoritative ``tool_call_id`` is then set by the dispatcher from the real
+    # ``tool_call.id``.
+    _merge_run_metadata_into(metadata, engine.run_state)
     # Flag the SYNTHETIC dispatch so a backend MAY default a required terminal
     # field (e.g. ``outcome``) ONLY for the runtime-synthesised last-resort
     # guaranteed-terminal answer, never for a model-emitted one.
@@ -9853,22 +10085,23 @@ async def _dispatch_tool(
     # unforgeable runtime state a backend may branch on. Set by core LAST
     # (after the run_metadata merge) so a forged ``run_metadata`` value cannot
     # shadow it; ALSO stripped from incoming run_metadata in
-    # ``service_runtime._sanitize_run_metadata``.
+    # the host's own run-metadata sanitiser.
     # ``False`` for every normal tool call ⟹ no key set ⟹ bit-identical.
     if synthetic_recovery:
         metadata[SYNTHETIC_RECOVERY_METADATA_KEY] = synthetic_recovery_kind
     ctx = ToolContext(
         tenant_id=engine.config.tenant_id,
-        account_id=engine.config.account_id,
         run_id=engine.config.run_id,
         session_id=engine.config.session_id,
-        evidence_origin=engine._engine_evidence_origin(),
+        work_scope=engine.config.work_session_id,
+        evidence=ToolEvidenceContext(origin=engine._engine_evidence_origin()),
+        run_state=engine.run_state,
         metadata=metadata,
     )
 
     # Buffer events so we can suppress
     # the dispatcher's ``TOOL_CALL_PENDING`` envelope when the web-mode
-    # approval kill-switch (``RuntimeConstants.approval_gate_web_enabled``)
+    # approval kill-switch (``LoopConstants.approval_gate_web_enabled``)
     # is off. The dispatcher yields events BEFORE the final
     # :class:`DispatchOutcome`, so we cannot inspect the verdict without
     # holding them back. The buffer is bounded by the dispatcher contract
@@ -9885,9 +10118,18 @@ async def _dispatch_tool(
     # one site. (The >=2 parallel branch releases around its own gather and does
     # NOT pass through here.) Gate: a delegation tool AND this run actually
     # holding a slot; otherwise ``None`` ⇒ no-op for reads / non-permit runs.
+    # A BACKGROUND delegation is deliberately excluded. The gate is "a
+    # delegation call this run BLOCKS on", and a background spawn returns as
+    # soon as its children are launched: there is no join to release around,
+    # the parent goes on doing local work, and a permit holder doing local work
+    # is exactly what the budget's invariant wants held. Releasing there would
+    # hand away a slot the parent is still using and reacquire it a moment
+    # later, and the parent would be pinning tree capacity on behalf of a child
+    # it is not waiting for.
     dispatch_tree_permit = (
         _resolve_subagent_tree_permit(engine)
         if _tool_is_delegation(engine, tool_call)
+        and not _delegation_is_background(engine, tool_call)
         else None
     )
     outcome: DispatchOutcome | None = None
@@ -9904,66 +10146,136 @@ async def _dispatch_tool(
     # local-work post-processing (soft caps, history append) runs.
     if dispatch_tree_permit is not None:
         await dispatch_tree_permit.release_while_waiting()
-    intent = None
-    if engine.config.rc.intent_settlement_enabled:
-        from protocore.runtime.intent import (
-            commit_intent,
-            settle_intent,
-            should_skip_never_replay,
-        )
-
-        existing = next(
-            (item for item in engine.open_intents if item.tool_call_id == tool_call.id),
-            None,
-        )
-        if should_skip_never_replay(existing):
+    # The durable record of this call. Written before anything is dispatched
+    # and kept whatever happens next, because after a crash the difference
+    # between "parked at a gate", "in flight", "asking the user" and "done" is
+    # not recoverable from history alone — history shows only a ``tool_use``
+    # with nothing after it, and all four look identical from there.
+    intent = find_intent(engine.open_intents, tool_call.id)
+    if intent is not None:
+        # A record that is already settled means this exact call has an answer.
+        # Re-issuing the tool would apply its effect a second time for an
+        # answer that is already known, so the recorded one is returned.
+        if intent.state == SETTLED:
             yield TurnEvent(
                 type=EventType.TOOL_RESULT,
                 run_id=engine.config.run_id,
                 payload={
                     "tool_call_id": tool_call.id,
-                    "content": "interrupted",
-                    "is_error": True,
+                    "content": (
+                        intent.result
+                        if intent.result is not None
+                        else unknown_outcome_text(intent, engine.config.rc)
+                    ),
+                    "is_error": False,
                 },
             )
             return
-        intent = existing or commit_intent(
+        # Everything that resumes a parked call arrives here carrying its own
+        # copy of what is being resumed. When that copy and the record disagree
+        # about which call it is, neither is preferred: one of them describes a
+        # call nobody approved, and picking wrong runs it.
+        assert_pause_matches(
+            intent,
+            tool_call_id=tool_call.id,
+            tool_name=tool_call.name,
+            arguments=tool_call.arguments,
+        )
+    else:
+        intent = commit_intent(
             tool_name=tool_call.name,
             tool_call_id=tool_call.id,
             rc=engine.config.rc,
+            arguments=tool_call.arguments,
+            roles=engine.config.tool_roles,
         )
-        if intent is not None and intent not in engine.open_intents:
-            engine.open_intents.append(intent)
+        engine.open_intents.append(intent)
+        if engine.config.rc.intent_settlement_enabled:
             yield TurnEvent(
                 type=EventType.INTENT_COMMITTED,
                 run_id=engine.config.run_id,
                 payload=intent.to_dict(),
             )
-        if engine.config.rc.typed_hooks_enabled and engine.typed_hook_registry is not None:
-            from protocore.runtime.correctness_bind import fire_typed_hook
+    # Whether a call may run is decided at this coordinate and nowhere else.
+    # It used to sit inside the intent-ledger branch, which meant a host that
+    # registered a deny got it only when an unrelated ledger switch happened to
+    # be on — a permission that depends on a bookkeeping toggle is not one.
+    from protocore.runtime.correctness_bind import fire_lifecycle
 
-            hook_out, hook_evt = fire_typed_hook(
-                engine,
-                "before_tool",
-                {"tool_name": tool_call.name, "arguments": tool_call.arguments},
+    pre_tool, pre_tool_evt = await fire_lifecycle(
+        engine,
+        HookEvent.pre_tool_use,
+        {"tool_name": tool_call.name, "arguments": tool_call.arguments},
+    )
+    if pre_tool_evt is not None:
+        yield pre_tool_evt
+    if pre_tool.verdict in (LifecycleVerdict.deny, LifecycleVerdict.fail_run):
+        return
+    if pre_tool.verdict is LifecycleVerdict.require_approval:
+        engine.mark_pending_approval(
+            tool_call.id,
+            tool_name=tool_call.name,
+            payload={"approval_token": pre_tool.approval_token},
+        )
+        await engine._persist_snapshot()
+        yield TurnEvent(
+            type=EventType.TOOL_CALL_PENDING,
+            run_id=engine.config.run_id,
+            payload={
+                "tool_call_id": tool_call.id,
+                "requires_approval": True,
+                "approval_token": pre_tool.approval_token,
+            },
+        )
+        return
+    # Serial twin of the charge on the deferred path, and it stands HERE rather
+    # than at the top of the dispatch: every seam above can still stop the call
+    # — a hook that denies it, a hook that parks it for approval — and a call
+    # that never reaches the dispatcher starts no child run to pay for. The
+    # parked call comes back through this same function when its approval lands
+    # and is charged then, once, because the ledger keys the charge on the call
+    # id and the first pass never reached this line.
+    #
+    # Unlike the deferred path, the gate and this charge are NOT one act here:
+    # the seams between them suspend — the tree permit is released across the
+    # join and the typed ``before_tool`` hook runs host code — so the budget
+    # this call was gated against can be spent by a sibling before the charge
+    # lands. That is why the short-grant refusal below is a live branch rather
+    # than the impossible one the deferred path used to carry, and why the
+    # refusal text comes from the shared builder: at this point the reason may
+    # be a SHORT budget, whose advice is "ask for fewer", not "stop".
+    serial_grant = _charge_child_run_start(engine, tool_call)
+    if serial_grant is not None and not serial_grant.fully_granted:
+        _logger.warning(
+            "DIAG query.run_work_budget.delegation_refused run=%s tenant=%s "
+            "tool=%s reason=%s %s",
+            engine.config.run_id,
+            engine.config.tenant_id,
+            tool_call.name,
+            serial_grant.reason,
+            _resolve_run_work_ledger(engine).spent_summary(),
+        )
+        refusal_events, refusal_outcome = _run_work_refusal_dispatch(
+            engine,
+            tool_call,
+            _run_work_refusal_text(engine, tool_call, serial_grant.reason),
+            serial_grant.reason,
+        )
+        for evt in refusal_events:
+            yield evt
+        engine.history.append(
+            Message(
+                role=MessageRole.tool,
+                content_blocks=[
+                    _result_block_from_outcome(tool_call.id, refusal_outcome)
+                ],
             )
-            if hook_evt is not None:
-                yield hook_evt
-            if hook_out.decision == "deny":
-                return
-            if hook_out.decision == "require_approval":
-                engine.mark_pending_approval(tool_call.id)
-                await engine._persist_snapshot()
-                yield TurnEvent(
-                    type=EventType.TOOL_CALL_PENDING,
-                    run_id=engine.config.run_id,
-                    payload={
-                        "tool_call_id": tool_call.id,
-                        "requires_approval": True,
-                        "approval_token": hook_out.approval_token,
-                    },
-                )
-                return
+        )
+        engine.forget_tool_name(tool_call.id)
+        if dispatch_tree_permit is not None:
+            await dispatch_tree_permit.reacquire()
+        await engine._persist_snapshot()
+        return
     async for item in dispatcher.dispatch(
         tool_call=tool_call,
         ctx=ctx,
@@ -9975,30 +10287,65 @@ async def _dispatch_tool(
         # declared one. Empty declaration ⇒ ``None`` ⇒ the gate's allow-list
         # stage stays off, exactly as before it was wired.
         subagent_whitelist=engine.effective_subagent_tool_allowlist,
+        child_run=engine.config.parent_run_id is not None,
         timeout_seconds=engine.config.rc.tool_timeout_seconds,
         preapproved_tool_call_id=tool_call.id if preapproved else None,
         admit_evidence=lambda records, producer: engine.append_tool_evidence(
             records, producer=producer
         ),
+        # Make the record durable at the last moment before the tool is
+        # touched — past every gate that could still stop the call, and before
+        # anything the tool does can be lost with the process.
+        on_dispatch_start=_durable_dispatch_start(engine, intent),
+        lifecycle=_lifecycle_registry(engine),
     ):
         if isinstance(item, DispatchOutcome):
             outcome = item
             break
         buffered.append(item)
-    if intent is not None and outcome is not None and not outcome.approval_required:
-        from protocore.runtime.intent import settle_intent
-
+    if outcome is not None and outcome.approval_required:
+        # The gate parked the call before the tool was reached. The record must
+        # say so, or a resumed run reads "dispatched" and tells the model the
+        # outcome of a call that never happened is unknown.
+        _assert_pause_envelope_matches_intent(intent, buffered)
+        mark_pending_approval(intent)
+    elif outcome is not None and outcome.ask_user_required:
+        # The tool ran, asked the user something, and is waiting for the
+        # answer. That answer is the result, and the layer that collects it
+        # builds the result block when it arrives — so this path appends
+        # nothing to history and settles nothing. A resumed run reads the
+        # record and knows to wait rather than to declare the outcome unknown.
+        _assert_pause_envelope_matches_intent(intent, buffered)
+        mark_paused_ask_user(intent, pause_payload=outcome.ask_user_payload)
+        # The wait is recorded as what it is. Parking it as an approval — which
+        # is what a single latch could only ever do — sends the answer to a
+        # question to the door that runs unapproved tools, and sends an
+        # operator's decision to the door that writes replies into the
+        # transcript.
+        engine.mark_awaiting_answer(
+            tool_call.id,
+            tool_name=tool_call.name,
+            payload=dict(outcome.ask_user_payload or {}),
+        )
+        if dispatch_tree_permit is not None:
+            await dispatch_tree_permit.reacquire()
+        for evt in buffered:
+            yield evt
+        engine.forget_tool_name(tool_call.id)
+        await engine._persist_snapshot()
+        return
+    elif outcome is not None:
         settle_intent(intent, result=str(outcome.content or "")[:200])
         from protocore.runtime.correctness_bind import (
             commit_usage,
-            fire_typed_hook,
+            fire_lifecycle,
             persist_correctness,
         )
 
         persist_correctness(engine)
-        _after_tool, after_tool_evt = fire_typed_hook(
+        _after_tool, after_tool_evt = await fire_lifecycle(
             engine,
-            "after_tool",
+            HookEvent.post_tool_use,
             {"tool_name": tool_call.name, "ok": not bool(getattr(outcome, "is_error", False))},
         )
         if after_tool_evt is not None:
@@ -10068,11 +10415,14 @@ async def _dispatch_tool(
             # …and the same declared-tool allow-list, so an approval downgrade
             # cannot be a way past the declaration.
             subagent_whitelist=engine.effective_subagent_tool_allowlist,
+            child_run=engine.config.parent_run_id is not None,
             timeout_seconds=engine.config.rc.tool_timeout_seconds,
             preapproved_tool_call_id=tool_call.id,
             admit_evidence=lambda records, producer: engine.append_tool_evidence(
                 records, producer=producer
             ),
+            on_dispatch_start=_durable_dispatch_start(engine, intent),
+            lifecycle=_lifecycle_registry(engine),
         ):
             if isinstance(item, DispatchOutcome):
                 outcome = item
@@ -10224,12 +10574,7 @@ async def _dispatch_tool(
         Message(
             role=MessageRole.tool,
             content_blocks=[
-                ToolResultBlock(
-                    tool_call_id=tool_call.id,
-                    content=_tool_result_content_with_finalization_hint(outcome),
-                    is_error=outcome.is_error,
-                    metadata=outcome.metadata or {},
-                )
+                _result_block_from_outcome(tool_call.id, outcome)
             ],
         )
     )
@@ -10255,8 +10600,158 @@ async def _dispatch_tool(
                 },
             )
         )
+    # The result is in history now, and history is where a settled call is
+    # durably recorded. The record has done its work; keeping one per call for
+    # the life of the run would grow every snapshot without answering a
+    # question history cannot already answer.
+    settle_intent(intent, result=str(outcome.content or "")[:200])
+    _forget_intent(engine, intent)
     engine.forget_tool_name(tool_call.id)
     await engine._persist_snapshot()
+
+
+async def resume_interrupts(
+    engine: QueryEngine,
+    resolutions: Mapping[str, InterruptResolution],
+    *,
+    allow_partial: bool = False,
+) -> AsyncIterator[TurnEvent]:
+    """Answer everything this run is waiting on, in one drive.
+
+    The general form of picking a paused run back up, and the only one that can
+    express a batch. Three dangerous calls in one assistant message park three
+    interrupts and stop the run once; this answers all three — approve the
+    first with corrected arguments, deny the second, abandon the third — and
+    the results land in history in the order the model asked for them.
+
+    The map is checked in full BEFORE anything is executed. A map that names an
+    interrupt this run is not waiting on, or answers an approval with an
+    answer, or leaves an open interrupt undecided, is refused with nothing
+    done: a resume that ran the first two resolutions and then discovered the
+    third was nonsense would have already dispatched tools on the strength of a
+    decision set that turned out to be incoherent.
+
+    ``allow_partial`` is how a caller says it means to leave the rest parked —
+    an operator who decided two of three and will come back to the last one. It
+    relaxes what the map must cover and nothing else: whether the run is still
+    waiting at the end is read off what is still parked, so a partial resume
+    that happens to answer everything finishes normally, and a full one whose
+    approved call parks a fresh interrupt goes back to waiting.
+
+    A cancelled run answers nothing and runs nothing. This entry does not go
+    through the turn loop, so it does not pass the stop checkpoint that opens
+    one; without its own check, a run an operator cancelled while it waited
+    would run the very tool it was waiting on the moment the approval landed.
+    """
+    plan = plan_resolution(
+        engine.pending_interrupts,
+        resolutions,
+        allow_partial=allow_partial,
+        now_ms=int(time.time() * 1000),
+    )
+    async with engine.driving_turn():
+        if engine.stop_requested:
+            for interrupt, _ in plan:
+                engine.release_interrupt(interrupt.interrupt_id)
+            if engine.state is LoopState.AWAITING:
+                engine.transition_to(LoopState.RUNNING)
+            async for evt in _emit_dispatch_cancel_teardown(engine):
+                yield evt
+            return
+
+        # The run is being driven again, so it is RUNNING for the length of the
+        # drive — whether or not anything will still be parked at the end of
+        # it. Deciding the state from the flag instead left a caller that
+        # answered every interrupt under ``allow_partial`` driving out of
+        # AWAITING, and the closing transition to COMPLETED is not one AWAITING
+        # has; the run then died mid-way with its decisions already written and
+        # its snapshot already persisted, recording the very shape — AWAITING
+        # with nothing open — the witness rule exists to forbid.
+        if engine.state is LoopState.AWAITING:
+            engine.transition_to(LoopState.RUNNING)
+            await engine._persist_snapshot()
+
+        for interrupt, resolution in plan:
+            # Released before the decision is acted on, not after. Executing an
+            # approved call re-enters the dispatch path, and a dispatch that
+            # still saw this call parked would read the run as waiting for the
+            # very thing it is in the middle of doing.
+            engine.release_interrupt(interrupt.interrupt_id)
+
+            if resolution.decision is InterruptDecision.abandon:
+                _abandon_pending_approval(engine, interrupt.tool_call_id)
+                continue
+
+            if resolution.decision is InterruptDecision.deny:
+                _settle_parked_call(
+                    engine,
+                    tool_call_id=interrupt.tool_call_id,
+                    content=engine.config.rc.tool_result_approval_denied_placeholder,
+                    is_error=False,
+                )
+                continue
+
+            if resolution.decision is InterruptDecision.answer:
+                # The answer IS the result of the call that asked for it. It is
+                # written where the tool's own result would have gone, so the
+                # model reads a question it asked and the reply it got, rather
+                # than an unexplained user turn arriving beside an unpaired
+                # call.
+                _settle_parked_call(
+                    engine,
+                    tool_call_id=interrupt.tool_call_id,
+                    content=resolution.answer or "",
+                    is_error=False,
+                )
+                continue
+
+            if _history_has_tool_result(engine, interrupt.tool_call_id):
+                # Already answered by a previous resume that got this far and
+                # then lost its process. Re-running the tool here would apply
+                # its effect a second time for a result already in history.
+                continue
+            tool_call = _tool_call_from_history(engine, interrupt.tool_call_id)
+            if resolution.updated_input is not None:
+                tool_call = _apply_updated_input(
+                    engine, tool_call, resolution.updated_input
+                )
+            async for evt in _dispatch_tool(engine, tool_call, preapproved=True):
+                yield evt
+
+        if engine.pending_interrupts:
+            # Still waiting, and the state has to keep saying so — a run left
+            # in RUNNING with interrupts open is a run nothing will come back
+            # for. What is still parked decides this, not what the caller
+            # asked for: a partial resume that happened to answer everything is
+            # finished, and a full resume whose approved call parked a fresh
+            # interrupt is not.
+            if engine.state is LoopState.RUNNING:
+                engine.transition_to(LoopState.AWAITING)
+            await engine._persist_snapshot()
+            yield TurnEvent(
+                type=EventType.MESSAGE_STOP,
+                run_id=engine.config.run_id,
+                payload={
+                    "turn_id": engine.turn_id(),
+                    "stop_reason": "tool_use",
+                    "tokens_used": _tokens_used_payload(engine),
+                    "cache_hit_rate": engine.total_usage.this_turn_cache_hit_rate(),
+                },
+            )
+            return
+        await engine._persist_snapshot()
+        yield TurnEvent(
+            type=EventType.MESSAGE_STOP,
+            run_id=engine.config.run_id,
+            payload={
+                "turn_id": engine.turn_id(),
+                "stop_reason": "tool_use",
+                "tokens_used": _tokens_used_payload(engine),
+                "cache_hit_rate": engine.total_usage.this_turn_cache_hit_rate(),
+            },
+        )
+        if not engine.is_terminal:
+            engine.transition_to(LoopState.COMPLETED)
 
 
 async def resume_approved_tool(
@@ -10272,36 +10767,81 @@ async def resume_approved_tool(
     that call id, then uses the normal dispatcher execution/post-hook/result
     path so the real ``ToolResultBlock`` lands in history before finalization.
 
+    It resolves exactly the one call it is given, and one of a batch is a
+    legal thing to be given. An assistant message with three gated calls parks
+    three approvals; approving the second of them runs the second and leaves
+    the other two parked, with the run back in ``AWAITING`` because it is
+    still waiting for the decisions nobody has made yet. Answering several at
+    once — approve, deny, correct — is what :func:`resume_interrupts` is for;
+    this entry is the single-decision case of the same thing and agrees with
+    it about what a partially answered run looks like afterwards.
+
     Replays are idempotent: if a matching ``ToolResultBlock`` already exists,
     the tool is not invoked again and no duplicate result is appended.
+
+    A cancelled run does not execute its pending call. This entry does not go
+    through the turn loop, so it does not pass the stop checkpoint that opens
+    one; without its own check, a run an operator cancelled while it waited for
+    an approval would run the very tool it was waiting on the moment the
+    approval landed — a command, a write, a whole delegated subtree — after the
+    cancel had been recorded and restored.
     """
-    if _history_has_tool_result(engine, tool_call.id):
+    async with engine.driving_turn():
+        if _history_has_tool_result(engine, tool_call.id):
+            engine.clear_pending_approval(tool_call.id)
+            return
+
+        if engine.stop_requested:
+            engine.clear_pending_approval(tool_call.id)
+            if engine.state is LoopState.AWAITING:
+                engine.transition_to(LoopState.RUNNING)
+            async for evt in _emit_dispatch_cancel_teardown(engine):
+                yield evt
+            return
+
+        _assert_history_has_matching_pending_tool_use(engine, tool_call)
+
+        if engine.state is LoopState.AWAITING:
+            engine.transition_to(LoopState.RUNNING)
+            await engine._persist_snapshot()
+
+        async for evt in _dispatch_tool(engine, tool_call, preapproved=True):
+            yield evt
+
         engine.clear_pending_approval(tool_call.id)
-        return
-
-    _assert_history_has_matching_pending_tool_use(engine, tool_call)
-
-    if engine.state is LoopState.AWAITING:
-        engine.transition_to(LoopState.RUNNING)
-        await engine._persist_snapshot()
-
-    async for evt in _dispatch_tool(engine, tool_call, preapproved=True):
-        yield evt
-
-    engine.clear_pending_approval(tool_call.id)
-    yield TurnEvent(
-        type=EventType.MESSAGE_STOP,
-        run_id=engine.config.run_id,
-        payload={
-            "turn_id": engine.turn_id(),
-            "stop_reason": "tool_use",
-            "tokens_used": _tokens_used_payload(engine),
-            "cache_hit_rate": engine.total_usage.this_turn_cache_hit_rate(),
-        },
-    )
-    if not engine.is_terminal:
-        engine.transition_to(LoopState.COMPLETED)
-        await engine._persist_snapshot()
+        if engine.pending_interrupts:
+            # This approval was one of a batch, and the rest are still waiting
+            # for a person. The run goes back to AWAITING rather than on to
+            # COMPLETED: a run left RUNNING with interrupts open is a run
+            # nothing will come back for, and completing it would abandon the
+            # calls still parked behind it without saying so. Read off what is
+            # still parked, exactly as the resolution-map drive reads it.
+            if engine.state is LoopState.RUNNING:
+                engine.transition_to(LoopState.AWAITING)
+            await engine._persist_snapshot()
+            yield TurnEvent(
+                type=EventType.MESSAGE_STOP,
+                run_id=engine.config.run_id,
+                payload={
+                    "turn_id": engine.turn_id(),
+                    "stop_reason": "tool_use",
+                    "tokens_used": _tokens_used_payload(engine),
+                    "cache_hit_rate": engine.total_usage.this_turn_cache_hit_rate(),
+                },
+            )
+            return
+        yield TurnEvent(
+            type=EventType.MESSAGE_STOP,
+            run_id=engine.config.run_id,
+            payload={
+                "turn_id": engine.turn_id(),
+                "stop_reason": "tool_use",
+                "tokens_used": _tokens_used_payload(engine),
+                "cache_hit_rate": engine.total_usage.this_turn_cache_hit_rate(),
+            },
+        )
+        if not engine.is_terminal:
+            engine.transition_to(LoopState.COMPLETED)
 
 
 def _history_has_tool_result(engine: QueryEngine, tool_call_id: str) -> bool:
@@ -10312,16 +10852,56 @@ def _history_has_tool_result(engine: QueryEngine, tool_call_id: str) -> bool:
     return False
 
 
+def _parsed_arguments(arguments_json: str) -> object:
+    """The values a stored ``tool_use`` block stands for, not its bytes.
+
+    History keeps the arguments as the text the model emitted; a host that
+    carries an approval back through its own transport re-serialises them, and
+    a transport that sorts keys (or drops insignificant whitespace) hands back
+    the same call spelled differently. Comparing the spellings refuses a call
+    nobody changed, so the comparison is made on parsed values. Text that is
+    not JSON at all has no values to compare and stands for itself.
+    """
+    try:
+        return json.loads(arguments_json or "{}")
+    except (TypeError, ValueError):
+        return arguments_json
+
+
 def _assert_history_has_matching_pending_tool_use(
     engine: QueryEngine,
     tool_call: ToolCall,
 ) -> None:
-    pending_tool_call_id = engine.pending_approval_tool_call_id()
-    if pending_tool_call_id != tool_call.id:
+    """Refuse a call this run is not holding an approval for.
+
+    The membership test is against the whole parked set, not against "the"
+    pending approval. One assistant message can park three gated calls at
+    once, and a host that approves the second of them is answering a decision
+    this run really is waiting on; reading the batch through a view that
+    reports a single id says ``None`` whenever more than one is parked, and
+    the honest approval was then refused as a mismatch. What stays refused is
+    a call that is not parked at all, or one parked as a different kind of
+    wait — approving a question runs a tool whose answer, not whose approval,
+    was being waited for.
+
+    The arguments are compared as canonical values — the same digest the
+    durable intent record carries — and never as serialized text. A host that
+    round-trips the approved call through its own transport is free to
+    re-serialise it (sorted keys, different spacing); that is a spelling of
+    the same call, and refusing it strands a run whose approval was honest.
+    An argument that really differs still changes the digest and is still
+    refused.
+    """
+    parked = find_interrupt_for_call(engine.pending_interrupts, tool_call.id)
+    if parked is None or parked.kind is not InterruptKind.approval:
+        expected = [
+            item.tool_call_id
+            for item in interrupts_of_kind(engine.pending_interrupts, InterruptKind.approval)
+        ]
         raise ValueError(
-            f"approved tool call is not the pending approval: expected {pending_tool_call_id!r}, got {tool_call.id!r}"
+            f"approved tool call is not a parked approval: expected one of {expected!r}, got {tool_call.id!r}"
         )
-    expected_arguments_json = json.dumps(tool_call.arguments, ensure_ascii=False)
+    expected_fingerprint = _intent_fingerprint(tool_call.name, tool_call.arguments)
     for message in engine.history:
         for block in message.content_blocks:
             if not isinstance(block, ToolUseBlock):
@@ -10330,7 +10910,9 @@ def _assert_history_has_matching_pending_tool_use(
                 continue
             if block.name != tool_call.name:
                 raise ValueError(f"approved tool call does not match pending tool name: {tool_call.id}")
-            if block.arguments_json != expected_arguments_json:
+            if _intent_fingerprint(block.name, _parsed_arguments(block.arguments_json)) != (
+                expected_fingerprint
+            ):
                 raise ValueError(f"approved tool call does not match pending tool input: {tool_call.id}")
             return
     raise ValueError(f"approved tool call is not pending in history: {tool_call.id}")
@@ -10662,6 +11244,7 @@ async def _ensure_run_skill_catalog(engine: QueryEngine) -> str:
     store = engine.skills
     if store is None:
         engine._skill_catalog_block = ""
+        _report_skill_catalog_drift(engine, "")
         return ""
 
     rc = engine.config.rc
@@ -10707,7 +11290,35 @@ async def _ensure_run_skill_catalog(engine: QueryEngine) -> str:
         block = ""
 
     engine._skill_catalog_block = block
+    _report_skill_catalog_drift(engine, block)
     return block
+
+
+def _report_skill_catalog_drift(engine: QueryEngine, block: str) -> None:
+    """Say so when a resumed run rebuilds a different catalog block.
+
+    The block is the head of the cached prompt prefix, and it is rebuilt from
+    the store on whichever process picks the run up. If the enabled-skill set
+    moved between the two, the new block differs, the cached prefix is invalid
+    for the rest of the run, and nothing about that is visible: the run simply
+    costs more from here on. The digest the previous process recorded is the
+    only thing that can tell, so it is compared once, here, and the answer is
+    logged either way it goes wrong.
+    """
+    expected = engine._resumed_skill_catalog_sha256
+    engine._resumed_skill_catalog_sha256 = None
+    if expected is None:
+        return
+    rebuilt = hashlib.sha256(block.encode("utf-8")).hexdigest()
+    if rebuilt == expected:
+        return
+    _logger.warning(
+        "DIAG skill_catalog.rebuilt_differently run_id=%s expected=%s rebuilt=%s; "
+        "the cached prompt prefix is invalid for the rest of this run",
+        engine.config.run_id,
+        expected,
+        rebuilt,
+    )
 
 
 async def _merge_pinned_skills(
@@ -10820,9 +11431,10 @@ async def _resolve_skill_bundle(
     UUID) then falls back to ``list_subset`` + UUID-based ``load``. Failures
     are logged and yield ``None`` (the loop drops the trigger silently).
 
-    The skill bank is account-wide (keyed on ``skills.account_id``), so every
-    lookup keys on ``config.account_id`` — NOT ``tenant_id`` (the scope id,
-    which differs from the account on non-default deployments). This is the
+    The skill bank is account-wide, so every lookup keys on
+    ``config.account_id`` — NOT ``tenant_id``, which is the run's scope and is
+    a different key wherever a host keeps more than one scope per account. This
+    is the
     skill-chaining path (e.g. web → frontend-design), so a
     scope-keyed lookup here would silently drop every chained skill body.
     """
@@ -10885,30 +11497,32 @@ def _ensure_tool_dispatcher(engine: QueryEngine) -> ToolDispatcher:
  We construct a default one bound to the engine's registry +
  hook manager using the default :class:`ToolPermissionGate` chain.
 
- / / A2: when the host helper bag carries a
- ``tool_error_counter`` (``protocore.contracts.run.IRunToolErrorCounter``
- implementation), pass it through so every dispatch error path
- increments ``runs.tool_errors_count`` for the active run. The bag is
- attached to the engine by the executor pod via
- ``setattr(engine, "_helpers", helpers)``; tests that skip the helper
- bag get a counter-less dispatcher (no telemetry, behaviour
- unchanged).
+ When the run carries a ``tool_error_counter``
+ (a :class:`~protocore.contracts.run.IRunToolErrorCounter`), pass it through
+ so every dispatch error path increments the active run's error count. A run
+ wired without one gets a counter-less dispatcher: no telemetry, behaviour
+ unchanged.
  """
     existing = getattr(engine, "_tool_dispatcher", None)
     if isinstance(existing, ToolDispatcher):
         return existing
-    helpers = getattr(engine, "_helpers", None)
-    tool_error_counter = None
-    if isinstance(helpers, Mapping):
-        tool_error_counter = helpers.get("tool_error_counter")
     dispatcher = ToolDispatcher(
         registry=engine.tools,
-        permission_gate=ToolPermissionGate(),
+        permission_gate=ToolPermissionGate(roles=engine.config.tool_roles),
         hook_manager=engine.hooks,
-        tool_error_counter=tool_error_counter,
+        tool_error_counter=engine.run_state.tool_error_counter,
+        roles=engine.config.tool_roles,
+        resilience_classifier=engine.config.resilience_classifier,
     )
     engine._tool_dispatcher = dispatcher  # type: ignore[attr-defined]
     return dispatcher
+
+
+def _lifecycle_registry(engine: QueryEngine) -> ILifecycleRegistry | None:
+    """The registry the tool dispatcher wraps its invocation in, if any."""
+    from protocore.runtime.correctness_bind import lifecycle_registry
+
+    return lifecycle_registry(engine)
 
 
 async def _safe_hook_invoke(
@@ -10984,22 +11598,19 @@ async def _as_provider_deltas(
 
 
 def _resolve_safety_band_value(engine: QueryEngine) -> int:
-    """Read the current AdaptiveSafetyBand value from the helper bag.
+    """Read the current AdaptiveSafetyBand value off the run's state.
 
     Returns 0 when:
-      - ``RuntimeConstants.adaptive_safety_band_enabled`` is False (kill-switch).
-      - No band is wired in the helper bag (test fixture / leader engine
-        without the host wiring).
+      - ``LoopConstants.adaptive_safety_band_enabled`` is False (kill-switch).
+      - The run carries no band (test fixture / leader engine without the
+        host wiring).
       - The band lookup raises (defensive — telemetry plane must never
         block the LLM call).
     """
     rc = engine.config.rc
-    if not getattr(rc, "adaptive_safety_band_enabled", False):
+    if not rc.adaptive_safety_band_enabled:
         return 0
-    helpers: Mapping[str, Any] | None = getattr(engine, "_helpers", None)
-    if not isinstance(helpers, Mapping):
-        return 0
-    band = helpers.get("adaptive_safety_band")
+    band = engine.run_state.adaptive_safety_band
     if band is None:
         return 0
     try:
@@ -11013,4 +11624,161 @@ def _resolve_safety_band_value(engine: QueryEngine) -> int:
     return max(0, current)
 
 
-__all__ = ["query"]
+__all__ = ["resume", "resume_approved_tool", "resume_interrupts"]
+
+
+#: The core's own policy set, in the order :data:`TURN_POLICY_ORDER` fixes.
+#: Built here rather than in the registry module because a policy is handed the
+#: loop primitives it borrows — the dispatcher, the event emitters — and those
+#: live in this module.
+_CORE_TURN_POLICIES: Final[TurnPolicyRegistry] = TurnPolicyRegistry(
+    (
+        LongFileConvergencePolicy(
+            seal=_maybe_seal_longfile_at_voluntary_finish,
+            drive=_maybe_drive_longfile_convergence,
+        ),
+        AnswerFloorPolicy(
+            applies=_plain_stop_answer_floor_applies,
+            pointer=_pointer_answer_evidence,
+            charge_pointer=_charge_pointer_answer_repair,
+            release_pointer=_release_pointer_answer_repair,
+            spend_short_answer_repair=_spend_short_answer_repair,
+            append_repair=_append_answer_floor_repair_turn,
+            log=_log_answer_floor_repair,
+            state_change=_policy_state_change,
+        ),
+        RunCeilingsPolicy(
+            tool_call_budget_reached=_tool_call_budget_reached,
+            deadline_reached=_terminal_deadline_reached,
+            has_terminal_tool_result=_history_has_terminal_tool_result,
+            has_final_answer=run_has_final_answer,
+            enter_wind_down=_enter_soft_stop,
+            wind_down_budget=_soft_stop_turn_budget,
+            llm_terminal=_emit_llm_terminal,
+            precondition_exhausted=_preconditions.is_exhausted,
+            precondition_terminal=_emit_tool_precondition_terminal,
+            wind_down_armed=_soft_stop.is_armed,
+            wind_down_finalize=_soft_stop.finalize,
+            pair_orphans=_policy_pair_orphan_tool_calls,
+            transition_event=_emit_state_change,
+            message_stop=_policy_message_stop,
+            log_output_budget_exhausted=_log_output_token_budget_exhausted,
+        ),
+        EmptyModelTurnPolicy(
+            empty_rounds=RunCounter(
+                read=_empty_rounds_spent,
+                charge=_charge_empty_round,
+                reset=_reset_empty_rounds,
+            ),
+            post_tool_nudges=RunCounter(
+                read=_post_tool_nudges_spent,
+                charge=_charge_post_tool_nudge,
+                reset=_reset_post_tool_nudges,
+            ),
+            append_continue_prompt=_append_thinking_continue_prompt,
+            append_post_tool_nudge=_append_post_tool_empty_nudge,
+            continue_prompt_event=_policy_continue_prompt_event,
+            enter_wind_down=_enter_soft_stop,
+            wind_down_budget=_soft_stop_turn_budget,
+            llm_terminal=_emit_llm_terminal,
+            state_change=_policy_state_change,
+        ),
+        EmptyCompletionGuardPolicy(
+            has_terminal_tool_result=_history_has_terminal_tool_result,
+            has_final_answer=run_has_final_answer,
+            redrives_spent=_empty_completion_redrives_spent,
+            charge_redrive=_charge_empty_completion_redrive,
+            append_redrive_nudge=_append_empty_completion_redrive_nudge,
+            empty_terminal=_emit_empty_completion_terminal,
+            voluntary_completion=_emit_voluntary_completion,
+            state_change=_policy_state_change,
+        ),
+        PerIterationCompactionPolicy(
+            compact=_run_compaction,
+            protect_index=current_tool_batch_protect_index,
+            pair_orphans=_policy_pair_orphan_tool_calls,
+            message_stop=_policy_message_stop,
+        ),
+        TerminalNudgePolicy(
+            required=_terminal_tool_nudge_required,
+            append=_append_terminal_tool_nudge,
+            state_change=_policy_state_change,
+        ),
+        CancellationPolicy(teardown=_emit_dispatch_cancel_teardown),
+        OutputCapRecoveryPolicy(
+            recoveries=RunCounter(
+                read=_output_recoveries_spent,
+                charge=_charge_output_recovery,
+                reset=_reset_output_recoveries,
+            ),
+            salvage=TruncationSalvage(
+                state_path=_truncated_call_state_path,
+                partial_content=_salvage_truncated_content,
+                land_partial=_salvage_truncated_write_to_disk,
+                recovery_text=_build_truncation_chunk_recovery_text,
+                is_content_mutation=_is_content_mutation_truncation,
+                paths=_truncated_call_paths,
+                driver_enabled=_longfile.is_enabled,
+                chunkable_names=_run_chunkable_write_names,
+                note_truncated=_longfile.note_truncated_mutation,
+                register_turn=_longfile.register_completed_turn,
+            ),
+            dispatch=_dispatch_tool,
+            park=_park_pause_interrupt,
+            parked_event=_interrupt_parked_event,
+            result_is_terminal=_history_tool_result_is_terminal,
+            pair_orphans=_policy_pair_orphan_tool_calls,
+            wind_down=_enter_soft_stop,
+            wind_down_budget=_soft_stop_turn_budget,
+            pin_backstop=_pin_terminal_backstop,
+            llm_terminal=_emit_llm_terminal,
+            state_event=_policy_state_payload_event,
+        ),
+        TerminalToolFinishPolicy(pair_orphans=_policy_pair_orphan_tool_calls),
+        StreamLoopGuardPolicy(
+            nudges=RunCounter(
+                read=_loop_guard_nudges_spent,
+                charge=_charge_loop_guard_nudge,
+                reset=_reset_loop_guard_nudges,
+            ),
+            block_identical=_block_identical_tools,
+            guard_event=_policy_loop_guard_event,
+        ),
+        ProviderFailurePolicy(
+            advance_chain=_advance_provider_chain,
+            context_overflow=_handle_context_window_exceeded,
+            has_preserved_answer=_preserve_completed_answer_on_stream_error,
+            has_terminal_tool_result=_history_has_terminal_tool_result,
+            has_final_answer=run_has_final_answer,
+            preserved_finish=_complete_run_on_preserved_answer,
+            wind_down=_enter_soft_stop,
+            wind_down_budget=_soft_stop_turn_budget,
+            llm_terminal=_emit_llm_terminal,
+            fallback_event=_policy_fallback_event,
+            retry_event=_policy_transient_retry_event,
+            commit_usage=_policy_commit_usage,
+            backoff=_transient_retry_backoff_seconds,
+            retries=RunCounter(
+                read=_transient_retries_spent,
+                charge=_charge_transient_retry,
+                reset=_reset_transient_retries,
+            ),
+            log_crash=_policy_log_stream_crash,
+        ),
+        TruncatedToolCallRecoveryPolicy(
+            recoveries=RunCounter(
+                read=_truncation_recoveries_spent,
+                charge=_charge_truncation_recovery,
+                reset=_reset_truncation_recoveries,
+            ),
+            llm_terminal=_emit_llm_terminal,
+            dispatch=_dispatch_tool,
+            park=_park_pause_interrupt,
+            parked_event=_interrupt_parked_event,
+            result_is_terminal=_history_tool_result_is_terminal,
+            pair_orphans=_policy_pair_orphan_tool_calls,
+            tool_use_stop=_policy_tool_use_message_stop,
+            recovery_result_event=_policy_truncation_result_event,
+        ),
+    )
+)

@@ -74,7 +74,7 @@ def render_compacted_placeholder(
 _PARSE_RE = re.compile(
     rf"^{re.escape(_MARKER)}:(?P<variant>SNAPSHOT|RERUN)\|"
     r"(?P<blob_ref>[^|]+)\|"
-    r"(?P<sha256>[a-fA-F0-9]+)\|"
+    r"(?P<sha256>[a-fA-F0-9]*)\|"
     r"(?P<tokens>\d+)\|"
     r"(?P<label>[^|]*)"
     r"(?:\|(?P<tool_name>[^|]*)\|(?P<preview>[^|]*))?$"
@@ -86,7 +86,9 @@ def parse_compacted_placeholder(text: str) -> tuple[CompactionSourceRef, Compact
 
     Returns ``None`` if ``text`` is not a placeholder. Inverse of
     :func:`render_compacted_placeholder`. Tolerates legacy 5-field
-    placeholders (no trailing tool_name/preview fields).
+    placeholders (no trailing tool_name/preview fields), and an empty digest —
+    which is what a placeholder says when it points at bytes whose hash the
+    writer had no honest way to state.
     """
     match = _PARSE_RE.match(text.strip())
     if not match:

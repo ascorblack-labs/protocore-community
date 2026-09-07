@@ -57,10 +57,12 @@ without the driver.
 """
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Any, Final
+from typing import TYPE_CHECKING, Any
 
+from protocore.contracts.tool_roles import ToolArgumentSlot, ToolRole
 from protocore.contracts.types import PENDING_READS_METADATA_KEY
 from protocore.logging_utils import get_logger
+from protocore.runtime.tool_arguments import string_argument
 
 if TYPE_CHECKING:  # pragma: no cover - typing only
     from protocore.contracts.types import ToolCall
@@ -68,32 +70,28 @@ if TYPE_CHECKING:  # pragma: no cover - typing only
 
 _logger = get_logger(__name__)
 
-# The tool the driver forces, and the tool whose successful result RELEASES a
-# pending path. One name, because ``tool_choice`` names exactly one tool per
-# request and the read-back obligation is satisfied by reading — a Grep or a
-# List over the file is a different act with a different result shape, and a
-# caller that greps a report has still not read it.
-FORCED_TOOL_NAME: Final[str] = "Read"
+def forced_tool_name(engine: QueryEngine) -> str | None:
+    """The host's tool that reads a file, or ``None`` when it declared none.
+
+    One name, because ``tool_choice`` names exactly one tool per request and
+    the read-back obligation is satisfied by reading — a search over the file
+    is a different act with a different result shape, and a caller that
+    searched a report has still not read it. Two tools in the role is the same
+    problem as none: the gate cannot pick, so it forces nothing and says so.
+    """
+    name = engine.config.tool_roles.sole_name(ToolRole.reads_path)
+    if name is None:
+        _logger.warning(
+            "DIAG pending_reads.no_read_tool run=%s: the read-back gate is "
+            "enabled but the role map names no single file-reading tool",
+            engine.config.run_id,
+        )
+    return name
 
 
 def is_enabled(engine: QueryEngine) -> bool:
     """Return True iff the read-back gate is enabled for this engine."""
     return bool(engine.config.rc.pending_reads_enabled)
-
-
-def _resolve_path_from_args(args: dict[str, Any]) -> str | None:
-    """Resolve a file path from a tool-call args dict (``file_path``/``path``).
-
-    Accepts both spellings because the read tool's canonical field is
-    ``file_path`` with ``path`` as a validation alias, and the model reaches
-    for either (mirrors the same helper in
-    :mod:`protocore.runtime.longfile_convergence`).
-    """
-    for key in ("file_path", "path"):
-        value = args.get(key)
-        if isinstance(value, str) and value:
-            return value
-    return None
 
 
 def _normalise(path: str) -> str:
@@ -192,9 +190,10 @@ def observe_tool_result(
     """
     if not is_enabled(engine):
         return
-    if tool_call.name == FORCED_TOOL_NAME and not is_error:
-        args = tool_call.arguments if isinstance(tool_call.arguments, dict) else {}
-        read_path = _resolve_path_from_args(args)
+    if engine.config.tool_roles.has_role(tool_call.name, ToolRole.reads_path) and not is_error:
+        read_path = string_argument(
+            tool_call.arguments, ToolArgumentSlot.path, roles=engine.config.tool_roles
+        )
         if read_path:
             _record_read(engine, read_path)
     if is_error:
@@ -240,11 +239,6 @@ def _record_declarations(engine: QueryEngine, declared: tuple[str, ...]) -> None
         engine._pending_read_paths.append(path)
 
 
-def pending_paths(engine: QueryEngine) -> tuple[str, ...]:
-    """The paths the caller still owes a read, in declaration order."""
-    return tuple(engine._pending_read_paths)
-
-
 def peek_forced_tool(engine: QueryEngine) -> str | None:
     """The tool to force on this stream, or None to force nothing.
 
@@ -266,7 +260,7 @@ def peek_forced_tool(engine: QueryEngine) -> str | None:
         return None
     if _attempts_exhausted(engine):
         return None
-    return FORCED_TOOL_NAME
+    return forced_tool_name(engine)
 
 
 def _attempts_exhausted(engine: QueryEngine) -> bool:

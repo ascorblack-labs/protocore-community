@@ -41,7 +41,7 @@ exhaustively and reused across products.
 ## Install
 
 ```bash
-pip install protocore==2.0.0a3
+pip install protocore==2.0.0a4
 ```
 
 Name the version explicitly. The published release is a pre-release, and pip
@@ -55,8 +55,31 @@ Or, to work on it, with [`uv`](https://docs.astral.sh/uv/):
 uv sync --extra dev
 ```
 
-Python ≥ 3.12. Runtime dependencies are `pydantic`, `pluggy`, `jinja2`, and
+Python ≥ 3.12. Runtime dependencies are `pydantic`, `jinja2`, and
 `typing-extensions` — nothing else.
+
+### Extras
+
+```bash
+pip install "protocore[testing]==2.0.0a4"   # run the conformance suites against your adapters
+```
+
+`testing` adds a test runner and nothing more. `protocore.conformance` is a
+pytest suite that ships inside the wheel, and a host points it at its own
+implementations of the contracts (`pytest --pyargs protocore.conformance`). The
+core's linter and type checker are deliberately not in it: those belong to
+someone changing the core, not to someone using it.
+
+Token estimation also has an optional native implementation, published as the
+separate distribution `protocore-native`. Wheels for it are not on the index
+yet, so for now it is built from source; the core stays pure Python and selects
+the extension only when it can import it, so having it changes speed and nothing
+else — same numbers, same contract. When the extension is installed and you want
+the Python implementation anyway — to compare the two, to rule it out as the
+cause of a discrepancy, or to build a reproducible environment — the environment
+variable **`PROTOCORE_DISABLE_NATIVE=1`** keeps it in force. It is read **once,
+at import**, and answers "which build of this function am I running" rather than
+tuning behaviour: changing it inside a live process does nothing.
 
 ## Quickstart
 
@@ -141,7 +164,7 @@ A full Russian mirror lives under [`docs/ru/`](docs/ru/index.md).
 
 ```bash
 uv sync --extra dev
-uv run pytest .            # 2973 tests
+uv run pytest .            # 3215 tests
 uv run ruff check .
 uv run mypy --strict
 uv run bandit -r protocore -q -c pyproject.toml

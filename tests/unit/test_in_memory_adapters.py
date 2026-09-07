@@ -233,10 +233,11 @@ async def test_agent_dispatch_register_and_dispatch() -> None:
     )
     listed = await rt.agents.list_subagents(rt.tenant_id)
     assert len(listed) == 1
-    result = await rt.agents.dispatch(
+    handle = await rt.agents.dispatch(
         SubagentTask(subagent_id="sa1", parent_run_id="r1", task_prompt="hi")
     )
-    assert result.success
+    assert handle.identity().kind == "agent"
+    assert (await handle.wait()).success
 
 
 async def test_agent_dispatch_missing_raises() -> None:
@@ -383,7 +384,7 @@ async def test_llm_complete_structured_empty_queue_returns_blank() -> None:
     rt = build_in_memory_runtime()
     response = await rt.llm.complete_structured(LLMRequest(model="test-model", messages=[]), {})
     assert response.stop_reason is StopReason.end_turn
-    assert response.message.content_blocks == []
+    assert response.message.content_blocks == ()
 
 
 async def test_llm_complete_text_pops_queue() -> None:
@@ -398,7 +399,7 @@ async def test_llm_complete_text_empty_queue_returns_blank() -> None:
     rt = build_in_memory_runtime()
     response = await rt.llm.complete_text(LLMRequest(model="test-model", messages=[]))
     assert response.stop_reason is StopReason.end_turn
-    assert response.message.content_blocks == []
+    assert response.message.content_blocks == ()
 
 
 async def test_llm_complete_text_records_the_call() -> None:
@@ -499,10 +500,10 @@ async def test_agent_dispatch_queued_result() -> None:
             success=True,
         )
     )
-    result = await rt.agents.dispatch(
+    handle = await rt.agents.dispatch(
         SubagentTask(subagent_id="sa1", parent_run_id="r1", task_prompt="hi")
     )
-    assert result.output == "custom"
+    assert (await handle.wait()).output == "custom"
 
 
 # ----- Session: append/list errors + since filter -----

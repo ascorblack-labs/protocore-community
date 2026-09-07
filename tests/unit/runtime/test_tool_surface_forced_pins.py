@@ -15,7 +15,7 @@ from __future__ import annotations
 
 import pytest
 
-from protocore.contracts.runtime_constants import RuntimeConstants
+from protocore.contracts.runtime_constants import LoopConstants
 from protocore.contracts.tool_registry import ToolVisibilityPolicy
 from protocore.runtime.tool_registry import ToolRegistry
 
@@ -26,7 +26,7 @@ _CORE_TOOLS: frozenset[str] = frozenset(
     {"Agent", "Read", "Write", "Edit", "Bash", "Glob", "Grep"}
 )
 
-# Top-K used for the per-turn surface (matches RuntimeConstants.tool_retrieval_top_k).
+# Top-K used for the per-turn surface (matches LoopConstants.tool_retrieval_top_k).
 _TOP_K = 12
 
 # Real 14-tool surface (name → description) — verbatim from the stand's
@@ -214,25 +214,8 @@ def test_blocked_still_wins_over_forced_pins(chat_registry: ToolRegistry) -> Non
 
 def test_runtime_constants_default_pins_are_agent_plus_core_tools() -> None:
     """§A.1: the RC default exposes Agent plus the six core file tools."""
-    rc = RuntimeConstants()
+    rc = LoopConstants()
     assert set(rc.tool_surface_forced_pins) == _CORE_TOOLS
-
-
-def test_runtime_constants_structured_output_default_on() -> None:
-    """§A.1: ``structured_output_use_response_format`` exists, defaults True.
-
-    The host vLLM client reads this RC by name (and a test constructs
-    ``RuntimeConstants(structured_output_use_response_format=False)``); the
-    frozen ``extra='forbid'`` model would reject that kwarg if the field were
-    absent, so this guards the cross-unit §A.1 contract.
-    """
-    assert RuntimeConstants().structured_output_use_response_format is True
-    assert (
-        RuntimeConstants(
-            structured_output_use_response_format=False
-        ).structured_output_use_response_format
-        is False
-    )
 
 
 def test_runtime_constants_pins_drive_policy(chat_registry: ToolRegistry) -> None:
@@ -241,7 +224,7 @@ def test_runtime_constants_pins_drive_policy(chat_registry: ToolRegistry) -> Non
     Proves the seam is RC-driven end to end: no inline magic list — the policy
     is built from ``rc.tool_surface_forced_pins`` and the core surface honours it.
     """
-    rc = RuntimeConstants()
+    rc = LoopConstants()
     policy = ToolVisibilityPolicy(forced_pinned=frozenset(rc.tool_surface_forced_pins))
     surface = {
         d.name

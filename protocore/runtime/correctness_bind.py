@@ -3,8 +3,14 @@ from __future__ import annotations
 
 from typing import Any
 
+from protocore.contracts.middleware import (
+    ILifecycleRegistry,
+    LifecycleContext,
+    LifecycleOutcome,
+    LifecycleVerdict,
+)
+from protocore.contracts.types import HookEvent
 from protocore.runtime.events import EventType, TurnEvent
-from protocore.runtime.typed_hooks import HookOutcome, dispatch_hook
 
 
 def persist_correctness(engine: Any) -> None:
@@ -46,16 +52,56 @@ def commit_usage(
     )
 
 
-def fire_typed_hook(engine: Any, name: str, payload: dict[str, Any]) -> tuple[HookOutcome, TurnEvent | None]:
-    from protocore.runtime.typed_hooks import HookOutcome as Outcome
+def lifecycle_registry(engine: Any) -> ILifecycleRegistry | None:
+    """The run's lifecycle registry, or ``None`` when the seam is not live.
 
-    if not engine.config.rc.typed_hooks_enabled or engine.typed_hook_registry is None:
-        return Outcome(decision="allow"), None
-    outcome = dispatch_hook(engine.typed_hook_registry, name, payload, engine.config.rc)
+    One place decides whether extensions run at all — the registry has to be
+    there and the run has to have the seam switched on. Every caller asks here,
+    so a coordinate dispatched from the loop and a coordinate dispatched from
+    the tool dispatcher can never disagree about whether the seam exists.
+    """
+    registry: ILifecycleRegistry | None = getattr(engine, "lifecycle_hooks", None)
+    if registry is None or not engine.config.rc.typed_hooks_enabled:
+        return None
+    return registry
+
+
+async def fire_lifecycle(
+    engine: Any, point: HookEvent, payload: dict[str, Any]
+) -> tuple[LifecycleOutcome, TurnEvent | None]:
+    """Dispatch one lifecycle coordinate and report what came back.
+
+    Returns the outcome plus the ``HOOK_FIRED`` event to yield, or ``None`` for
+    the event when nothing was registered — a coordinate nobody listens to
+    should not fill the stream with news of its own silence.
+    """
+    registry = lifecycle_registry(engine)
+    if registry is None:
+        return LifecycleOutcome(payload=dict(payload)), None
+    if not registry.registrations(point):
+        return LifecycleOutcome(payload=dict(payload)), None
+    outcome = await registry.dispatch(
+        LifecycleContext(
+            point=point,
+            run_id=engine.config.run_id,
+            session_id=str(getattr(engine.config, "session_id", "") or ""),
+            tenant_id=str(getattr(engine.config, "tenant_id", "") or ""),
+            payload=dict(payload),
+        )
+    )
+    event_payload: dict[str, Any] = {
+        "hook": point.value,
+        "decision": outcome.verdict.value,
+    }
+    if outcome.verdict is not LifecycleVerdict.allow:
+        event_payload["reason"] = outcome.reason
+        event_payload["decided_by"] = outcome.decided_by
+    if outcome.failures:
+        event_payload["failures"] = [item.error for item in outcome.failures]
     evt = TurnEvent(
         type=EventType.HOOK_FIRED,
         run_id=engine.config.run_id,
-        payload={"hook": name, "decision": outcome.decision},
+        payload=event_payload,
     )
     return outcome, evt
 
@@ -80,7 +126,8 @@ def mark_intent_recovery(engine: Any, intent: Any) -> list[TurnEvent]:
 
 __all__ = [
     "commit_usage",
-    "fire_typed_hook",
+    "fire_lifecycle",
+    "lifecycle_registry",
     "mark_intent_recovery",
     "persist_correctness",
 ]

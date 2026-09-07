@@ -10,7 +10,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-from protocore.contracts.verification import (
+from protocore.contracts.evidence import (
     CandidateReleasedProjection,
     VerificationDelivery,
     VerificationLifecycle,

@@ -14,7 +14,7 @@ from __future__ import annotations
 
 import pytest
 
-from protocore.contracts.runtime_constants import RuntimeConstants
+from protocore.contracts.runtime_constants import LoopConstants
 from protocore.contracts.tool_registry import ToolVisibilityPolicy
 from protocore.contracts.types import ToolCall
 from protocore.runtime.events import EventType, TurnEvent
@@ -48,7 +48,7 @@ def _engine(
             tenant_id="tenant-allowlist",
             session_id="sess-allowlist",
             model_name="qwen3.6-35b-a3b",
-            rc=RuntimeConstants(
+            rc=LoopConstants(
                 model_context_window=4_096,
                 # An empty floor keeps these tests about the declaration alone.
                 # The floor's own interaction with it is asserted separately.
@@ -136,7 +136,7 @@ async def test_declaration_narrows_only_beyond_the_forced_pin_floor() -> None:
     object.__setattr__(
         engine.config,
         "rc",
-        RuntimeConstants(
+        LoopConstants(
             model_context_window=4_096,
             tool_surface_forced_pins=(ORDINARY,),
         ),

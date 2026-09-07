@@ -24,7 +24,7 @@ from typing import Any
 import pytest
 
 from protocore.contracts.llm import LLMRequest, LLMStreamEvent
-from protocore.contracts.runtime_constants import RuntimeConstants
+from protocore.contracts.runtime_constants import LoopConstants
 from protocore.contracts.tools import Tool, ToolContext
 from protocore.contracts.types import (
     PARTIAL_ASSISTANT_ATTEMPT_METADATA_KEY,
@@ -49,6 +49,7 @@ from protocore.tests_support.adapters import (
     InMemorySkillStore,
     InMemoryToolRegistry,
 )
+from tests._fixtures.tool_roles import CONVENTIONAL_TOOL_ROLES
 
 WRITE = "Write"
 APPEND = "AppendFile"
@@ -57,9 +58,10 @@ READ = "Read"
 TARGET = "/workspace/big.py"
 
 
-def _build_engine(*, rc: RuntimeConstants, llm: object) -> QueryEngine:
+def _build_engine(*, rc: LoopConstants, llm: object) -> QueryEngine:
     return QueryEngine(
         config=QueryEngineConfig(
+            tool_roles=CONVENTIONAL_TOOL_ROLES,
             run_id="run-lfc",
             tenant_id="tenant-test",
             session_id="sess-lfc",
@@ -209,7 +211,7 @@ async def test_stall_after_header_forces_appendfile_then_finalize() -> None:
     The header is truncated (the only path that engages the truncation driver);
     the salvage lands its partial bytes so the truncation-gated driver
     can fire."""
-    rc = RuntimeConstants(
+    rc = LoopConstants(
         model_context_window=8_192,
         longfile_convergence_enabled=True,
         longfile_stall_turns=2,
@@ -274,7 +276,7 @@ async def test_stall_after_header_forces_appendfile_then_finalize() -> None:
 @pytest.mark.asyncio
 async def test_disabled_rc_never_forces_a_tool() -> None:
     """RC kill-switch: the same idle scenario forces NOTHING when disabled."""
-    rc = RuntimeConstants(
+    rc = LoopConstants(
         model_context_window=8_192,
         longfile_convergence_enabled=False,
         longfile_stall_turns=2,
@@ -307,7 +309,7 @@ async def test_disabled_rc_never_forces_a_tool() -> None:
 @pytest.mark.asyncio
 async def test_strong_model_self_completing_is_a_no_op() -> None:
     """A model that adds bytes every turn and self-finalizes is never forced."""
-    rc = RuntimeConstants(
+    rc = LoopConstants(
         model_context_window=8_192,
         longfile_convergence_enabled=True,
         longfile_stall_turns=2,
@@ -344,7 +346,7 @@ async def test_fop_en_006_pattern_no_append_flood() -> None:
     then idle-inspect via Glob/Read — must force ZERO tools. Without the
     truncation gate this produced a 195-AppendFile self-loop; with it the driver
     never engages a non-truncated file."""
-    rc = RuntimeConstants(
+    rc = LoopConstants(
         model_context_window=8_192,
         longfile_convergence_enabled=True,
         longfile_stall_turns=2,
@@ -391,7 +393,7 @@ async def test_salvage_truncated_partial_lands_bytes_and_engages() -> None:
     """Salvage happy path (end-to-end): a truncated Write WITH a recoverable
     partial ``content`` → the partial is salvaged to disk as a clean Write (bytes
     land + truncation latched) → the driver engages on the next stall."""
-    rc = RuntimeConstants(
+    rc = LoopConstants(
         model_context_window=8_192,
         longfile_convergence_enabled=True,
         longfile_stall_turns=1,
@@ -507,7 +509,7 @@ async def test_salvage_ge_floor_forces_append_not_finalize() -> None:
     FAILS on 7a16d29 (the FIRST forced tool is FinalizeFile); PASSES after the fix
     (the FIRST forced tool is AppendFile).
     """
-    rc = RuntimeConstants(
+    rc = LoopConstants(
         model_context_window=8_192,
         longfile_convergence_enabled=True,
         longfile_stall_turns=2,
@@ -574,7 +576,7 @@ async def test_salvage_then_clean_append_reaches_finalize() -> None:
     truncated-tail flag, so the file becomes ``plausibly_complete`` and a
     subsequent idle stall reaches the FinalizeFile path. Proves the re-set blocks
     finalize ONLY on the salvage-tail itself, never permanently."""
-    rc = RuntimeConstants(
+    rc = LoopConstants(
         model_context_window=8_192,
         longfile_convergence_enabled=True,
         longfile_stall_turns=2,
@@ -641,7 +643,7 @@ async def test_truncation_with_no_salvageable_content_requests_smaller_chunk() -
     key is ABSENT (cut before any body) is NOT dispatched as an empty file;
     instead the recovery message keeps the chunk protocol and (on a repeat)
     LOWERS the header budget so the retry writes a SMALLER first chunk."""
-    rc = RuntimeConstants(
+    rc = LoopConstants(
         model_context_window=8_192,
         longfile_convergence_enabled=True,
         longfile_stall_turns=1,
@@ -703,7 +705,7 @@ async def test_repeated_salvage_uses_unique_synthetic_ids() -> None:
     tool_call_ids, so the outbound pairing repair does not drop the second
     salvage's assistant/tool blocks (which would hide a real workspace mutation
     from the model)."""
-    rc = RuntimeConstants(
+    rc = LoopConstants(
         model_context_window=8_192,
         longfile_convergence_enabled=True,
         longfile_stall_turns=2,
@@ -768,7 +770,7 @@ async def test_repeat_truncated_full_write_replaces_not_duplicates() -> None:
     FAILS before the fix (file == prefix1 + prefix2, the salvage op is
     AppendFile); PASSES after (file == prefix2, the salvage honours the Write).
     """
-    rc = RuntimeConstants(
+    rc = LoopConstants(
         model_context_window=8_192,
         longfile_convergence_enabled=True,
         longfile_stall_turns=2,
@@ -839,7 +841,7 @@ async def test_truncated_appendfile_with_zero_tracked_bytes_does_not_replace() -
     FAILS before the fix (file == chunk only, prior content destroyed); PASSES
     after (file == prior content + chunk, the salvage honours the AppendFile).
     """
-    rc = RuntimeConstants(
+    rc = LoopConstants(
         model_context_window=8_192,
         longfile_convergence_enabled=True,
         longfile_stall_turns=2,
@@ -899,7 +901,7 @@ async def test_pathless_content_present_truncation_is_not_swallowed() -> None:
     """A truncated chunkable write with RECOVERED content but NO resolvable path
     must NOT be classified as salvaged-then-dropped; it stays in the recovery
     path and the model is told to re-issue."""
-    rc = RuntimeConstants(
+    rc = LoopConstants(
         model_context_window=8_192,
         longfile_convergence_enabled=True,
         longfile_stall_turns=2,
@@ -991,7 +993,7 @@ class _ForcingAwareScriptedLLM(_ScriptedLLM):
 async def test_disabled_rc_truncation_event_has_no_salvaged_paths_key() -> None:
     """With the driver DISABLED, the tool_call_truncation_recovery event payload
     must have NO ``salvaged_paths`` key (it was absent before the feature)."""
-    rc = RuntimeConstants(
+    rc = LoopConstants(
         model_context_window=8_192,
         longfile_convergence_enabled=False,
         max_output_recovery_rounds=3,
@@ -1064,7 +1066,7 @@ async def test_voluntary_seal_via_terminal_tool_seals_truncated_file() -> None:
 
     FAILS on 1c6fe1fc (no voluntary-finish seal → ``_longfile_finalized`` stays
     False, FinalizeFile never runs). PASSES after the seam."""
-    rc = RuntimeConstants(
+    rc = LoopConstants(
         model_context_window=8_192,
         longfile_convergence_enabled=True,
         longfile_stall_turns=2,
@@ -1124,7 +1126,7 @@ async def test_voluntary_seal_via_prose_end_turn_seals_truncated_file() -> None:
     """Same shape, but the model VOLUNTARILY ends with a prose
     ``end_turn`` (no run-terminal tool). The runtime must still synthesise a
     FinalizeFile to seal the truncation-gated file before COMPLETED."""
-    rc = RuntimeConstants(
+    rc = LoopConstants(
         model_context_window=8_192,
         longfile_convergence_enabled=True,
         longfile_stall_turns=2,
@@ -1170,7 +1172,7 @@ async def test_voluntary_seal_via_prose_end_turn_seals_truncated_file() -> None:
 async def test_voluntary_seal_inert_on_untruncated_file() -> None:
     """Zero-collateral: the SAME voluntary-finish shape WITHOUT a truncation
     dispatches NOTHING (the file was never truncation-gated). Bit-identical."""
-    rc = RuntimeConstants(
+    rc = LoopConstants(
         model_context_window=8_192,
         longfile_convergence_enabled=True,
         longfile_stall_turns=2,
@@ -1210,7 +1212,7 @@ async def test_voluntary_seal_inert_on_untruncated_file() -> None:
 async def test_voluntary_seal_disabled_rc_is_noop() -> None:
     """RC kill-switch: the truncated-then-voluntary-finish shape dispatches NO
     synthetic FinalizeFile when the driver is disabled (bit-identical)."""
-    rc = RuntimeConstants(
+    rc = LoopConstants(
         model_context_window=8_192,
         longfile_convergence_enabled=False,
         longfile_stall_turns=2,
@@ -1253,7 +1255,7 @@ async def test_voluntary_seal_skips_when_finalize_not_on_surface() -> None:
     """Skip silently — when FinalizeFile is NOT registered on the run's
     tool surface, the seal is skipped without crashing and the run completes
     (a tenant without the chunk-protocol tools simply cannot be sealed)."""
-    rc = RuntimeConstants(
+    rc = LoopConstants(
         model_context_window=8_192,
         longfile_convergence_enabled=True,
         longfile_stall_turns=2,
@@ -1314,7 +1316,7 @@ async def test_soft_cap_annotation_does_not_hide_bytes_from_driver() -> None:
     FAILS before the fix (tracked size frozen at the Write's 1000 bytes);
     PASSES after (tracked size == the real cumulative 3000 bytes).
     """
-    rc = RuntimeConstants(
+    rc = LoopConstants(
         model_context_window=8_192,
         longfile_convergence_enabled=True,
         longfile_stall_turns=2,
@@ -1344,10 +1346,10 @@ async def test_soft_cap_annotation_does_not_hide_bytes_from_driver() -> None:
     ]
     llm = _ScriptedLLM(scripts)
     engine = _build_engine(rc=rc, llm=llm)
-    # The per-subagent soft cap is read off the helper bag the executor forwards
-    # into ``ToolContext.metadata['protocore.helpers']`` (agent_dispatch.py
-    # ``tool_call_soft_caps_json``). A cap of 1 annotates from the 1st AppendFile.
-    engine._helpers = {"subagent_tool_call_soft_caps": {APPEND: 1}}  # type: ignore[attr-defined]
+    # The per-subagent soft cap is read off the run's own state, where the host
+    # puts it when it composes a child run. A cap of 1 annotates from the first
+    # AppendFile.
+    engine.run_state.tool_call_soft_caps = {APPEND: 1}
     for tool in tools:
         engine.tools.register(tool)  # type: ignore[attr-defined]
 

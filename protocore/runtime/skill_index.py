@@ -88,7 +88,7 @@ def derive_skill_index_budget_tokens(
     model_context_window: int,
     skill_index_budget_ratio: float,
 ) -> int:
-    """RuntimeConstants-derived budget for the skill catalog block.
+    """LoopConstants-derived budget for the skill catalog block.
 
     Defaults to 1% of ``model_context_window``.
     Returns an integer token count, floored ≥ 0.

@@ -12,7 +12,7 @@ the memory tools can hold their store dependency directly and keep all of their
 logic in the universal core. The host builds the concrete
 ``PgMemoryStore``, injects it into these tool instances, and decides whether to
 register them at all (RC-gated by
-:attr:`~protocore.contracts.runtime_constants.RuntimeConstants.memory_enabled`).
+:attr:`~protocore.contracts.runtime_constants.LoopConstants.memory_enabled`).
 This keeps the agent-facing behaviour universal + unit-testable against the
 in-memory fake, with zero per-tenant targeting.
 
@@ -22,7 +22,7 @@ The tools are scope-aware but **never hard-code a scope policy**. They read the
 ambient ``(scope, scope_key)`` from :attr:`ToolContext.metadata` under
 :data:`MEMORY_SCOPE_CONTEXT_KEY` / :data:`MEMORY_SCOPE_KEY_CONTEXT_KEY`, which
 the host dispatcher populates from the resolved
-:attr:`RuntimeConstants.memory_default_scope` for the tenant (the most-isolated
+:attr:`LoopConstants.memory_default_scope` for the tenant (the most-isolated
 configuration = ``session``; broader tenants may use
 ``user``/``project``/``global``). When the metadata is absent the tools fall
 back to ``session`` scope keyed by :attr:`ToolContext.session_id` — the safest,
@@ -61,7 +61,7 @@ from protocore.contracts.memory import (
     MemoryStoreUnavailableError,
     blocked_memory_placeholder,
 )
-from protocore.contracts.tools import Tool, ToolContext
+from protocore.contracts.tools import Tool, ToolContext, has_metadata, read_metadata
 from protocore.contracts.types import (
     ToolDefinition,
     ToolParameterSchema,
@@ -112,6 +112,10 @@ MEMORY_WRITE_SIMILARITY_THRESHOLD_CONTEXT_KEY: Final[str] = (
     "memory_write_similarity_threshold"
 )
 MEMORY_MAX_RECORDS_PER_SCOPE_CONTEXT_KEY: Final[str] = "memory_max_records_per_scope"
+# The id the dispatcher stamps on the bag so a result can name the call it
+# answers. Read here rather than spelled inline: every key core reads off the
+# bag is a declared one.
+TOOL_CALL_ID_CONTEXT_KEY: Final[str] = "tool_call_id"
 
 # Defensive caps so a single tool call cannot wedge the store / blow a row.
 REMEMBER_TEXT_MAX_LENGTH: Final[int] = 8000
@@ -158,15 +162,14 @@ def _memory_disabled(context: ToolContext) -> bool:
     opinion" (return ``False``) so pure-core tests and non-RC callers are
     unaffected — same convention as the other per-tool dispatch guards.
     """
-    md = context.metadata or {}
-    if MEMORY_ENABLED_CONTEXT_KEY not in md:
+    if not has_metadata(context, MEMORY_ENABLED_CONTEXT_KEY):
         return False
-    return md.get(MEMORY_ENABLED_CONTEXT_KEY) is False
+    return read_metadata(context, MEMORY_ENABLED_CONTEXT_KEY) is False
 
 
 def _resolved_similarity_threshold(context: ToolContext) -> float | None:
     """Per-tenant ``memory_write_similarity_threshold`` from metadata (or None)."""
-    raw = (context.metadata or {}).get(MEMORY_WRITE_SIMILARITY_THRESHOLD_CONTEXT_KEY)
+    raw = read_metadata(context, MEMORY_WRITE_SIMILARITY_THRESHOLD_CONTEXT_KEY)
     if raw is None:
         return None
     try:
@@ -177,7 +180,7 @@ def _resolved_similarity_threshold(context: ToolContext) -> float | None:
 
 def _resolved_max_records_per_scope(context: ToolContext) -> int | None:
     """Per-tenant ``memory_max_records_per_scope`` from metadata (or None)."""
-    raw = (context.metadata or {}).get(MEMORY_MAX_RECORDS_PER_SCOPE_CONTEXT_KEY)
+    raw = read_metadata(context, MEMORY_MAX_RECORDS_PER_SCOPE_CONTEXT_KEY)
     if raw is None:
         return None
     try:
@@ -219,10 +222,12 @@ def _resolve_scope(
  ``session_id`` under the requested scope — that mis-files the record;
  this mirrors the recall path and the :meth:`IMemory.write` contract).
  """
-    md = context.metadata or {}
-
     # 1/2 — pick the scope.
-    scope_str = requested_scope or md.get(MEMORY_SCOPE_CONTEXT_KEY) or MemoryScope.session.value
+    scope_str = (
+        requested_scope
+        or read_metadata(context, MEMORY_SCOPE_CONTEXT_KEY)
+        or MemoryScope.session.value
+    )
     try:
         scope = MemoryScope(scope_str)
     except ValueError as exc:
@@ -253,16 +258,16 @@ def _resolve_scope(
     # tenant's default scope (today: ``user`` → the user id); applying it to a
     # different requested scope (project/agent/custom) files the record under
     # the wrong id (a silent cross-scope key bleed).
-    default_scope = md.get(MEMORY_SCOPE_CONTEXT_KEY)
+    default_scope = read_metadata(context, MEMORY_SCOPE_CONTEXT_KEY)
     default_scope_key = (
-        md.get(MEMORY_SCOPE_KEY_CONTEXT_KEY)
+        read_metadata(context, MEMORY_SCOPE_KEY_CONTEXT_KEY)
         if default_scope and str(default_scope) == scope.value
         else None
     )
 
     key = (
         requested_scope_key
-        or _injected_scope_key(md, scope)
+        or _injected_scope_key(context, scope)
         or default_scope_key
         or (context.session_id if scope is MemoryScope.session else "")
     )
@@ -305,7 +310,7 @@ def _allowed_scope_values(context: ToolContext) -> set[str] | None:
  The non-``None`` return is always an explicit restriction the callers
  (:func:`_resolve_scope` / :func:`_allowed_recall_scopes`) enforce.
  """
-    raw = (context.metadata or {}).get(MEMORY_ALLOWED_SCOPES_CONTEXT_KEY)
+    raw = read_metadata(context, MEMORY_ALLOWED_SCOPES_CONTEXT_KEY)
     if raw is None:
         return None
     if isinstance(raw, str):
@@ -320,7 +325,7 @@ def _allowed_scope_values(context: ToolContext) -> set[str] | None:
     return values or set(_EMPTY_ALLOWLIST_FALLBACK)
 
 
-def _injected_scope_key(md: dict[str, Any], scope: MemoryScope) -> str | None:
+def _injected_scope_key(context: ToolContext, scope: MemoryScope) -> str | None:
     """Look up the dispatcher-injected resolved key for ``scope`` (or None).
 
     The dispatcher injects ``{scope_value: scope_key}`` under
@@ -328,7 +333,7 @@ def _injected_scope_key(md: dict[str, Any], scope: MemoryScope) -> str | None:
     resolve (user/project/agent). Session is keyed by the context session id,
     so it is intentionally not required here.
     """
-    keys = md.get(MEMORY_SCOPE_KEYS_CONTEXT_KEY)
+    keys = read_metadata(context, MEMORY_SCOPE_KEYS_CONTEXT_KEY)
     if not isinstance(keys, dict):
         return None
     val = keys.get(scope.value)
@@ -772,9 +777,8 @@ def _ambient_scope_keys(context: ToolContext) -> dict[MemoryScope, str]:
     unaddressable non-global scopes), so no cross-key leak is possible.
     """
     keys: dict[MemoryScope, str] = {MemoryScope.session: context.session_id}
-    md = context.metadata or {}
     # the per-scope key map (richest source).
-    raw_map = md.get(MEMORY_SCOPE_KEYS_CONTEXT_KEY)
+    raw_map = read_metadata(context, MEMORY_SCOPE_KEYS_CONTEXT_KEY)
     if isinstance(raw_map, dict):
         for scope_value, scope_key in raw_map.items():
             if not scope_key:
@@ -784,8 +788,8 @@ def _ambient_scope_keys(context: ToolContext) -> dict[MemoryScope, str]:
             except ValueError:
                 continue
     # the single default scope+key (back-compat / minimal injection).
-    scope_str = md.get(MEMORY_SCOPE_CONTEXT_KEY)
-    scope_key = md.get(MEMORY_SCOPE_KEY_CONTEXT_KEY)
+    scope_str = read_metadata(context, MEMORY_SCOPE_CONTEXT_KEY)
+    scope_key = read_metadata(context, MEMORY_SCOPE_KEY_CONTEXT_KEY)
     if scope_str and scope_key:
         try:
             keys[MemoryScope(str(scope_str))] = str(scope_key)
@@ -874,8 +878,7 @@ def _call_id(context: ToolContext) -> str:
     real id via ``metadata['tool_call_id']`` when available, else we fall back
     to the run id so the result is never unaddressable.
     """
-    md = context.metadata or {}
-    raw = md.get("tool_call_id")
+    raw = read_metadata(context, TOOL_CALL_ID_CONTEXT_KEY)
     return str(raw) if raw else context.run_id
 
 

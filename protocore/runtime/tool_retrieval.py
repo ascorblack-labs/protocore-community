@@ -217,9 +217,9 @@ def retrieve_tools(
         # message, contradicting this function's documented contract. Sorting
         # by name (not raw input order) makes the fallback independent of
         # caller ordering, matching ``ToolRegistry.search``'s "first top_k by
-        # name order" promise — the clip callers
-        # (``ToolRegistry.compute_effective_surface`` / ``assemble_tool_pool``)
-        # already feed a name-sorted catalog, so this is a no-op for them.
+        # name order" promise — the clip caller
+        # (``ToolRegistry.compute_effective_surface``) already feeds a
+        # name-sorted catalog, so this is a no-op for it.
         retrieved = sorted(other_candidates, key=lambda c: c.name)
     else:
         avgdl = compute_avgdl(other_candidates)

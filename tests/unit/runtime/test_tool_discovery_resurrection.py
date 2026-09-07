@@ -29,6 +29,7 @@ from protocore.tools.memory import (
     RECALL_TOOL_NAME,
     REMEMBER_TOOL_NAME,
 )
+from tests._fixtures.tool_roles import CONVENTIONAL_TOOL_ROLES
 
 from ._tool_fixtures import MockTool
 
@@ -203,7 +204,7 @@ def test_dispatcher_injects_policy_into_tool_context() -> None:
 
     tool.invoke = _spy_invoke  # type: ignore[method-assign]
     reg = _registry_with(tool)
-    dispatcher = ToolDispatcher(registry=reg, permission_gate=ToolPermissionGate())
+    dispatcher = ToolDispatcher(registry=reg, permission_gate=ToolPermissionGate(roles=CONVENTIONAL_TOOL_ROLES))
     policy = ToolVisibilityPolicy(blocked={"SomethingElse"})
 
     async def _run() -> None:

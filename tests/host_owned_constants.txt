@@ -1,0 +1,24 @@
+# Constants that live in the core's model and that the core does not read.
+#
+# Each of these is a knob the surrounding layer owns: it fills the value in, it
+# reads the value back, and the loop never looks at it. They sit here because
+# the model was written as one flat surface before the ownership question was
+# asked, and every one of them is on its way out — to be declared by the layer
+# that actually reads it, and removed from this model.
+#
+# The list is therefore a debt ledger, not a configuration. It only ever
+# shrinks: a name is struck from it in the same window the field leaves the
+# model. The guard refuses a name that has since acquired a core reader and
+# refuses a name that no longer exists, so a stale line cannot survive the
+# change that made it stale.
+#
+# The debt is paid: the list is empty, and every field of the model now has a
+# reader in this package. The file stays because the rule it exempts from is
+# still the rule, and an empty ledger states plainly that nothing is exempt.
+#
+# Nothing is ever added here. A NEW constant that no part of the core reads
+# does not belong in the core's model at all, and the guard failing on it is
+# the whole point.
+#
+# One name per line. Blank lines and lines beginning with `#` are ignored.
+# Guard: tests/test_constant_readers.py

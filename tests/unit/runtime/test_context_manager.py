@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import pytest
 
-from protocore.contracts.runtime_constants import RuntimeConstants
+from protocore.contracts.runtime_constants import LoopConstants
 from protocore.contracts.types import (
     ImageRefBlock,
     Message,
@@ -13,10 +13,10 @@ from protocore.contracts.types import (
     ToolResultBlock,
     ToolUseBlock,
 )
+from protocore.runtime.context.compaction import estimate_history_tokens
 from protocore.runtime.context.manager import (
     ContextManager,
     detect_active_language,
-    estimate_history_tokens,
 )
 from protocore.tests_support.adapters import InMemoryBlobStore, InMemoryLLMProvider
 
@@ -49,12 +49,12 @@ def test_detect_active_language_empty_message() -> None:
 
 
 def test_estimate_history_tokens_zero_for_empty() -> None:
-    rc = RuntimeConstants()
+    rc = LoopConstants()
     assert estimate_history_tokens([], rc) == 0
 
 
 def test_estimate_history_tokens_scales_with_content() -> None:
-    rc = RuntimeConstants()
+    rc = LoopConstants()
     short = [Message(role=MessageRole.user, content_blocks=[TextBlock(text="hi")])]
     long_ = [Message(role=MessageRole.user, content_blocks=[TextBlock(text="x" * 1000)])]
     assert estimate_history_tokens(long_, rc) > estimate_history_tokens(short, rc)
@@ -72,7 +72,7 @@ def test_estimate_counts_tool_use_arguments() -> None:
     ``arguments_json``. The old attr-probe estimator counted it as 0, so a
     20 KB Write tool-call vanished from the pre-flight compaction gate.
     """
-    rc = RuntimeConstants()
+    rc = LoopConstants()
     big_args = '{"path": "x.txt", "content": "' + ("Z" * 20_000) + '"}'
     history = [
         Message(
@@ -93,7 +93,7 @@ def test_estimate_counts_reasoning_content() -> None:
     reasoning_content is a top-level Message field (not a content block) that
     thinking-capable providers re-emit on the wire; it must be included.
     """
-    rc = RuntimeConstants()
+    rc = LoopConstants()
     base = Message(
         role=MessageRole.assistant,
         content_blocks=[TextBlock(text="ok")],
@@ -110,7 +110,7 @@ def test_estimate_counts_reasoning_content() -> None:
 
 def test_estimate_counts_thinking_block() -> None:
     """ThinkingBlock.text is counted (it has .text, but assert)."""
-    rc = RuntimeConstants()
+    rc = LoopConstants()
     history = [
         Message(
             role=MessageRole.assistant,
@@ -123,7 +123,7 @@ def test_estimate_counts_thinking_block() -> None:
 def test_estimate_counts_image_ref_block_via_constant() -> None:
     """ImageRefBlock has neither text nor content; it must count
     a fixed RC-configurable image-token constant, never 0."""
-    rc = RuntimeConstants()
+    rc = LoopConstants()
     history = [
         Message(
             role=MessageRole.assistant,
@@ -137,7 +137,7 @@ def test_estimate_counts_image_ref_block_via_constant() -> None:
 
 def test_estimate_counts_tool_result_block() -> None:
     """A ToolResultBlock (has .content) is counted (regression anchor)."""
-    rc = RuntimeConstants()
+    rc = LoopConstants()
     history = [
         Message(
             role=MessageRole.tool,
@@ -149,7 +149,7 @@ def test_estimate_counts_tool_result_block() -> None:
 
 @pytest.mark.asyncio
 async def test_context_manager_build_context_returns_bundle() -> None:
-    rc = RuntimeConstants(model_context_window=4_096)
+    rc = LoopConstants(model_context_window=4_096)
     blobs = InMemoryBlobStore()
     llm = InMemoryLLMProvider()
     mgr = ContextManager(rc=rc, blob_store=blobs, compaction_llm=llm)
@@ -165,7 +165,7 @@ async def test_context_manager_build_context_returns_bundle() -> None:
 
 @pytest.mark.asyncio
 async def test_context_manager_detects_russian() -> None:
-    rc = RuntimeConstants(model_context_window=4_096)
+    rc = LoopConstants(model_context_window=4_096)
     blobs = InMemoryBlobStore()
     llm = InMemoryLLMProvider()
     mgr = ContextManager(rc=rc, blob_store=blobs, compaction_llm=llm)
@@ -178,7 +178,7 @@ async def test_context_manager_detects_russian() -> None:
 
 
 def test_context_manager_needs_compaction_when_history_exceeds_trigger() -> None:
-    rc = RuntimeConstants(model_context_window=512)
+    rc = LoopConstants(model_context_window=512)
     blobs = InMemoryBlobStore()
     llm = InMemoryLLMProvider()
     mgr = ContextManager(rc=rc, blob_store=blobs, compaction_llm=llm)
@@ -192,7 +192,7 @@ def test_context_manager_needs_compaction_when_history_exceeds_trigger() -> None
 
 
 def test_context_manager_no_compaction_for_short_history() -> None:
-    rc = RuntimeConstants(model_context_window=49_152)
+    rc = LoopConstants(model_context_window=49_152)
     blobs = InMemoryBlobStore()
     llm = InMemoryLLMProvider()
     mgr = ContextManager(rc=rc, blob_store=blobs, compaction_llm=llm)
@@ -207,7 +207,7 @@ def test_observed_prompt_tokens_floors_compaction_gate() -> None:
     reported a real prompt size above the trigger. Regression for a 65536-window
     provider that received ~148K real input tokens with the estimate far below
     trigger and never compacted."""
-    rc = RuntimeConstants(model_context_window=65_536)
+    rc = LoopConstants(model_context_window=65_536)
     blobs = InMemoryBlobStore()
     llm = InMemoryLLMProvider()
     mgr = ContextManager(rc=rc, blob_store=blobs, compaction_llm=llm)
@@ -229,7 +229,7 @@ def test_observed_prompt_tokens_floors_compaction_gate() -> None:
 def test_observed_prompt_tokens_below_trigger_does_not_force_compaction() -> None:
     """A real measurement UNDER the trigger must not spuriously trip the gate;
     the floor is a max, never an override that ignores a healthy prompt."""
-    rc = RuntimeConstants(model_context_window=65_536)
+    rc = LoopConstants(model_context_window=65_536)
     blobs = InMemoryBlobStore()
     llm = InMemoryLLMProvider()
     mgr = ContextManager(rc=rc, blob_store=blobs, compaction_llm=llm)
@@ -247,7 +247,7 @@ def test_estimate_still_governs_when_it_exceeds_observed() -> None:
     """When the char estimate is the larger of the two (e.g. right after a
     resume with a stale-zero observation but a genuinely large history), the
     estimate still drives the gate — the floor is max(estimate, observed)."""
-    rc = RuntimeConstants(model_context_window=512)
+    rc = LoopConstants(model_context_window=512)
     blobs = InMemoryBlobStore()
     llm = InMemoryLLMProvider()
     mgr = ContextManager(rc=rc, blob_store=blobs, compaction_llm=llm)
@@ -278,7 +278,7 @@ async def test_run_compaction_tier1_failure_early_return_sets_tokens_after() -> 
     falsely telling operators the whole context was cleared."""
     from protocore.runtime.context.compaction import CompactionState
 
-    rc = RuntimeConstants(
+    rc = LoopConstants(
         model_context_window=4_096,
         # Generous retry budget so the failure early-returns (not raises).
         compaction_failed_max_retries=5,
@@ -319,7 +319,7 @@ async def test_run_compaction_tier1_failure_early_return_sets_tokens_after() -> 
 
 
 def _new_manager(*, cap: int) -> ContextManager:
-    rc = RuntimeConstants(pinned_tool_max_count=cap)
+    rc = LoopConstants(pinned_tool_max_count=cap)
     return ContextManager(
         rc=rc,
         blob_store=InMemoryBlobStore(),

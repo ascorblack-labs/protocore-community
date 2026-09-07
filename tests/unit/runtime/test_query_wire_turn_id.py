@@ -13,7 +13,7 @@ keep the LEGACY (unsuffixed) id because they run before the first round opens.
 from __future__ import annotations
 
 from protocore.contracts.hooks import HookActionKind, HookResult
-from protocore.contracts.runtime_constants import RuntimeConstants
+from protocore.contracts.runtime_constants import LoopConstants
 from protocore.contracts.types import (
     HookEvent,
     Message,
@@ -41,7 +41,7 @@ def _build_engine(
     run_mode: str = "direct",
     llm: InMemoryLLMProvider,
     hook_manager: InMemoryHookManager | None = None,
-    rc: RuntimeConstants | None = None,
+    rc: LoopConstants | None = None,
     run_id: str = "rw",
 ) -> QueryEngine:
     registry = InMemoryToolRegistry()
@@ -53,7 +53,7 @@ def _build_engine(
             tenant_id="tenant-test",
             session_id="sess-test",
             model_name="qwen3.6-35b-a3b",
-            rc=rc or RuntimeConstants(model_context_window=8_192),
+            rc=rc or LoopConstants(model_context_window=8_192),
             run_mode=run_mode,
             thinking_enabled=(run_mode == "deep"),
             reasoning_effort="low",

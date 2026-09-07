@@ -6,7 +6,7 @@
 > tool *contracts, names, dispatch, gating, retrieval, and ordering*. It ships a
 > few concrete tools whose entire surface **is** the protocol contract — ask-user
 > (`tools/ask_user.py`) and memory (`tools/memory.py`) — but it registers **no**
-> concrete *lean default*
+> concrete backend-bound
 > (sandbox / exec / read / write) tool itself; those production, backend-bound
 > tools live in the sibling the host repo. (The `IWorkspace` **contract** lives
 > in core, but its concrete tools are host-only — see the workspace
@@ -16,74 +16,11 @@
 The core deliberately keeps the agent-visible tool list **small and stable**: a
 small universal pool keeps the prompt cheap for smaller local models, and a
 deterministic ordering keeps the KV-prefix cache reusable across turns. For the
-*lean default* surface (sandbox / exec / read / write) the core registers no
+default backend-bound surface (sandbox / exec / read / write) the core registers no
 concrete tool — it defines the *shape* and the machinery that runs one tool call
 safely, and the host binds the backend-backed implementations. (The core does
 ship its own protocol-surface tools — ask-user and memory — see the
 [scope note](#tool-surface) above.)
-
----
-
-## The lean 7-verb surface
-
-`contracts/lean_tool_surface.py` defines a canonical pool of **exactly seven
-verbs**. A capable model hand-composes operations against the runtime instead of
-filling a dozen bespoke typed schemas. The names are stable, domain-neutral
-identifiers a backend SHOULD adopt verbatim so the agent-facing surface is
-uniform across backends.
-
-The constants `LEAN_TOOL_EXEC`, `LEAN_TOOL_READ`, `LEAN_TOOL_READ_SILENT`,
-`LEAN_TOOL_WRITE`, `LEAN_TOOL_FIND`, `LEAN_TOOL_SEARCH`, `LEAN_TOOL_ANSWER`
-collect into the ordered tuple `LEAN_TOOL_NAMES`:
-
-| Verb | Constant | What it does |
-|---|---|---|
-| `exec` | `LEAN_TOOL_EXEC` | Run a registered runtime binary by path with an argv list and optional stdin (`{path, args, stdin}`). This is **not** a `/bin/sh` — there is no shell metacharacter handling. The single power tool that lets one capable model invoke any runtime binary without a bespoke typed verb per operation. |
-| `read` | `LEAN_TOOL_READ` | Read a file/record **and record its path as observed evidence** (grounding-tracked). Use for any source you may cite. |
-| `read_silent` | `LEAN_TOOL_READ_SILENT` | Read a file/record **without** recording it as evidence. Identical content to `read`; only the grounding side effect differs. Lets the model browse or compare candidates without polluting its citation set. |
-| `write` | `LEAN_TOOL_WRITE` | Create or modify a file/record (the mutation verb). Optimistic-write backends may accept a content hash for compare-and-swap — a backend concern, not part of the universal name. |
-| `find` | `LEAN_TOOL_FIND` | Locate files/records by name or path pattern (filename-level discovery). |
-| `search` | `LEAN_TOOL_SEARCH` | Search file/record *contents* by query (content-level discovery). |
-| `answer` | `LEAN_TOOL_ANSWER` | Produce the final, terminal answer for the task with supporting citations (`{message, outcome, refs}`). Every lean surface MUST guarantee a terminal answer is always producible. |
-
-The `answer` verb's `outcome` field is a **free-form string** whose accepted
-values are defined by the backend's own answer contract — core owns only the
-field's *shape*, never a fixed value set.
-
-### Grounding-tracked reads
-
-`GROUNDING_TRACKED_TOOLS` is the frozenset `{read}` — only successful `read`
-calls record observed evidence:
-
-```python
-GROUNDING_TRACKED_TOOLS: frozenset[str] = frozenset({LEAN_TOOL_READ})
-```
-
-A downstream grounding/citation layer treats every recorded `read` path as
-observed evidence, so the model's own minimal reads become its citation set.
-`read_silent` returns identical content but is explicitly **not** recorded.
-Exposing this split as a core contract means any backend implements the same
-read-vs-browse discipline. A host adapter can assert its (non-)recording
-behaviour against this frozenset.
-
-### Profiles and backend binding
-
-Core owns only the *contracts and names*; it registers no concrete `Tool` for
-the lean pool. Helper functions build the canonical specs and validate the
-active profile:
-
-- `lean_tool_surface()` → the full pool as `ToolDefinition` specs, in
-  `LEAN_TOOL_NAMES` order (stable for cache reuse and deterministic tests).
-- `lean_tool_definition(name)` / `is_lean_tool(name)` — per-verb spec / membership.
-- `select_tool_surface_profile(profile)` — normalise the active profile to one
-  of `TOOL_SURFACE_PROFILES` (`"legacy"` | `"lean"`), falling back to the
-  behaviour-preserving `"legacy"` default for an unrecognised value.
-
-Whether a tenant sees the lean pool or a backend's pre-existing typed surface is
-governed by `RuntimeConstants.tool_surface_profile` plus per-tool
-`tool_surface_*_enabled` flags. The host binds each canonical name to a
-concrete backend. See [`runtime-constants.md`](runtime-constants.md) for how
-these flags are read.
 
 ---
 
@@ -107,11 +44,15 @@ async def echo(context: ToolContext, text: str) -> ToolResult:
     return ToolResult(tool_call_id="...", content=text)
 ```
 
+A result carries its canonical value and, beside it, projections for the model
+and for the client — see [Extending the Core](./extending.md) where those
+fields are worked through with an example.
+
 The wrapped function must be `async` — `@tool` raises `TypeError` otherwise.
 `echo` is now a `Tool` subclass whose `.definition` carries `name`,
 `description`, and the schema built from the `text: str` hint. The
-backend-backed *lean default* tools use this decorator but live in 
-the host package; the core itself registers no lean-default tool (though it
+backend-backed default tools use this decorator but live in
+the host package; the core itself registers none of them (though it
 does ship the ask-user / memory protocol-surface tools). For richer
 or stateful tools, implement the `Tool` ABC (`contracts/tools.py`) directly.
 
@@ -138,10 +79,10 @@ final item, a `DispatchOutcome`. The lifecycle:
    tool result; the caller transitions the loop to `AWAITING`.
 4. **Preconditions** — the tool's `ToolDefinition.preconditions` DAG is checked
    (below); an unsatisfied tool short-circuits to a failure when
-   `RuntimeConstants.tool_preconditions_enabled` is set.
+   `LoopConstants.tool_preconditions_enabled` is set.
 5. **Execute** — `tool.invoke(ctx)` wrapped in `asyncio.wait_for` honouring
    `rc.tool_timeout_seconds`.
-6. **`PostToolUse` hook** — fire-and-await; may rewrite the output.
+6. **The `post_tool_use` coordinate** — fire-and-await; may rewrite the output.
 
 `DispatchOutcome` (frozen) carries `success`, `content`, `is_error`,
 `error_kind`, `approval_required` / `approval_token`, `ask_user_required` /
@@ -157,7 +98,7 @@ A tool may attach a machine-readable `structured_error` dict (e.g.
 dispatch except-branch forwards it on `DispatchOutcome.metadata` and the loop
 surfaces a finalize hint to the model.
 
-See the [Tool dispatch + gating](architecture.md#tool-dispatch--gating) section
+See the [Tool dispatch + gating](architecture.md#dispatch-roles-the-canonical-result-and-pairing-repair) section
 for the event-emission contract.
 
 ---
@@ -178,22 +119,25 @@ no-op default:
 | 1 | `whitelist` | The `ToolVisibilityPolicy` (and any subagent narrowing whitelist) must permit the tool name — `blocked` always denies, `visible` (when non-empty) is a strict allow-list. |
 | 2 | `safety_policy` | Per-side-effect-class checks via the `IToolSafetyPolicy` chain. |
 | 3 | `rate_limit` | Host-only; the baseline is a no-op `allow`. Compose a Redis-backed bucket policy via `register_policy` to deny here. |
-| 4 | `hook` | The `PreToolUse` hook — the final, highest-leverage stage; it can flip `allow` → `deny` / `require_approval` / modify the args. Skipped when no hook manager is wired. |
+| 4 | `hook` | The `pre_tool_use` coordinate — the final, highest-leverage stage; it can flip `allow` → `deny` / `require_approval` / modify the args. Skipped when no hook manager is wired. |
 | — | `default` | The decision's StrEnum default value, used for the implicit `allow` when no stage objected. |
 
 A safety policy implements `IToolSafetyPolicy` — `applies_to(side_effect_class)`
 plus `evaluate(tool, arguments, ctx)`. The default policy stack contains exactly
 one policy:
 
-- `ShellSafetyPolicyAdapter` — wraps `DefaultShellSafetyPolicy`, inspecting
-  `arguments['command']` for the sandbox side-effect class.
+- `ShellSafetyPolicyAdapter` — wraps `DefaultShellSafetyPolicy`, inspecting the
+  argument the host declared as the shell command for tools carrying the
+  `runs_shell` role. A tool whose command spelling is undeclared is sent for
+  approval rather than run unexamined: the check cannot be skipped just because
+  the core does not know where to look.
 
 `HttpDnsAllowlistPolicy` and `WorkspacePathPolicy` are provided but **not** in
 the default stack; the host stacks them on at runtime via `register_policy`,
-which keeps the core API frozen. The gate is always on. The `PreToolUse` hook is
-the highest-leverage seam for an LLM-as-policy gate.
+which keeps the core API frozen. The gate is always on. The `pre_tool_use`
+coordinate is the highest-leverage seam for an LLM-as-policy gate.
 
-See the [Permission gate](architecture.md#permission-gate) section for the
+See the [Permission gate](architecture.md#dispatch-roles-the-canonical-result-and-pairing-repair) section for the
 gate's place in the dispatch flow and the side-effect class map.
 
 ---
@@ -231,12 +175,8 @@ retrieval order drives *selection*, but the emitted list is sorted by name so
 the LLM context stays byte-stable and the KV-prefix cache survives across turns.
 The clip threshold is the RC `tool_retrieval_top_k` passed by the loop.
 
-> `runtime/tool_pool.py` (`assemble_tool_pool`) is a parallel assembler that is
-> **not** wired into the loop; the loop uses `compute_effective_surface`. It has
-> callers only in tests and a re-export.
-
 See the
-[Tool retrieval / pool / registry / 3-layer surface](architecture.md#tool-retrieval--pool--registry--3-layer-surface)
+[Tool retrieval / pool / registry / 3-layer surface](architecture.md#technology-inventory)
 section for the retrieval internals.
 
 ---
@@ -247,53 +187,98 @@ Preconditions enforce tool **ordering**: a tool that requires a prior
 observation is masked until its precondition is satisfied, so the model cannot,
 for example, mutate a record before reading the governing policy.
 
-There are three systems; they never interact:
+There are two systems; they never interact:
 
 - **Runtime DAG** — `runtime/tool_preconditions.py` (`check_preconditions`,
   `resolve_precondition`, `record_satisfaction`, `compute_masked_tools`,
-  `load_satisfied_set` / `store_satisfied_set`). A tool's `preconditions` are
-  read from its `ToolDefinition`; the satisfied set is round-tripped through the
-  engine helper-bag so it survives snapshot/resume. This layer is consumed in
+  `derive_satisfied_from_messages`). A tool's `preconditions` are
+  read from its `ToolDefinition`; the satisfied set is replayed from the run's
+  own messages, so it survives snapshot/resume without being persisted at all.
+  This layer is consumed in
   the dispatch path (step 4 above) and is gated by
-  `RuntimeConstants.tool_preconditions_enabled` (default `False`). It
+  `LoopConstants.tool_preconditions_enabled` (default `False`). It
   **blocks** a tool the model chose.
-- **Declarative spec** — `contracts/tool_action_preconditions.py` holds the
-  typed, string-payload rule spec: `ToolActionPreconditionSpec` /
-  `ToolActionPreconditionRule` / `ToolActionPreconditionPredicate` /
-  `ToolActionPreconditionResult`, with the predicate kinds
-  `PREDICATE_KIND_ARGS_MATCH`, `PREDICATE_KIND_REF_OBSERVED`, and
-  `PREDICATE_KIND_DOC_OBSERVED` (collected in `ALL_PREDICATE_KINDS`). This
-  targets *argument-pattern + observed-state* preconditions (e.g. a mutating
-  binary may only run after a specific document was observed in this run). Rule
-  `kind` strings are forward-compatible: an unknown kind is a runtime no-op
-  rather than a snapshot-rejecting validation error. Wired only as RC types
-  plus a host evaluator — no core loop code reads the spec directly.
-  Mode: `tool_action_preconditions_mode` (`off | shadow | block`, default
-  `off`).
 - **Run-level forcer** — `runtime/run_tool_preconditions.py` plus
   `QueryEngineConfig.tool_preconditions`. An ordered tuple of tools this run
   **must** call before the agent is free to answer; while an entry is
   outstanding the loop sets `LLMRequest.extra['forced_tool_choice']`. Empty
   (the default) is a no-op. This **forces** a tool the model did not choose.
 
-See the [Tool preconditions](architecture.md#tool-preconditions-dag--action-spec--run-level-forcer)
+See the [Tool preconditions](architecture.md#technology-inventory)
 section for the precondition mechanism.
+
+---
+
+## What a tool declares: roles, and what its result is
+
+**Roles, not names.** The runtime asks what a call DOES, never what it is
+called. `contracts/tool_roles.py` is where that is said: `ToolRole` is the
+capability (`reads_path`, `writes_path`, `appends_path`, `edits_path`,
+`finalizes_path`, `searches_workspace`, `runs_shell`, `fetches_url`,
+`delegates_work`, `records_plan`, `discovers_tools`, `asks_user`,
+`never_delegated`), and `ToolRoleMap` — passed in as
+`QueryEngineConfig.tool_roles` — is the host's declaration of which of ITS tool
+names carry which of them. The map also carries the argument spellings that go
+with those roles (`ToolArgumentSlot`): which key holds the shell command, which
+holds the body of a write, which holds a terminal tool's answer. The runtime
+reads raw arguments before any input model has resolved an alias, so it has to
+be told them rather than guess.
+
+Every comparison of a tool name against a string spelled inside the core used to
+assume that every installation names its tools the way the first one did. A host
+that called its shell tool something else lost the shell deny-patterns, its
+large-file writes stopped converging, and nothing anywhere said so — the
+comparison simply never matched. A role the map does not mention is now a
+capability this installation does not have, and the feature that needs it says
+so in a warning rather than going quietly inert.
+
+The same map bounds a delegated run:
+`runtime/child_capabilities.py::narrow_child_capabilities` computes what a child
+may do from its parent and its `SubagentDef`, narrowing only. It is applied
+twice — when the child's catalogue is resolved and again on each of the child's
+calls — because the catalogue keeps a child from being shown what it may not
+have, and the gate keeps it from having what it was not shown.
+
+**One value, three audiences.** `ToolResult.content` is the canonical value,
+complete whatever its size. The projections sit beside it: `model_projection`
+is what the transcript carries in its place (the first page of a long listing,
+`wrote 4.2 MB to <path>` for bytes the model has no use for reading back);
+`ui_payload` rides the result event and never enters the transcript, so a whole
+rendered table costs no tokens and cannot change what the model decides;
+`canonical_ref` names a blob the whole value can be fetched back from — and when
+a tool names none, compaction stores the value itself at the moment it first
+needs the room and fills this in on the block it rewrites. A tool that names no
+projection says the value is small enough to be its own, which is the common
+case and costs it nothing.
+
+**A record before the call.** Every dispatched call commits an `IntentRecord`
+(`runtime/intent.py`) before the tool is touched, with its result ids reserved
+and an explicit lifecycle — `RESERVED`, `PENDING_APPROVAL`, `DISPATCHED`,
+`PAUSED_ASK_USER`, `SETTLED`. That is what lets a resumed run tell apart a call
+that never started, one whose outcome is genuinely unknown, and one that is
+waiting on an answer. Guessing costs correctness in the worst direction:
+reporting an interrupted call as failed invites the model to repeat it, and a
+repeated call with a side effect applies that effect twice.
 
 ---
 
 ## Extending the tool surface
 
 - **Add a tool:** implement the `Tool` ABC (`contracts/tools.py`) or use `@tool`;
-  register the resulting `ToolDefinition` with the `IToolRegistry`. For a lean
-  agent-facing surface, adopt the canonical names from `LEAN_TOOL_NAMES` for
-  cross-backend uniformity.
+  register the resulting `ToolDefinition` with the `IToolRegistry`.
 - **Control visibility:** set `visible` / `blocked` / `pinned` on a
   `ToolVisibilityPolicy`.
 - **Add a safety check:** implement `IToolSafetyPolicy` and register it with
   `ToolPermissionGate.register_policy` — it evaluates after the defaults; the
   core gate stays frozen.
-- **Gate by observed state:** ship a `ToolActionPreconditionSpec` via the
-  precondition RCs (a host evaluator runs it).
+- **Declare what it does:** add the tool's `ToolRole`s and argument slots to the
+  `ToolRoleMap` you pass as `QueryEngineConfig.tool_roles`. A tool the map does
+  not describe still runs; what it loses is every behaviour that depends on
+  knowing what kind of call it is.
+- **Gate by observed state:** a rule keyed on an argument pattern plus
+  something already observed in the run is a **host** evaluator bound at the
+  lifecycle seam, not a core mechanism. The core's two precondition systems are
+  the DAG and the run-level forcer above.
 
 See [`extending.md`](extending.md) for the broader "pick your seam" guide and
 the import-boundary rule.

@@ -29,8 +29,9 @@ from typing import Any
 
 import pytest
 
+from protocore.contracts.interrupt import InterruptResolutionError
 from protocore.contracts.llm import LLMRequest, LLMStreamEvent
-from protocore.contracts.runtime_constants import RuntimeConstants
+from protocore.contracts.runtime_constants import LoopConstants
 from protocore.contracts.types import (
     SESSION_HISTORY_SEED_METADATA_KEY,
     SYNTHETIC_RECOVERY_METADATA_KEY,
@@ -44,19 +45,19 @@ from protocore.contracts.types import (
     ToolResultBlock,
     ToolUseBlock,
 )
-from protocore.runtime.context.compaction import (
-    _session_history_seed_indices,
-    _tool_name_by_call_id,
-)
+from protocore.runtime.context.compaction import _session_history_seed_indices
 from protocore.runtime.longfile_convergence import _active_file_tail
 from protocore.runtime.query import (
+    _apply_updated_input,
     _assert_history_has_matching_pending_tool_use,
     _history_has_tool_result,
     _history_tool_result_is_terminal,
     _prose_gate_just_injected,
+    _tool_call_from_history,
     _tool_name_for_call_id,
 )
 from protocore.runtime.query_engine import QueryEngine
+from protocore.runtime.result_eviction import tool_name_for_result
 
 #: The other half of the pin. The registry names the test that holds each
 #: run-scope claim; each test names, here, the entries it was written to hold.
@@ -71,13 +72,16 @@ PINNED_ENTRIES: dict[str, tuple[str, ...]] = {
         "protocore/runtime/query_engine.py::QueryEngine.run",
     ),
     "test_prose_gate_reads_the_tail_and_not_a_seeded_turn": (
-        "protocore/runtime/query.py::_prose_gate_just_injected",
+        "protocore/runtime/turn_policies/sibling_walk.py::prose_gate_just_injected",
     ),
     "test_call_id_lookups_resolve_the_call_they_are_asked_for": (
         "protocore/runtime/query.py::_tool_name_for_call_id",
         "protocore/runtime/query.py::_history_has_tool_result",
         "protocore/runtime/query.py::_history_tool_result_is_terminal",
-        "protocore/runtime/context/compaction.py::_tool_name_by_call_id",
+    ),
+    "test_interrupt_resolution_is_keyed_on_the_parked_call": (
+        "protocore/runtime/query.py::_tool_call_from_history",
+        "protocore/runtime/query.py::_apply_updated_input",
     ),
     "test_pending_tool_use_assertion_is_keyed_on_the_approved_call": (
         "protocore/runtime/query.py::_assert_history_has_matching_pending_tool_use",
@@ -172,7 +176,7 @@ async def test_latest_user_message_is_this_runs_task_not_a_seeded_one(
     perfectly healthy-looking COMPLETED run.
     """
     llm = _PlainTextEndTurnLLM()
-    engine: QueryEngine = engine_factory(rc=RuntimeConstants(model_context_window=4_096))
+    engine: QueryEngine = engine_factory(rc=LoopConstants(model_context_window=4_096))
     engine.llm = llm  # type: ignore[assignment]
 
     # Exactly what the executor splices in: a prior run of the same session,
@@ -290,13 +294,10 @@ def _transcript_with_two_runs_of_tool_calls() -> list[Message]:
 def test_call_id_lookups_resolve_the_call_they_are_asked_for(engine_factory) -> None:
     """A tool_call_id names one call, so these lookups span the whole session.
 
-    Four registry entries rest on this — ``_tool_name_for_call_id``,
-    ``_history_has_tool_result``, ``_history_tool_result_is_terminal`` and
-    compaction's ``_tool_name_by_call_id``, which makes the same argument in
-    the same words and was classified whole-transcript with no pin. Two
-    identical arguments filed two different ways in one registry is a working
-    demonstration that the argument needs no pin, sitting in the data the next
-    author will copy from.
+    Three registry entries rest on this — ``_tool_name_for_call_id``,
+    ``_history_has_tool_result`` and ``_history_tool_result_is_terminal``.
+    The name lookup itself is the one shared ``tool_name_for_result``; the
+    engine-facing wrapper only supplies the history.
 
     The claim is not "the seed cannot be reached"; it is that reaching it is
     harmless because the id decides the answer. Both halves are asserted: each
@@ -320,23 +321,55 @@ def test_call_id_lookups_resolve_the_call_they_are_asked_for(engine_factory) -> 
     assert _history_tool_result_is_terminal(engine, "cur-append") is False
     assert _history_tool_result_is_terminal(engine, "never-issued") is False
 
-    # Compaction's twin, keyed the same way over the same transcript: every id
+    # The shared lookup, keyed the same way over the same transcript: every id
     # resolves to ITS OWN tool name, so a seeded call's name can never be the
-    # one written into this run's placeholder.
-    by_id = _tool_name_by_call_id(engine.history)
-    assert by_id["cur-append"] == "AppendFile"
-    assert by_id["prior-final"] == "final_answer"
-    assert "never-issued" not in by_id
+    # one written into this run's compaction placeholder.
+    assert tool_name_for_result(engine.history, "cur-append") == "AppendFile"
+    assert tool_name_for_result(engine.history, "prior-final") == "final_answer"
+    assert tool_name_for_result(engine.history, "never-issued") is None
+
+
+def test_interrupt_resolution_is_keyed_on_the_parked_call(engine_factory) -> None:
+    """Resolving an interrupt reaches the call its id names, and no other.
+
+    Two registry entries rest on this. Both walk the whole transcript, and
+    both are handed a tool_call_id — so the seeded prior run is exactly what
+    could break them: rebuilding a prior run's call would dispatch a tool this
+    run never asked for, and rewriting a prior run's arguments would edit a
+    transcript that is already settled.
+    """
+    engine: QueryEngine = engine_factory()
+    engine.history = _transcript_with_two_runs_of_tool_calls()
+
+    rebuilt = _tool_call_from_history(engine, "cur-append")
+    assert rebuilt.name == "AppendFile"
+    assert rebuilt.arguments == {"path": "report.md", "content": "x"}
+
+    # A seeded call resolves to ITS OWN call, never to this run's.
+    seeded = _tool_call_from_history(engine, "prior-final")
+    assert seeded.name == "final_answer"
+
+    with pytest.raises(InterruptResolutionError, match="not in this run's history"):
+        _tool_call_from_history(engine, "never-issued")
+
+    corrected = _apply_updated_input(engine, rebuilt, {"path": "fixed.md"})
+    assert corrected.arguments == {"path": "fixed.md"}
+    # The correction landed on the call it was asked for, and the seeded call
+    # beside it is untouched.
+    assert _tool_call_from_history(engine, "cur-append").arguments == {"path": "fixed.md"}
+    assert _tool_call_from_history(engine, "prior-final").arguments == {"message": "done"}
 
 
 def test_pending_tool_use_assertion_is_keyed_on_the_approved_call(
     engine_factory,
 ) -> None:
-    """The approval check matches ONE call id, name and argument payload.
+    """The approval check matches a PARKED call id, name and argument payload.
 
     Its reason is a structural claim, and the seeded prior run is the thing
     that could break it: a prior run's approved call must neither satisfy this
-    run's approval nor be mistaken for a mismatch.
+    run's approval nor be mistaken for a mismatch. Membership is read off the
+    open set, so a batch of parked calls admits each of them by name and a
+    call that was never parked is still refused.
     """
     engine: QueryEngine = engine_factory()
     arguments = {"path": "report.md", "content": "x"}
@@ -347,7 +380,7 @@ def test_pending_tool_use_assertion_is_keyed_on_the_approved_call(
         engine, ToolCall(id="cur-append", name="AppendFile", arguments=arguments)
     )
 
-    with pytest.raises(ValueError, match="not the pending approval"):
+    with pytest.raises(ValueError, match="not a parked approval"):
         _assert_history_has_matching_pending_tool_use(
             engine,
             ToolCall(id="prior-final", name="final_answer", arguments={"message": "done"}),

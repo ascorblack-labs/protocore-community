@@ -32,7 +32,7 @@ from typing import Any
 import pytest
 
 from protocore.contracts.llm import LLMStreamEvent
-from protocore.contracts.runtime_constants import RuntimeConstants
+from protocore.contracts.runtime_constants import LoopConstants
 from protocore.contracts.types import (
     SYNTHETIC_RECOVERY_METADATA_KEY,
     SYNTHETIC_RECOVERY_PROSE_GATE_REPAIR,
@@ -156,7 +156,7 @@ def _build(engine_factory, in_memory_runtime, **rc_kwargs: Any):
         )
     )
     engine = engine_factory(
-        rc=RuntimeConstants(model_context_window=1_048_576, **rc_kwargs)
+        rc=LoopConstants(model_context_window=1_048_576, **rc_kwargs)
     )
     return engine, in_memory_runtime["llm"]
 
@@ -217,7 +217,7 @@ def test_the_measured_shape_is_what_these_tests_claim_it_is() -> None:
     that quietly moved one of them would leave the tests passing for the wrong
     reason.
     """
-    rc = RuntimeConstants()
+    rc = LoopConstants()
     assert len(ARTICLE) == 13_031
     assert len(ARTICLE) >= rc.finalize_prose_gate_pointer_min_written_chars
     # The notice clears the length floor and is still a fraction of the article.
@@ -284,7 +284,7 @@ async def test_a_filing_notice_after_a_large_write_buys_one_more_turn(
     assert len(_repair_turns(engine)) == 1
     assert (
         _repair_turns(engine)[0].content_blocks[0].text
-        == engine.config.rc.finalize_prose_gate_repair_text
+        == engine.prompt_text("finalize_prose_gate_repair")
     )
     # The answer is in history, and the notice was not retracted — the floor
     # asks for more, it never erases what the model already said.
@@ -702,7 +702,7 @@ def _write_args(path: str, content: str) -> str:
 
 def _hidden(engine_factory, **rc_kwargs: Any):
     return engine_factory(
-        rc=RuntimeConstants(
+        rc=LoopConstants(
             model_context_window=1_048_576,
             workspace_visible_to_user=False,
             **rc_kwargs,
@@ -848,7 +848,7 @@ def test_the_length_floor_still_does_its_own_job(engine_factory) -> None:
     """Nothing here narrows what was already caught: a run that did work and
     then said almost nothing still trips the floor, with no file in sight."""
     engine = engine_factory(
-        rc=RuntimeConstants(
+        rc=LoopConstants(
             model_context_window=4_096,
             workspace_visible_to_user=False,
             finalize_prose_gate_min_chars=400,
@@ -900,7 +900,7 @@ def test_the_dispatch_seam_refuses_the_same_reply(
         )
     )
     engine = engine_factory(
-        rc=RuntimeConstants(
+        rc=LoopConstants(
             model_context_window=1_048_576, workspace_visible_to_user=False
         ),
         expected_terminal_tool="Finalize",
@@ -911,7 +911,7 @@ def test_the_dispatch_seam_refuses_the_same_reply(
     assert _finalize_prose_gate_applies(engine, call) is False
 
     pointer_run = engine_factory(
-        rc=RuntimeConstants(
+        rc=LoopConstants(
             model_context_window=1_048_576, workspace_visible_to_user=False
         ),
         expected_terminal_tool="Finalize",
@@ -964,7 +964,7 @@ def test_a_spent_pointer_budget_does_not_bind_the_short_answer_floor(
     burnt every pointer attempt on one file may still be corrected for a reply
     that is simply too short to be an answer at all."""
     engine = engine_factory(
-        rc=RuntimeConstants(
+        rc=LoopConstants(
             model_context_window=4_096,
             workspace_visible_to_user=False,
             finalize_prose_gate_min_chars=HIGH_FLOOR,

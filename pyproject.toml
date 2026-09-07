@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "protocore"
-version = "2.0.0a3"
+version = "2.0.0a4"
 description = "Protocol-first pure core for LLM agent orchestration"
 readme = "README.en.md"
 requires-python = ">=3.12"
@@ -23,7 +23,6 @@ classifiers = [
 ]
 dependencies = [
     "pydantic>=2.7",
-    "pluggy>=1.5",
     "typing-extensions>=4.12",
     # Jinja2 prompt template rendering.
     # ``SandboxedEnvironment`` + ``StrictUndefined`` are the hard requirements.
@@ -31,10 +30,18 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+# What a host installs to run ``protocore.conformance`` against its own
+# adapters. Deliberately narrow: the suites need a test runner and nothing else,
+# so a host does not inherit the core's linting and typing toolchain to use them.
+testing = [
+    "pytest>=8.2",
+    "pytest-asyncio>=0.23",
+]
 dev = [
     "pytest>=8.2",
     "pytest-asyncio>=0.23",
     "pytest-cov>=5.0",
+    "pytest-xdist>=3.6",
     "mypy>=1.10",
     "ruff>=0.4",
     "bandit>=1.7",
@@ -151,3 +158,10 @@ exclude_also = [
     "if TYPE_CHECKING:",
 ]
 omit = ["*/__init__.py"]
+
+[tool.bandit.assert_used]
+# The conformance package is a pytest suite that ships inside the wheel, so it
+# is scanned along with the rest of the package. Its body is assertions — that
+# is what a suite is — and B101's warning is about production code compiled with
+# -O, not about a test. Every other check still applies to those files.
+skips = ["*/conformance/*.py"]

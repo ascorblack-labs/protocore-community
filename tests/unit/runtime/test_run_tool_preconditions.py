@@ -27,7 +27,7 @@ from typing import Any
 import pytest
 
 from protocore.contracts.llm import LLMRequest, LLMStreamEvent
-from protocore.contracts.runtime_constants import RuntimeConstants
+from protocore.contracts.runtime_constants import LoopConstants
 from protocore.contracts.tools import Tool, ToolContext
 from protocore.contracts.types import (
     Message,
@@ -159,7 +159,7 @@ class _ScriptedLLM:
 def _build_engine(
     *,
     llm: _ScriptedLLM,
-    rc: RuntimeConstants,
+    rc: LoopConstants,
     preconditions: tuple[ToolPrecondition, ...] = (),
 ) -> QueryEngine:
     engine = QueryEngine(
@@ -182,8 +182,8 @@ def _build_engine(
     return engine
 
 
-def _rc(**overrides: Any) -> RuntimeConstants:
-    return RuntimeConstants(model_context_window=8_192, **overrides)
+def _rc(**overrides: Any) -> LoopConstants:
+    return LoopConstants(model_context_window=8_192, **overrides)
 
 
 async def _run(engine: QueryEngine) -> list[Any]:

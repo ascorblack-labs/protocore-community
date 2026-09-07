@@ -2,10 +2,11 @@
 from __future__ import annotations
 
 import re
+from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Literal
 
-from protocore.contracts.runtime_constants import RuntimeConstants
+from protocore.contracts.runtime_constants import LoopConstants
 
 GrantKind = Literal["exact", "program", "multiplexer_verb"]
 _METACHAR = re.compile(r"[|&;<>`$(){}]|&&|\|\|")
@@ -20,6 +21,26 @@ class CommandGrant:
     def to_dict(self) -> dict[str, str]:
         return {"kind": self.kind, "value": self.value}
 
+    @classmethod
+    def from_dict(cls, raw: Mapping[str, object]) -> CommandGrant:
+        """Read back a grant this class wrote.
+
+        A grant crosses a process boundary as the two strings ``to_dict``
+        names, and whoever picks it up needs the object again: the match is
+        made by :func:`grant_covers`, which asks the grant for its kind. A row
+        naming a kind this build does not have is read as ``exact`` — the
+        narrowest of the three, so an unreadable grant widens nothing.
+        """
+        kind = str(raw.get("kind", "exact"))
+        narrowed: GrantKind = (
+            "program"
+            if kind == "program"
+            else "multiplexer_verb"
+            if kind == "multiplexer_verb"
+            else "exact"
+        )
+        return cls(narrowed, str(raw.get("value", "")))
+
 
 def has_metachar_or_env(command: str) -> bool:
     stripped = command.strip()
@@ -29,7 +50,7 @@ def has_metachar_or_env(command: str) -> bool:
     return bool(_ENV_ASSIGN.match(first) or re.match(r"^[A-Za-z_][A-Za-z0-9_]*=", first))
 
 
-def preview_widen(command: str, rc: RuntimeConstants) -> CommandGrant:
+def preview_widen(command: str, rc: LoopConstants) -> CommandGrant:
     """What a widen button would store. Metachar / VAR= stay exact."""
     parts = command.strip().split()
     if not parts or has_metachar_or_env(command):
@@ -68,7 +89,7 @@ def apply_widen(
     command: str,
     *,
     kind: GrantKind,
-    rc: RuntimeConstants,
+    rc: LoopConstants,
 ) -> list[CommandGrant]:
     if not rc.permission_widening_enabled:
         raise ValueError("permission_widening_disabled")

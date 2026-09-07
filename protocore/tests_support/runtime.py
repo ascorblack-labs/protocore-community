@@ -13,7 +13,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any
 
-from protocore.contracts.runtime_constants import RuntimeConstants
+from protocore.contracts.runtime_constants import LoopConstants
 from protocore.events import EventBus
 from protocore.runtime.runtime_constants import (
     StaticRuntimeConstantsProvider,
@@ -43,7 +43,7 @@ class InMemoryRuntime:
  """
 
     tenant_id: str
-    rc: RuntimeConstants
+    rc: LoopConstants
     rc_provider: StaticRuntimeConstantsProvider
     event_bus: EventBus
     llm: InMemoryLLMProvider

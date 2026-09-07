@@ -1,300 +1,395 @@
-"""Tests for :class:`HookManager` dispatch + isolation."""
+"""The lifecycle registry: order, scope, disposal, and the exception policy."""
 from __future__ import annotations
 
+import asyncio
 from typing import Any
 
-from protocore.contracts.hooks import HookActionKind
+import pytest
+
+from protocore.contracts.middleware import (
+    LifecycleContext,
+    LifecycleDecision,
+    LifecycleScope,
+    LifecycleVerdict,
+    RegistrationKind,
+)
 from protocore.contracts.types import HookEvent
-from protocore.hooks import HookManager, hookimpl
+from protocore.hooks import HookManager, refuse_lifecycle_when_disabled
 
 
-class _Counter:
-    """Per-hook invocation counter."""
-
-    def __init__(self) -> None:
-        self.tool_use_count = 0
-        self.session_count = 0
-
-
-class _GoodPlugin:
-    def __init__(self, counter: _Counter) -> None:
-        self._counter = counter
-
-    @hookimpl
-    async def pre_tool_use(
-        self,
-        tool_name: str,
-        arguments: dict[str, Any],
-        context: dict[str, Any],
-    ) -> dict[str, Any]:
-        self._counter.tool_use_count += 1
-        return {"action": HookActionKind.ALLOW, "reason": "noted"}
-
-    @hookimpl
-    async def session_start(self, session_id: str, context: dict[str, Any]) -> dict[str, Any]:
-        self._counter.session_count += 1
-        return {"action": HookActionKind.ALLOW}
-
-
-class _DenyPlugin:
-    @hookimpl
-    async def pre_tool_use(
-        self,
-        tool_name: str,
-        arguments: dict[str, Any],
-        context: dict[str, Any],
-    ) -> dict[str, Any]:
-        return {
-            "action": HookActionKind.DENY,
-            "reason": "blocked by safety",
-        }
-
-
-class _BadPlugin:
-    @hookimpl
-    async def pre_tool_use(
-        self,
-        tool_name: str,
-        arguments: dict[str, Any],
-        context: dict[str, Any],
-    ) -> dict[str, Any]:
-        raise RuntimeError("hook explodes")
-
-
-async def test_register_and_invoke_allow() -> None:
-    mgr = HookManager()
-    counter = _Counter()
-    mgr.register(_GoodPlugin(counter), name="good")
-    result = await mgr.invoke(
-        HookEvent.pre_tool_use,
-        {"tool_name": "Bash", "arguments": {}, "context": {}},
+def _ctx(point: HookEvent = HookEvent.pre_tool_use, **payload: Any) -> LifecycleContext:
+    return LifecycleContext(
+        point=point,
+        run_id="run-1",
+        session_id="sess-1",
+        tenant_id="tenant-1",
+        payload=payload,
     )
-    assert result.action == HookActionKind.ALLOW
-    assert counter.tool_use_count == 1
 
 
-async def test_invoke_session_start() -> None:
-    mgr = HookManager()
-    counter = _Counter()
-    mgr.register(_GoodPlugin(counter), name="good")
-    await mgr.invoke(HookEvent.session_start, {"session_id": "s1", "context": {}})
-    assert counter.session_count == 1
+@pytest.mark.asyncio
+async def test_an_empty_coordinate_allows_and_returns_the_payload_it_got() -> None:
+    manager = HookManager()
+    outcome = await manager.dispatch(_ctx(tool_name="Read"))
+    assert outcome.allowed
+    assert outcome.payload == {"tool_name": "Read"}
+    assert outcome.failures == ()
 
 
-async def test_deny_short_circuits() -> None:
-    mgr = HookManager()
-    counter = _Counter()
-    mgr.register(_DenyPlugin(), name="deny")
-    mgr.register(_GoodPlugin(counter), name="good")
-    result = await mgr.invoke(
+@pytest.mark.asyncio
+async def test_registrations_run_by_priority_then_registration_order() -> None:
+    manager = HookManager()
+    seen: list[str] = []
+    for owner, priority in (("c", 50), ("a", 10), ("b", 10)):
+        manager.register(
+            HookEvent.pre_tool_use,
+            RegistrationKind.observe,
+            lambda _ctx, name=owner: seen.append(name),
+            owner=owner,
+            priority=priority,
+        )
+    await manager.dispatch(_ctx())
+    assert seen == ["a", "b", "c"]
+
+
+@pytest.mark.asyncio
+async def test_a_decide_registration_denies_and_names_its_owner() -> None:
+    manager = HookManager()
+    manager.register(
         HookEvent.pre_tool_use,
-        {"tool_name": "Bash", "arguments": {}, "context": {}},
+        RegistrationKind.decide,
+        lambda _ctx: LifecycleDecision(
+            verdict=LifecycleVerdict.deny, reason="not that tool"
+        ),
+        owner="policy",
     )
-    assert result.action == HookActionKind.DENY
-    assert "blocked by safety" in result.reason
-
-
-async def test_handler_exception_isolated() -> None:
-    mgr = HookManager()
-    counter = _Counter()
-    mgr.register(_BadPlugin(), name="bad")
-    mgr.register(_GoodPlugin(counter), name="good")
-    result = await mgr.invoke(
+    ran_after = []
+    manager.register(
         HookEvent.pre_tool_use,
-        {"tool_name": "Bash", "arguments": {}, "context": {}},
+        RegistrationKind.decide,
+        lambda _ctx: ran_after.append(1),
+        owner="second",
+        priority=200,
     )
-    # A crashed handler must NOT break siblings: the good plugin still
-    # records and the aggregate stays ALLOW (allow-vs-deny on crash is a
-    # failure_mode decision left to the host adapter).
-    assert result.action == HookActionKind.ALLOW
-    assert counter.tool_use_count == 1
-    # : the crash must be SURFACED, not silently swallowed — an
-    # error record lands in raw_results so a consumer can observe it.
-    error_records = [r for r in result.raw_results if r.get("outcome") == "error"]
-    assert len(error_records) == 1
-    assert error_records[0]["event"] == HookEvent.pre_tool_use.value
-    assert "hook explodes" in error_records[0]["error"]
+    outcome = await manager.dispatch(_ctx())
+    assert outcome.verdict is LifecycleVerdict.deny
+    assert outcome.decided_by == "policy"
+    assert outcome.reason == "not that tool"
+    assert ran_after == []
 
 
-async def test_crashed_handler_surfaced_even_when_no_other_handler() -> None:
-    """: a lone crashing handler must still surface an error record
-    (a crashed deny hook fails open but the operator can see it broke)."""
-    mgr = HookManager()
-    mgr.register(_BadPlugin(), name="bad")
-    result = await mgr.invoke(
+@pytest.mark.asyncio
+async def test_a_decide_registration_that_raises_denies() -> None:
+    """Fail closed: a seam that cannot answer has not said yes."""
+    manager = HookManager()
+
+    def _explode(_ctx: LifecycleContext) -> None:
+        raise RuntimeError("executor unreachable")
+
+    manager.register(
         HookEvent.pre_tool_use,
-        {"tool_name": "Bash", "arguments": {}, "context": {}},
+        RegistrationKind.decide,
+        _explode,
+        owner="judge",
     )
-    assert result.action == HookActionKind.ALLOW
-    error_records = [r for r in result.raw_results if r.get("outcome") == "error"]
-    assert len(error_records) == 1
-    assert error_records[0]["outcome"] == "error"
-    assert error_records[0]["event"] == HookEvent.pre_tool_use.value
+    outcome = await manager.dispatch(_ctx())
+    assert outcome.verdict is LifecycleVerdict.deny
+    assert outcome.decided_by == "judge"
+    assert "executor unreachable" in outcome.reason
+    assert [item.isolated for item in outcome.failures] == [False]
 
 
-def test_all_10_hook_events_in_enum() -> None:
-    """10 events total: 8 base + subagent_start/stop."""
-    values = {ev.value for ev in HookEvent}
-    expected = {
-        "pre_tool_use",
-        "post_tool_use",
-        "user_prompt_submit",
-        "session_start",
-        "session_end",
-        "pre_compact",
-        "post_compact",
-        "file_changed",
-        "subagent_start",
-        "subagent_stop",
-    }
-    assert values == expected
-    assert len(values) == 10
+@pytest.mark.asyncio
+async def test_a_decide_registration_that_overruns_denies() -> None:
+    manager = HookManager()
+
+    async def _slow(_ctx: LifecycleContext) -> LifecycleDecision:
+        await asyncio.sleep(5)
+        return LifecycleDecision()
+
+    manager.register(
+        HookEvent.pre_tool_use,
+        RegistrationKind.decide,
+        _slow,
+        owner="slow-judge",
+        timeout_s=0.01,
+    )
+    outcome = await manager.dispatch(_ctx())
+    assert outcome.verdict is LifecycleVerdict.deny
+    assert "timed out" in outcome.reason
 
 
-def test_registered_lists_names() -> None:
-    mgr = HookManager()
-    counter = _Counter()
-    mgr.register(_GoodPlugin(counter), name="good")
-    assert "good" in mgr.registered()
+@pytest.mark.asyncio
+async def test_a_decide_registration_that_answers_nonsense_denies() -> None:
+    manager = HookManager()
+    manager.register(
+        HookEvent.pre_tool_use,
+        RegistrationKind.decide,
+        lambda _ctx: 17,
+        owner="confused",
+    )
+    outcome = await manager.dispatch(_ctx())
+    assert outcome.verdict is LifecycleVerdict.deny
+    assert "not a decision" in outcome.reason
 
 
-class _ModifyPlugin:
-    @hookimpl
-    async def pre_tool_use(
-        self,
-        tool_name: str,
-        arguments: dict[str, Any],
-        context: dict[str, Any],
-    ) -> dict[str, Any]:
-        return {
-            "action": HookActionKind.MODIFY,
-            "reason": "patched args",
-            "modifications": {"tool_name": "BashSafe"},
-        }
+@pytest.mark.asyncio
+async def test_an_observing_registration_that_raises_changes_nothing() -> None:
+    manager = HookManager()
+
+    def _explode(_ctx: LifecycleContext) -> None:
+        raise RuntimeError("audit sink down")
+
+    manager.register(
+        HookEvent.pre_tool_use, RegistrationKind.observe, _explode, owner="audit"
+    )
+    outcome = await manager.dispatch(_ctx(tool_name="Read"))
+    assert outcome.allowed
+    assert outcome.payload == {"tool_name": "Read"}
+    assert [item.isolated for item in outcome.failures] == [True]
+    assert outcome.failures[0].owner == "audit"
 
 
-class _IgnoredReturnPlugin:
-    """Returns non-dict / None — should be ignored."""
+@pytest.mark.asyncio
+async def test_a_notifying_registration_that_raises_changes_nothing() -> None:
+    manager = HookManager()
+    manager.register(
+        HookEvent.post_tool_use,
+        RegistrationKind.notify,
+        lambda _ctx: (_ for _ in ()).throw(RuntimeError("webhook 500")),
+        owner="webhook",
+    )
+    outcome = await manager.dispatch(_ctx(HookEvent.post_tool_use, ok=True))
+    assert outcome.allowed
+    assert outcome.failures[0].isolated is True
 
-    @hookimpl
-    async def pre_tool_use(
-        self,
-        tool_name: str,
-        arguments: dict[str, Any],
-        context: dict[str, Any],
-    ) -> Any:
-        return "not-a-dict"
+
+@pytest.mark.asyncio
+async def test_a_transform_replaces_the_payload_for_everyone_downstream() -> None:
+    manager = HookManager()
+    manager.register(
+        HookEvent.context_transform,
+        RegistrationKind.transform,
+        lambda ctx: {**ctx.payload, "sections": ["redacted"]},
+        owner="redactor",
+    )
+    seen: list[Any] = []
+
+    def _watch(ctx: LifecycleContext) -> dict[str, Any]:
+        seen.append(ctx.payload["sections"])
+        return dict(ctx.payload)
+
+    manager.register(
+        HookEvent.context_transform,
+        RegistrationKind.transform,
+        _watch,
+        owner="second",
+        priority=200,
+    )
+    outcome = await manager.dispatch(
+        _ctx(HookEvent.context_transform, sections=["secret"])
+    )
+    assert outcome.payload["sections"] == ["redacted"]
+    assert seen == [["redacted"]]
 
 
-class _NoneReturnPlugin:
-    @hookimpl
-    async def pre_tool_use(
-        self,
-        tool_name: str,
-        arguments: dict[str, Any],
-        context: dict[str, Any],
-    ) -> None:
+@pytest.mark.asyncio
+async def test_a_transform_that_raises_denies_rather_than_letting_it_through() -> None:
+    manager = HookManager()
+    manager.register(
+        HookEvent.context_transform,
+        RegistrationKind.transform,
+        lambda _ctx: (_ for _ in ()).throw(ValueError("bad rewrite")),
+        owner="redactor",
+    )
+    outcome = await manager.dispatch(
+        _ctx(HookEvent.context_transform, sections=["secret"])
+    )
+    assert outcome.verdict is LifecycleVerdict.deny
+    assert outcome.payload["sections"] == ["secret"]
+
+
+@pytest.mark.asyncio
+async def test_scope_keeps_a_registration_off_runs_it_was_not_made_for() -> None:
+    manager = HookManager()
+    hits: list[str] = []
+    manager.register(
+        HookEvent.pre_tool_use,
+        RegistrationKind.observe,
+        lambda ctx: hits.append(ctx.run_id),
+        owner="scoped",
+        scope=LifecycleScope(run_id="run-other"),
+    )
+    await manager.dispatch(_ctx())
+    assert hits == []
+    await manager.dispatch(
+        LifecycleContext(point=HookEvent.pre_tool_use, run_id="run-other")
+    )
+    assert hits == ["run-other"]
+
+
+@pytest.mark.asyncio
+async def test_the_disposer_removes_the_registration_and_is_idempotent() -> None:
+    manager = HookManager()
+    hits: list[int] = []
+    dispose = manager.register(
+        HookEvent.pre_tool_use,
+        RegistrationKind.observe,
+        lambda _ctx: hits.append(1),
+        owner="temp",
+    )
+    await manager.dispatch(_ctx())
+    assert hits == [1]
+    assert dispose() is True
+    assert dispose() is False
+    assert dispose.disposed is True
+    assert manager.registrations(HookEvent.pre_tool_use) == ()
+    assert manager.registrations() == ()
+    assert manager.points() == ()
+    await manager.dispatch(_ctx())
+    assert hits == [1]
+
+
+@pytest.mark.asyncio
+async def test_disposing_one_owner_leaves_the_others_alone() -> None:
+    manager = HookManager()
+    for owner in ("a", "a", "b"):
+        manager.register(
+            HookEvent.pre_tool_use,
+            RegistrationKind.observe,
+            lambda _ctx: None,
+            owner=owner,
+        )
+    assert manager.owners() == ("a", "b")
+    assert manager.dispose_owner("a") == 2
+    assert manager.owners() == ("b",)
+
+
+def test_a_registration_without_an_owner_is_refused() -> None:
+    manager = HookManager()
+    with pytest.raises(ValueError, match="registration_requires_owner"):
+        manager.register(
+            HookEvent.pre_tool_use,
+            RegistrationKind.observe,
+            lambda _ctx: None,
+            owner="",
+        )
+
+
+@pytest.mark.asyncio
+async def test_around_wraps_the_work_and_can_short_circuit_it() -> None:
+    manager = HookManager()
+    ran: list[str] = []
+
+    async def _next(_ctx: LifecycleContext) -> None:
+        ran.append("work")
+
+    manager.register(
+        HookEvent.pre_tool_use,
+        RegistrationKind.around,
+        lambda _ctx, _n: LifecycleDecision(
+            verdict=LifecycleVerdict.deny, reason="blocked"
+        ),
+        owner="gate",
+    )
+    outcome = await manager.around(_ctx(), _next)
+    assert ran == []
+    assert outcome.verdict is LifecycleVerdict.deny
+    assert outcome.decided_by == "gate"
+
+
+@pytest.mark.asyncio
+async def test_around_that_calls_next_lets_the_work_happen() -> None:
+    manager = HookManager()
+    ran: list[str] = []
+
+    async def _next(_ctx: LifecycleContext) -> None:
+        ran.append("work")
+
+    async def _pass_through(ctx: LifecycleContext, next_: Any) -> LifecycleDecision:
+        await next_(ctx)
+        return LifecycleDecision()
+
+    manager.register(
+        HookEvent.pre_tool_use,
+        RegistrationKind.around,
+        _pass_through,
+        owner="timer",
+    )
+    outcome = await manager.around(_ctx(), _next)
+    assert ran == ["work"]
+    assert outcome.allowed
+
+
+@pytest.mark.asyncio
+async def test_around_with_nothing_registered_still_runs_the_work() -> None:
+    manager = HookManager()
+    ran: list[str] = []
+
+    async def _next(_ctx: LifecycleContext) -> None:
+        ran.append("work")
+
+    outcome = await manager.around(_ctx(), _next)
+    assert ran == ["work"]
+    assert outcome.allowed
+
+
+@pytest.mark.asyncio
+async def test_an_around_that_raises_denies_and_the_work_is_not_reported_done() -> None:
+    manager = HookManager()
+
+    async def _next(_ctx: LifecycleContext) -> None:
         return None
 
-
-async def test_modify_action_aggregates_modifications() -> None:
-    mgr = HookManager()
-    mgr.register(_ModifyPlugin(), name="mod")
-    result = await mgr.invoke(
+    manager.register(
         HookEvent.pre_tool_use,
-        {"tool_name": "Bash", "arguments": {}, "context": {}},
+        RegistrationKind.around,
+        lambda _ctx, _n: (_ for _ in ()).throw(RuntimeError("wrapper broke")),
+        owner="wrapper",
     )
-    assert result.action == HookActionKind.MODIFY
-    assert result.modifications == {"tool_name": "BashSafe"}
-    assert result.reason == "patched args"
+    outcome = await manager.around(_ctx(), _next)
+    assert outcome.verdict is LifecycleVerdict.deny
+    assert outcome.decided_by == "wrapper"
 
 
-async def test_deny_includes_self_in_raw_results() -> None:
-    """First-resolved deny must surface itself in raw_results before exit."""
-    mgr = HookManager()
-    mgr.register(_DenyPlugin(), name="deny")
-    mgr.register(_ModifyPlugin(), name="mod")
-    result = await mgr.invoke(
+@pytest.mark.asyncio
+async def test_cancellation_is_never_read_as_a_denial() -> None:
+    manager = HookManager()
+
+    async def _cancelled(_ctx: LifecycleContext) -> None:
+        raise asyncio.CancelledError
+
+    manager.register(
+        HookEvent.pre_tool_use, RegistrationKind.decide, _cancelled, owner="cancelled"
+    )
+    with pytest.raises(asyncio.CancelledError):
+        await manager.dispatch(_ctx())
+
+
+@pytest.mark.asyncio
+async def test_a_verdict_may_be_returned_bare_or_as_its_string() -> None:
+    manager = HookManager()
+    manager.register(
         HookEvent.pre_tool_use,
-        {"tool_name": "Bash", "arguments": {}, "context": {}},
+        RegistrationKind.decide,
+        lambda _ctx: "require_approval",
+        owner="asker",
     )
-    assert result.action == HookActionKind.DENY
-    # raw_results contains at least the denying record before short-circuit;
-    # additional entries depend on pluggy LIFO order.
-    assert len(result.raw_results) >= 1
-    assert any(r.get("action") == HookActionKind.DENY for r in result.raw_results)
+    outcome = await manager.dispatch(_ctx())
+    assert outcome.verdict is LifecycleVerdict.require_approval
 
-
-async def test_non_dict_or_none_results_ignored() -> None:
-    mgr = HookManager()
-    counter = _Counter()
-    mgr.register(_NoneReturnPlugin(), name="none")
-    mgr.register(_IgnoredReturnPlugin(), name="ignored")
-    mgr.register(_GoodPlugin(counter), name="good")
-    result = await mgr.invoke(
+    manager = HookManager()
+    manager.register(
         HookEvent.pre_tool_use,
-        {"tool_name": "Bash", "arguments": {}, "context": {}},
+        RegistrationKind.decide,
+        lambda _ctx: LifecycleVerdict.fail_run,
+        owner="stopper",
     )
-    assert result.action == HookActionKind.ALLOW
-    # Only the dict-returning _GoodPlugin lands in raw_results.
-    assert len(result.raw_results) == 1
+    outcome = await manager.dispatch(_ctx())
+    assert outcome.verdict is LifecycleVerdict.fail_run
 
 
-async def test_no_spec_for_event_returns_allow() -> None:
-    """When no hookspec exists for an event, invoke must short-circuit ALLOW."""
-    import pluggy
-
-    mgr = HookManager()
-    # Replace the underlying PluginManager with one that has no hookspecs;
-    # this exercises the ``caller is None`` branch.
-    mgr._pm = pluggy.PluginManager("empty-project")
-    result = await mgr.invoke(
-        HookEvent.pre_tool_use,
-        {"tool_name": "Bash", "arguments": {}, "context": {}},
-    )
-    assert result.action == HookActionKind.ALLOW
-    assert result.reason == "no spec for event"
-
-
-async def test_dispatch_failure_returns_allow() -> None:
-    """When the pluggy caller itself raises, manager isolates and returns ALLOW."""
-    mgr = HookManager()
-
-    class _ExplodingCaller:
-        def __call__(self, **_: Any) -> Any:
-            raise RuntimeError("dispatch boom")
-
-    # Swap the caller on the pluggy hook relay so caller(...) raises.
-    object.__setattr__(mgr._pm.hook, HookEvent.pre_tool_use.value, _ExplodingCaller())
-    result = await mgr.invoke(
-        HookEvent.pre_tool_use,
-        {"tool_name": "Bash", "arguments": {}, "context": {}},
-    )
-    assert result.action == HookActionKind.ALLOW
-    assert "dispatch failed" in result.reason
-    # : a crash at dispatch time (the path a SYNCHRONOUS hookimpl's
-    # exception takes through pluggy's ``caller(...)``) must also be surfaced.
-    error_records = [r for r in result.raw_results if r.get("outcome") == "error"]
-    assert len(error_records) == 1
-    assert "dispatch boom" in error_records[0]["error"]
-
-
-def test_unregister_by_name_returns_true() -> None:
-    mgr = HookManager()
-    counter = _Counter()
-    plugin = _GoodPlugin(counter)
-    mgr.register(plugin, name="good")
-    assert mgr.unregister("good") is True
-
-
-def test_unregister_unknown_returns_false() -> None:
-    mgr = HookManager()
-    assert mgr.unregister("never-registered") is False
-
-
-def test_unregister_by_plugin_instance() -> None:
-    mgr = HookManager()
-    counter = _Counter()
-    plugin = _GoodPlugin(counter)
-    mgr.register(plugin, name="good")
-    assert mgr.unregister(plugin) is True
+def test_the_seam_refuses_to_be_used_while_switched_off() -> None:
+    with pytest.raises(ValueError, match="lifecycle_hooks_disabled"):
+        refuse_lifecycle_when_disabled(False)
+    refuse_lifecycle_when_disabled(True)

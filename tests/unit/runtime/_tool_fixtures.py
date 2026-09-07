@@ -47,6 +47,13 @@ class MockTool(Tool):
  simulate a tool that classifies a soft ``is_error`` result via the
  ``count_as_tool_error`` / ``consecutive_error_cap_eligible`` flags
  without standing up the host ``TypedTool``.
+ response_projection / response_ui_payload / response_canonical_ref /
+ response_path:
+ The projections a real tool states beside its canonical value — what
+ the model should read instead of the whole thing, what the watching
+ client should be shown, where the whole thing is kept, and which file
+ the result is about. All default to unset, which is a tool saying its
+ value is its own projection.
  """
 
     tool_name: str = "Mock"
@@ -61,6 +68,10 @@ class MockTool(Tool):
     side_effect_class: str | None = None
     parameters_schema: dict[str, Any] = field(default_factory=dict)
     response_metadata: dict[str, Any] = field(default_factory=dict)
+    response_projection: str | None = None
+    response_ui_payload: dict[str, Any] | None = None
+    response_canonical_ref: str | None = None
+    response_path: str | None = None
     calls: list[dict[str, Any]] = field(default_factory=list)
 
     @property
@@ -96,6 +107,10 @@ class MockTool(Tool):
             content=self.response_content,
             is_error=self.response_is_error,
             metadata=dict(self.response_metadata),
+            model_projection=self.response_projection,
+            ui_payload=self.response_ui_payload,
+            canonical_ref=self.response_canonical_ref,
+            path=self.response_path,
         )
 
 

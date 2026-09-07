@@ -18,7 +18,7 @@ from __future__ import annotations
 
 import pytest
 
-from protocore.contracts.runtime_constants import RuntimeConstants
+from protocore.contracts.runtime_constants import LoopConstants
 from protocore.contracts.types import (
     SESSION_HISTORY_SEED_METADATA_KEY,
     SYNTHETIC_RECOVERY_METADATA_KEY,
@@ -132,7 +132,7 @@ async def test_the_ledger_outlives_the_history_it_was_never_read_from(
 
 
 def test_the_ledger_stops_growing_at_the_cap_and_says_so(engine_factory) -> None:
-    engine = engine_factory(rc=RuntimeConstants(run_tool_call_ledger_max_entries=3))
+    engine = engine_factory(rc=LoopConstants(run_tool_call_ledger_max_entries=3))
 
     for index in range(10):
         engine.record_tool_call(f"Tool{index}", ok=True)
@@ -147,7 +147,7 @@ def test_the_ordinal_keeps_counting_past_the_cap(engine_factory) -> None:
     A ledger whose ordinals restarted, or stopped, at the cap would make a
     truncated record silently disagree with the run it describes.
     """
-    engine = engine_factory(rc=RuntimeConstants(run_tool_call_ledger_max_entries=2))
+    engine = engine_factory(rc=LoopConstants(run_tool_call_ledger_max_entries=2))
 
     for index in range(5):
         engine.record_tool_call(f"Tool{index}", ok=True)
@@ -157,7 +157,7 @@ def test_the_ordinal_keeps_counting_past_the_cap(engine_factory) -> None:
 
 
 def test_a_zero_cap_keeps_no_ledger_at_all(engine_factory) -> None:
-    engine = engine_factory(rc=RuntimeConstants(run_tool_call_ledger_max_entries=0))
+    engine = engine_factory(rc=LoopConstants(run_tool_call_ledger_max_entries=0))
 
     engine.record_tool_call("Read", ok=True)
 
@@ -177,13 +177,13 @@ def test_the_ledger_a_caller_reads_is_a_copy(engine_factory) -> None:
 @pytest.mark.asyncio
 async def test_the_ledger_survives_a_cross_pod_resume(engine_factory) -> None:
     """Losing it on resume loses the only copy of a compacted turn's calls."""
-    engine = engine_factory(rc=RuntimeConstants(run_tool_call_ledger_max_entries=2))
+    engine = engine_factory(rc=LoopConstants(run_tool_call_ledger_max_entries=2))
     engine.record_tool_call("Read", ok=True)
     engine.record_tool_call("Grep", ok=False)
     engine.record_tool_call("Bash", ok=True)  # dropped, latches truncation
     snapshot = engine.snapshot()
 
-    resumed = engine_factory(rc=RuntimeConstants(run_tool_call_ledger_max_entries=2))
+    resumed = engine_factory(rc=LoopConstants(run_tool_call_ledger_max_entries=2))
     await resumed.resume_from_snapshot(snapshot)
 
     assert resumed.tool_call_ledger == [
@@ -390,7 +390,7 @@ async def test_a_crashed_run_reports_no_answer_rather_than_no_information(
 async def test_the_settle_event_carries_the_whole_outcome_once_per_run(
     engine_factory, in_memory_runtime
 ) -> None:
-    engine = engine_factory(rc=RuntimeConstants(run_settled_enabled=True))
+    engine = engine_factory(rc=LoopConstants(run_settled_enabled=True))
     in_memory_runtime["tools"].register(MockTool(tool_name="Read"))
     in_memory_runtime["llm"].queue_tool_call_response(
         tool_call_id="c1", tool_name="Read", tool_input={}

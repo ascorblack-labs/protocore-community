@@ -1,9 +1,9 @@
-"""Unit tests — terminal payload normalize, deadline early finalize predicate,
+"""Unit tests — deadline early finalize predicate,
 pre-terminal self-verify latch, parallel-read RC defaults, and the generic
 read-dedup tool key.
 
 These cover the pure-core primitives + the engine-facing helpers in isolation.
-The host apply-points (``final_answer`` normalize call, the self-verify
+The host apply-points (the self-verify
 trigger implementation, the ledger lock acquisition, the read-dedup tool
 wiring) are out of core scope and covered host-side.
 """
@@ -14,66 +14,14 @@ import time
 
 import pytest
 
-from protocore.contracts.runtime_constants import RuntimeConstants
-from protocore.runtime.read_dedup_cache import ReadDedupCache
-from protocore.runtime.terminal_payload_normalize import normalize_terminal_text
-
-
-# --------------------------------------------------------------------------
-# terminal payload entity normalization
-# --------------------------------------------------------------------------
-def test_entity_unescape_marker() -> None:
-    assert (
-        normalize_terminal_text("&lt;YES&gt; FST-APSRIZJW", entity_unescape=True)
-        == "<YES> FST-APSRIZJW"
-    )
-
-
-def test_entity_named_and_numeric_refs() -> None:
-    assert normalize_terminal_text("a &amp; b", entity_unescape=True) == "a & b"
-    assert (
-        normalize_terminal_text("x &#60;NO&#62; y", entity_unescape=True)
-        == "x <NO> y"
-    )
-
-
-def test_entity_unescape_disabled_is_noop() -> None:
-    assert (
-        normalize_terminal_text("&lt;YES&gt;", entity_unescape=False) == "&lt;YES&gt;"
-    )
-
-
-def test_entity_none_and_empty_passthrough() -> None:
-    assert normalize_terminal_text(None, entity_unescape=True) is None
-    assert normalize_terminal_text("", entity_unescape=True) == ""
-
-
-def test_entity_single_pass_does_not_overunescape() -> None:
-    # Double-escaped input unescapes exactly one level (not looped) so a
-    # message legitimately containing an entity-looking substring is safe.
-    assert normalize_terminal_text("&amp;lt;", entity_unescape=True) == "&lt;"
-
-
-def test_entity_sentinels_non_mutating_today() -> None:
-    assert (
-        normalize_terminal_text(
-            "&lt;YES&gt;", entity_unescape=True, sentinels=("<YES>", "<NO>")
-        )
-        == "<YES>"
-    )
-
-
-@pytest.mark.parametrize("enabled", [True, False])
-def test_entity_unescape_gate_param(enabled: bool) -> None:
-    out = normalize_terminal_text("&lt;X&gt;", entity_unescape=enabled)
-    assert out == ("<X>" if enabled else "&lt;X&gt;")
+from protocore.contracts.runtime_constants import LoopConstants
 
 
 # --------------------------------------------------------------------------
 # RC defaults reproduce today
 # --------------------------------------------------------------------------
 def test_rc_defaults_reproduce_today() -> None:
-    rc = RuntimeConstants()
+    rc = LoopConstants()
     # deadline-finalize disabled by default
     assert rc.agent_max_seconds == 0.0
     assert rc.agent_deadline_finalize_slack_seconds >= 0.0
@@ -84,23 +32,18 @@ def test_rc_defaults_reproduce_today() -> None:
     assert rc.pre_dispatch_terminal_verify_enabled is False
     # entity-normalize is NOT byte-preserving → default OFF;
     # a tenant opts in via a per-tenant override.
-    assert rc.terminal_answer_entity_normalize_enabled is False
-    assert rc.terminal_answer_sentinels == []
     # parallel reads on; fanout default is the value-preserving sentinel 0
     # (== UNLIMITED == unbounded gather); only a positive override chunks.
     assert rc.parallel_read_tools_enabled is True
     assert rc.parallel_read_tools_max_fanout == 0
     # generic dedup off by default (workspace dedup unaffected)
-    assert rc.read_dedup_enabled is False
-    assert rc.read_dedup_ttl_seconds == 300
-    assert rc.read_dedup_max_entries == 256
 
 
 # --------------------------------------------------------------------------
 # Minimal engine doubles for the deadline / self-verify helpers
 # --------------------------------------------------------------------------
 class _FakeConfig:
-    def __init__(self, rc: RuntimeConstants) -> None:
+    def __init__(self, rc: LoopConstants) -> None:
         self.rc = rc
         self.expected_terminal_tool = "final_answer"
         self.pre_terminal_self_verify_trigger = None
@@ -109,7 +52,7 @@ class _FakeConfig:
 
 
 class _FakeEngine:
-    def __init__(self, rc: RuntimeConstants, *, started_monotonic: float) -> None:
+    def __init__(self, rc: LoopConstants, *, started_monotonic: float) -> None:
         self.config = _FakeConfig(rc)
         self._run_started_monotonic = started_monotonic
         self._pre_terminal_self_verify_used = False
@@ -160,14 +103,14 @@ def test_deadline_helper_is_module_level() -> None:
 
 def test_deadline_disabled_when_budget_zero() -> None:
     fn = _deadline_fn()
-    eng = _FakeEngine(RuntimeConstants(), started_monotonic=1.0)
+    eng = _FakeEngine(LoopConstants(), started_monotonic=1.0)
     assert fn(eng) is False  # agent_max_seconds == 0
 
 
 def test_deadline_not_reached_when_fresh(monkeypatch: pytest.MonkeyPatch) -> None:
     fn = _deadline_fn()
     now = _fixed_monotonic(monkeypatch)
-    rc = RuntimeConstants(
+    rc = LoopConstants(
         agent_max_seconds=600.0, agent_deadline_finalize_slack_seconds=45.0
     )
     eng = _FakeEngine(rc, started_monotonic=now)  # 0s elapsed
@@ -177,7 +120,7 @@ def test_deadline_not_reached_when_fresh(monkeypatch: pytest.MonkeyPatch) -> Non
 def test_deadline_reached_within_slack(monkeypatch: pytest.MonkeyPatch) -> None:
     fn = _deadline_fn()
     now = _fixed_monotonic(monkeypatch)
-    rc = RuntimeConstants(
+    rc = LoopConstants(
         agent_max_seconds=600.0, agent_deadline_finalize_slack_seconds=45.0
     )
     # elapsed = 600 - 45 + 1 = 556 -> past threshold (555)
@@ -187,7 +130,7 @@ def test_deadline_reached_within_slack(monkeypatch: pytest.MonkeyPatch) -> None:
 
 def test_deadline_noop_when_clock_unstamped() -> None:
     fn = _deadline_fn()
-    rc = RuntimeConstants(agent_max_seconds=600.0)
+    rc = LoopConstants(agent_max_seconds=600.0)
     eng = _FakeEngine(rc, started_monotonic=0.0)
     assert fn(eng) is False
 
@@ -198,7 +141,7 @@ def test_deadline_slack_ge_budget_finalises_promptly(
     fn = _deadline_fn()
     now = _fixed_monotonic(monkeypatch)
     # slack > budget -> threshold floored at 0 -> any elapsed finalises.
-    rc = RuntimeConstants(
+    rc = LoopConstants(
         agent_max_seconds=10.0, agent_deadline_finalize_slack_seconds=999.0
     )
     eng = _FakeEngine(rc, started_monotonic=now - 0.5)
@@ -216,7 +159,7 @@ def test_deadline_accounts_pre_run_grounding_elapsed(
 ) -> None:
     fn = _deadline_fn()
     now = _fixed_monotonic(monkeypatch)
-    rc = RuntimeConstants(
+    rc = LoopConstants(
         agent_max_seconds=300.0, agent_deadline_finalize_slack_seconds=90.0
     )
     # Example values: finalize threshold = 300 - 90 = 210s.
@@ -235,7 +178,7 @@ def test_deadline_low_uptime_keeps_positive_stamp_distinct_from_unstamped(
 ) -> None:
     fn = _deadline_fn()
     now = _fixed_monotonic(monkeypatch, 100.0)
-    rc = RuntimeConstants(agent_max_seconds=10.0)
+    rc = LoopConstants(agent_max_seconds=10.0)
     stamped = _FakeEngine(rc, started_monotonic=1.0)
     unstamped = _FakeEngine(rc, started_monotonic=0.0)
 
@@ -251,7 +194,7 @@ def test_pre_run_stamp_inert_when_budget_disabled() -> None:
     # returns False regardless of when the clock was stamped, so a Part-A
     # pre-stamp can never change deadline-disabled behaviour.
     fn = _deadline_fn()
-    rc = RuntimeConstants()  # agent_max_seconds defaults to 0.0
+    rc = LoopConstants()  # agent_max_seconds defaults to 0.0
     eng = _FakeEngine(rc, started_monotonic=1.0)
     assert fn(eng) is False
 
@@ -261,7 +204,7 @@ def test_pre_run_stamp_inert_when_budget_disabled() -> None:
 # --------------------------------------------------------------------------
 async def test_self_verify_disabled_by_default_no_injection() -> None:
     fn = _self_verify_fn()
-    rc = RuntimeConstants()  # pre_terminal_self_verify_enabled == False
+    rc = LoopConstants()  # pre_terminal_self_verify_enabled == False
     eng = _FakeEngine(rc, started_monotonic=time.monotonic())
     eng.config.pre_terminal_self_verify_trigger = lambda _e: "fix it"
     assert await fn(eng) is False
@@ -272,7 +215,7 @@ async def test_self_verify_disabled_by_default_no_injection() -> None:
 
 async def test_self_verify_injects_once_then_latches() -> None:
     fn = _self_verify_fn()
-    rc = RuntimeConstants(
+    rc = LoopConstants(
         pre_terminal_self_verify_enabled=True,
         pre_terminal_self_verify_max_extra_turns=1,
     )
@@ -296,7 +239,7 @@ async def test_self_verify_injects_once_then_latches() -> None:
 
 async def test_self_verify_trigger_none_declines() -> None:
     fn = _self_verify_fn()
-    rc = RuntimeConstants(pre_terminal_self_verify_enabled=True)
+    rc = LoopConstants(pre_terminal_self_verify_enabled=True)
     eng = _FakeEngine(rc, started_monotonic=time.monotonic())
     eng.config.pre_terminal_self_verify_trigger = lambda _e: None
     assert await fn(eng) is False
@@ -310,7 +253,7 @@ async def test_self_verify_trigger_exception_is_swallowed() -> None:
     def _boom(_e: object) -> str:
         raise RuntimeError("trigger blew up")
 
-    rc = RuntimeConstants(pre_terminal_self_verify_enabled=True)
+    rc = LoopConstants(pre_terminal_self_verify_enabled=True)
     eng = _FakeEngine(rc, started_monotonic=time.monotonic())
     eng.config.pre_terminal_self_verify_trigger = _boom
     # Must never break finalisation -- declines gracefully.
@@ -319,38 +262,13 @@ async def test_self_verify_trigger_exception_is_swallowed() -> None:
 
 async def test_self_verify_max_extra_turns_zero_blocks_injection() -> None:
     fn = _self_verify_fn()
-    rc = RuntimeConstants(
+    rc = LoopConstants(
         pre_terminal_self_verify_enabled=True,
         pre_terminal_self_verify_max_extra_turns=0,
     )
     eng = _FakeEngine(rc, started_monotonic=time.monotonic())
     eng.config.pre_terminal_self_verify_trigger = lambda _e: "fix"
     assert await fn(eng) is False
-
-
-# --------------------------------------------------------------------------
-# generic read-dedup tool key
-# --------------------------------------------------------------------------
-def test_read_dedup_tool_key_order_independent() -> None:
-    assert ReadDedupCache.tool_key("t", {"a": 1, "b": 2}) == ReadDedupCache.tool_key(
-        "t", {"b": 2, "a": 1}
-    )
-
-
-def test_read_dedup_tool_key_prefix_and_empty() -> None:
-    assert ReadDedupCache.tool_key("remote_read", {"path": "/p"}).startswith(
-        "remote_read:"
-    )
-    assert ReadDedupCache.tool_key("t", None) == "t:{}"
-
-
-def test_read_dedup_tool_key_non_serialisable_falls_back() -> None:
-    class _X:
-        pass
-
-    # default=repr keeps it from raising; key is stable.
-    key = ReadDedupCache.tool_key("t", {"obj": _X()})
-    assert key.startswith("t:")
 
 
 # ==========================================================================
@@ -391,7 +309,7 @@ def _query_mod():
 
 def _build_terminal_engine(
     *,
-    rc: RuntimeConstants,
+    rc: LoopConstants,
     tools: InMemoryToolRegistry | None = None,
     expected_terminal_tool: str | None = "final_answer",
     pre_dispatch_trigger=None,
@@ -428,7 +346,7 @@ def _build_terminal_engine(
 # The wind-down survives snapshot/resume
 # --------------------------------------------------------------------------
 def test_wind_down_absent_from_a_fresh_snapshot() -> None:
-    eng = _build_terminal_engine(rc=RuntimeConstants(model_context_window=4_096))
+    eng = _build_terminal_engine(rc=LoopConstants(model_context_window=4_096))
     snap = eng.snapshot()
     assert snap["soft_stop_cause"] is None
     assert snap["soft_stop_stage"] == ""
@@ -443,13 +361,13 @@ async def test_wind_down_roundtrips_through_a_snapshot() -> None:
     """
     from protocore.runtime import soft_stop as _soft_stop
 
-    eng = _build_terminal_engine(rc=RuntimeConstants(model_context_window=4_096))
+    eng = _build_terminal_engine(rc=LoopConstants(model_context_window=4_096))
     _soft_stop.enter(eng, cause_name=_soft_stop.CAUSE_DEADLINE)
     snap = eng.snapshot()
     assert snap["soft_stop_cause"] == _soft_stop.CAUSE_DEADLINE
     assert snap["soft_stop_stage"] == _soft_stop.STAGE_WITHDRAWN
 
-    other = _build_terminal_engine(rc=RuntimeConstants(model_context_window=4_096))
+    other = _build_terminal_engine(rc=LoopConstants(model_context_window=4_096))
     await other.resume_from_snapshot(snap)
     assert _soft_stop.is_armed(other) is True
     assert _soft_stop.tools_withdrawn(other) is True
@@ -461,7 +379,7 @@ async def test_wind_down_roundtrips_through_a_snapshot() -> None:
 async def test_a_snapshot_without_the_wind_down_resumes_without_one() -> None:
     from protocore.runtime import soft_stop as _soft_stop
 
-    eng = _build_terminal_engine(rc=RuntimeConstants(model_context_window=4_096))
+    eng = _build_terminal_engine(rc=LoopConstants(model_context_window=4_096))
     snap = eng.snapshot()
     snap.pop("soft_stop_cause", None)
     snap.pop("soft_stop_stage", None)
@@ -479,7 +397,7 @@ async def test_snapshot_resume_deadline_survives_lower_monotonic_uptime(
     budget_seconds: float,
     expected_reached: bool,
 ) -> None:
-    rc = RuntimeConstants(
+    rc = LoopConstants(
         model_context_window=4_096,
         agent_max_seconds=budget_seconds,
         agent_deadline_finalize_slack_seconds=0.0,
@@ -505,7 +423,7 @@ async def test_run_preserves_negative_resume_reanchor_but_stamps_zero(
 ) -> None:
     from protocore.contracts.types import Message, TextBlock
 
-    rc = RuntimeConstants(model_context_window=4_096)
+    rc = LoopConstants(model_context_window=4_096)
     source = _build_terminal_engine(rc=rc, expected_terminal_tool=None)
     resumed_snapshot = source.snapshot()
     resumed_snapshot["run_started_epoch"] = 800.0
@@ -549,7 +467,7 @@ async def test_future_epoch_repeated_resume_keeps_one_consumed_budget(
 
     budget_seconds = 150.0
     persisted_epoch = 1_200.0
-    rc = RuntimeConstants(
+    rc = LoopConstants(
         model_context_window=4_096,
         agent_max_seconds=budget_seconds,
         agent_deadline_finalize_slack_seconds=0.0,
@@ -608,7 +526,7 @@ async def test_malformed_epoch_rejected_before_deadline_state_mutates(
 ) -> None:
     from protocore.runtime.deadline_clock import InvalidDeadlineSnapshot
 
-    eng = _build_terminal_engine(rc=RuntimeConstants(model_context_window=4_096))
+    eng = _build_terminal_engine(rc=LoopConstants(model_context_window=4_096))
     eng._run_started_epoch = 123.0
     eng._run_started_monotonic = 45.0
     snapshot = eng.snapshot()
@@ -630,7 +548,7 @@ async def test_malformed_elapsed_rejected_before_deadline_state_mutates(
 ) -> None:
     from protocore.runtime.deadline_clock import InvalidDeadlineSnapshot
 
-    eng = _build_terminal_engine(rc=RuntimeConstants(model_context_window=4_096))
+    eng = _build_terminal_engine(rc=LoopConstants(model_context_window=4_096))
     eng._run_started_epoch = 123.0
     eng._run_started_monotonic = 45.0
     snapshot = eng.snapshot()
@@ -653,7 +571,7 @@ async def test_run_preserves_preset_monotonic_stamp() -> None:
     from protocore.contracts.types import Message, TextBlock
 
     eng = _build_terminal_engine(
-        rc=RuntimeConstants(model_context_window=4_096),
+        rc=LoopConstants(model_context_window=4_096),
         expected_terminal_tool=None,
     )
     # Simulate the host prelude setting a valid run-clock before run().
@@ -683,7 +601,7 @@ async def test_run_stamps_epoch_independently_of_monotonic() -> None:
     from protocore.contracts.types import Message, TextBlock
 
     eng = _build_terminal_engine(
-        rc=RuntimeConstants(model_context_window=4_096),
+        rc=LoopConstants(model_context_window=4_096),
         expected_terminal_tool=None,
     )
     preset_monotonic = 1.0
@@ -707,7 +625,7 @@ async def test_run_stamps_both_when_nothing_preset() -> None:
     from protocore.contracts.types import Message, TextBlock
 
     eng = _build_terminal_engine(
-        rc=RuntimeConstants(model_context_window=4_096),
+        rc=LoopConstants(model_context_window=4_096),
         expected_terminal_tool=None,
     )
     assert eng._run_started_monotonic == 0.0
@@ -732,7 +650,7 @@ def _applies_fn():
 def test_pre_dispatch_verify_gate_off_by_default() -> None:
     fn = _applies_fn()
     eng = _build_terminal_engine(
-        rc=RuntimeConstants(model_context_window=4_096),
+        rc=LoopConstants(model_context_window=4_096),
         pre_dispatch_trigger=lambda _e, _tc: "bad refs",
     )
     call = ToolCall(id="t-1", name="final_answer", arguments={"refs": ["x"]})
@@ -742,7 +660,7 @@ def test_pre_dispatch_verify_gate_off_by_default() -> None:
 
 def test_pre_dispatch_verify_gate_only_terminal_tool() -> None:
     fn = _applies_fn()
-    rc = RuntimeConstants(
+    rc = LoopConstants(
         model_context_window=4_096, pre_dispatch_terminal_verify_enabled=True
     )
     eng = _build_terminal_engine(
@@ -758,7 +676,7 @@ def test_pre_dispatch_verify_gate_only_terminal_tool() -> None:
 
 def test_pre_dispatch_verify_gate_requires_trigger() -> None:
     fn = _applies_fn()
-    rc = RuntimeConstants(
+    rc = LoopConstants(
         model_context_window=4_096, pre_dispatch_terminal_verify_enabled=True
     )
     eng = _build_terminal_engine(rc=rc, pre_dispatch_trigger=None)
@@ -769,7 +687,7 @@ def test_pre_dispatch_verify_gate_requires_trigger() -> None:
 
 def test_pre_dispatch_verify_gate_latched_off_after_fire() -> None:
     fn = _applies_fn()
-    rc = RuntimeConstants(
+    rc = LoopConstants(
         model_context_window=4_096, pre_dispatch_terminal_verify_enabled=True
     )
     eng = _build_terminal_engine(
@@ -784,7 +702,7 @@ def test_pre_dispatch_verify_gate_latched_off_after_fire() -> None:
 
 def test_pre_dispatch_verify_gate_respects_shared_budget() -> None:
     fn = _applies_fn()
-    rc = RuntimeConstants(
+    rc = LoopConstants(
         model_context_window=4_096,
         pre_dispatch_terminal_verify_enabled=True,
         pre_terminal_self_verify_max_extra_turns=1,
@@ -821,7 +739,7 @@ async def test_pre_dispatch_veto_blocks_terminal_dispatch() -> None:
         captured["args"] = dict(tool_call.arguments)
         return "You cited ref /catalog/999 which you never observed. Fix it."
 
-    rc = RuntimeConstants(
+    rc = LoopConstants(
         model_context_window=4_096, pre_dispatch_terminal_verify_enabled=True
     )
     eng = _build_terminal_engine(
@@ -877,7 +795,7 @@ async def test_pre_dispatch_no_veto_when_trigger_declines_dispatches_normally() 
     )
     tools.register(terminal)
 
-    rc = RuntimeConstants(
+    rc = LoopConstants(
         model_context_window=4_096, pre_dispatch_terminal_verify_enabled=True
     )
     eng = _build_terminal_engine(
@@ -912,7 +830,7 @@ async def test_pre_dispatch_trigger_exception_does_not_block_dispatch() -> None:
     def _boom(_e, _tc):
         raise RuntimeError("trigger blew up")
 
-    rc = RuntimeConstants(
+    rc = LoopConstants(
         model_context_window=4_096, pre_dispatch_terminal_verify_enabled=True
     )
     eng = _build_terminal_engine(rc=rc, tools=tools, pre_dispatch_trigger=_boom)
@@ -933,16 +851,16 @@ async def test_pre_dispatch_trigger_exception_does_not_block_dispatch() -> None:
 # pre-dispatch verify durable latch survives snapshot/resume
 # --------------------------------------------------------------------------
 def test_pre_dispatch_verify_latch_in_snapshot_default_false() -> None:
-    eng = _build_terminal_engine(rc=RuntimeConstants(model_context_window=4_096))
+    eng = _build_terminal_engine(rc=LoopConstants(model_context_window=4_096))
     assert eng.snapshot()["pre_dispatch_terminal_verify_used"] is False
 
 
 @pytest.mark.asyncio
 async def test_pre_dispatch_verify_latch_roundtrips_true() -> None:
-    eng = _build_terminal_engine(rc=RuntimeConstants(model_context_window=4_096))
+    eng = _build_terminal_engine(rc=LoopConstants(model_context_window=4_096))
     eng._pre_dispatch_terminal_verify_used = True
     snap = eng.snapshot()
-    other = _build_terminal_engine(rc=RuntimeConstants(model_context_window=4_096))
+    other = _build_terminal_engine(rc=LoopConstants(model_context_window=4_096))
     await other.resume_from_snapshot(snap)
     # Durable latch survives resume → a re-driven run will not re-veto the
     # model's corrected re-submission (which would loop).
@@ -967,7 +885,7 @@ def test_output_reserve_default_off_is_noop() -> None:
     # actual final turn (the terminal-only latch is set).
     fn = _reserve_fn()
     eng = _build_terminal_engine(
-        rc=RuntimeConstants(
+        rc=LoopConstants(
             model_context_window=4_096, terminal_tool_nudge_enabled=True
         )
     )
@@ -983,7 +901,7 @@ def test_output_reserve_noop_when_not_final_turn() -> None:
     # now it correctly defers until the genuine final turn.
     fn = _reserve_fn()
     eng = _build_terminal_engine(
-        rc=RuntimeConstants(
+        rc=LoopConstants(
             model_context_window=4_096,
             terminal_tool_nudge_enabled=True,
             terminal_synthesis_output_reserve_tokens=4096,
@@ -1000,7 +918,7 @@ def test_output_reserve_noop_when_not_final_turn() -> None:
 def test_output_reserve_floors_on_final_turn() -> None:
     fn = _reserve_fn()
     eng = _build_terminal_engine(
-        rc=RuntimeConstants(
+        rc=LoopConstants(
             model_context_window=4_096,
             terminal_tool_nudge_enabled=True,
             terminal_synthesis_output_reserve_tokens=4096,
@@ -1015,7 +933,7 @@ def test_output_reserve_floors_on_final_turn() -> None:
 def test_output_reserve_does_not_lower_a_larger_budget() -> None:
     fn = _reserve_fn()
     eng = _build_terminal_engine(
-        rc=RuntimeConstants(
+        rc=LoopConstants(
             model_context_window=4_096,
             terminal_tool_nudge_enabled=True,
             terminal_synthesis_output_reserve_tokens=4096,
@@ -1031,7 +949,7 @@ def test_output_reserve_never_raises_global_cap() -> None:
     # reserve (10000) exceeds the global cap (3000) -> the floor is clamped to
     # the cap, so it NEVER raises above max_context*ratio.
     eng = _build_terminal_engine(
-        rc=RuntimeConstants(
+        rc=LoopConstants(
             model_context_window=4_096,
             terminal_tool_nudge_enabled=True,
             terminal_synthesis_output_reserve_tokens=10000,
@@ -1050,7 +968,7 @@ def test_output_reserve_fires_on_deadline_backstop_turn(
     now = _fixed_monotonic(monkeypatch)
     # nudge disabled, but the deadline backstop is active -> still a final turn.
     eng = _build_terminal_engine(
-        rc=RuntimeConstants(
+        rc=LoopConstants(
             model_context_window=4_096,
             agent_max_seconds=30.0,
             terminal_synthesis_output_reserve_tokens=4096,

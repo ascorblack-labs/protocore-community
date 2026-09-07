@@ -10,11 +10,49 @@ pre-flight budget checks where exact token counts aren't yet available.
 """
 from __future__ import annotations
 
+import os
 import re
 from enum import StrEnum
-from typing import Final
+from typing import Final, Protocol
 
-from protocore.contracts.runtime_constants import RuntimeConstants
+from protocore.contracts.runtime_constants import LoopConstants
+
+#: Set to a non-empty value to ignore an installed native estimator and use the
+#: Python one. The only environment variable the core reads, and it answers a
+#: packaging question — which build of this function am I running — rather than
+#: tuning anything: everything tunable is a :class:`LoopConstants` field.
+#: It exists so the two implementations can be compared on one machine without
+#: building a second environment to uninstall the extension from.
+DISABLE_NATIVE_ENV_VAR: Final[str] = "PROTOCORE_DISABLE_NATIVE"
+
+class _NativeEstimator(Protocol):
+    """The one function the optional native extension is asked to provide."""
+
+    def __call__(
+        self,
+        text: str,
+        latin: float,
+        cyrillic: float,
+        cyrillic_json_escape: float,
+        cjk: float,
+        json_struct: float,
+    ) -> int: ...
+
+
+_native_estimate_tokens: _NativeEstimator | None
+try:
+    from protocore._native import estimate_tokens as _imported_native_estimator
+except ImportError:
+    # The extension is an optional extra, and its absence is the normal case:
+    # the pure-Python implementation below is the specification either way.
+    _native_estimate_tokens = None
+else:
+    _native_estimate_tokens = _imported_native_estimator
+
+#: Whether the native estimator is the one :func:`estimate_tokens` calls.
+NATIVE_ACTIVE: Final[bool] = _native_estimate_tokens is not None and not os.environ.get(
+    DISABLE_NATIVE_ENV_VAR,
+)
 
 
 class LanguageProfile(StrEnum):
@@ -60,7 +98,7 @@ def detect_profile(text: str) -> LanguageProfile:
     return LanguageProfile.latin_prose
 
 
-def chars_per_token(profile: LanguageProfile, rc: RuntimeConstants) -> float:
+def chars_per_token(profile: LanguageProfile, rc: LoopConstants) -> float:
     """Return the chars-per-token ratio for a profile from RC."""
     if profile is LanguageProfile.latin_prose:
         return rc.token_count_chars_per_token_latin
@@ -73,7 +111,28 @@ def chars_per_token(profile: LanguageProfile, rc: RuntimeConstants) -> float:
     return rc.token_count_chars_per_token_json_struct
 
 
-def estimate_tokens(text: str, rc: RuntimeConstants) -> int:
+def estimate_tokens(text: str, rc: LoopConstants) -> int:
+    """Estimate token count of ``text`` by partitioning it per profile.
+
+    Answered by the native extension when ``protocore[native]`` is installed
+    and :data:`NATIVE_ACTIVE` is true, and by :func:`estimate_tokens_python`
+    otherwise. Both compute the same partition with the same arithmetic, and a
+    test compares them character class by character class; the Python one is
+    the specification, and it is never removed from the tree.
+    """
+    if _native_estimate_tokens is not None and NATIVE_ACTIVE:
+        return _native_estimate_tokens(
+            text,
+            rc.token_count_chars_per_token_latin,
+            rc.token_count_chars_per_token_cyrillic,
+            rc.token_count_chars_per_token_cyrillic_json_escape,
+            rc.token_count_chars_per_token_cjk,
+            rc.token_count_chars_per_token_json_struct,
+        )
+    return estimate_tokens_python(text, rc)
+
+
+def estimate_tokens_python(text: str, rc: LoopConstants) -> int:
     """Estimate token count of ``text`` by partitioning it per profile.
 
     Each character class is costed at its own chars-per-token ratio rather
@@ -125,8 +184,11 @@ def estimate_tokens(text: str, rc: RuntimeConstants) -> int:
 
 
 __all__ = [
+    "DISABLE_NATIVE_ENV_VAR",
+    "NATIVE_ACTIVE",
     "LanguageProfile",
     "chars_per_token",
     "detect_profile",
     "estimate_tokens",
+    "estimate_tokens_python",
 ]

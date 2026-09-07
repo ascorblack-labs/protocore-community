@@ -28,11 +28,11 @@ def test_event_type_anthropic_subset_present() -> None:
     assert required.issubset(members)
 
 
-def test_event_type_protocore_extensions_present() -> None:
-    """7 Protocore extensions are members."""
+def test_event_type_extensions_present() -> None:
+    """7 extensions beyond the Anthropic-aligned set are members."""
     required = {
-        "sandbox_starting",
-        "sandbox_ready",
+        "tool_transport_starting",
+        "tool_transport_ready",
         "subagent_spawn",
         "subagent_complete",
         "hook_fired",

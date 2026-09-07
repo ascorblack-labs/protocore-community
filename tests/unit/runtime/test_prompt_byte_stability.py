@@ -23,7 +23,7 @@ import hashlib
 
 import pytest
 
-from protocore.contracts.runtime_constants import RuntimeConstants
+from protocore.contracts.runtime_constants import LoopConstants
 from protocore.contracts.skills import SkillUpsertInput
 from protocore.contracts.types import (
     Message,
@@ -47,7 +47,7 @@ async def test_skill_index_byte_stable_across_calls(
 ) -> None:
     """Two consecutive turns with identical user input must produce the
     same skill-index ``<system-reminder>`` block byte-for-byte."""
-    rc = RuntimeConstants(
+    rc = LoopConstants(
         model_context_window=100_000,
         skill_index_budget_ratio=0.05,
     )
@@ -123,7 +123,7 @@ async def test_no_skills_byte_stable(
 ) -> None:
     """Skill-store empty path: assembly stays byte-stable even with no
     skills (the no-op path must still be deterministic)."""
-    rc = RuntimeConstants(model_context_window=8_000)
+    rc = LoopConstants(model_context_window=8_000)
     engine_one = engine_factory(rc=rc, run_id="run-empty-a")
     engine_two = engine_factory(rc=rc, run_id="run-empty-b")
 
@@ -167,7 +167,7 @@ async def test_context_manager_sections_byte_stable_directly() -> None:
     from protocore.runtime.context.manager import ContextManager
     from protocore.tests_support.adapters import InMemoryBlobStore, InMemoryLLMProvider
 
-    rc = RuntimeConstants(model_context_window=10_000)
+    rc = LoopConstants(model_context_window=10_000)
     cm = ContextManager(
         rc=rc,
         blob_store=InMemoryBlobStore(),

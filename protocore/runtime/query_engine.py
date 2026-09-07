@@ -17,22 +17,22 @@ Persistence: snapshot ↔ resume via
 from __future__ import annotations
 
 import asyncio
+import contextlib
+import hashlib
+import logging
 import time
 import uuid
 from collections.abc import AsyncIterator, Callable, Sequence
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import TYPE_CHECKING, Any, ClassVar
 
+from protocore.contracts.background import (
+    BACKGROUND_TERMINAL_STATUSES,
+    IBackgroundTaskPool,
+)
 from protocore.contracts.blob import IBlobStore
 from protocore.contracts.events import IEventStream
-from protocore.contracts.hooks import IHookManager
-from protocore.contracts.llm import ILLMProvider, IProviderChain
-from protocore.contracts.observability import CacheObserverProtocol
-from protocore.contracts.runtime_constants import RuntimeConstants
-from protocore.contracts.skills import ISkillStore, SkillBundle
-from protocore.contracts.tool_registry import IToolRegistry, ToolVisibilityPolicy
-from protocore.contracts.types import Message, MessageRole, ToolCall, ToolPrecondition
-from protocore.contracts.verification import (
+from protocore.contracts.evidence import (
     CandidateBundle,
     CandidateReleasedProjection,
     EvidenceLedger,
@@ -43,6 +43,55 @@ from protocore.contracts.verification import (
     VerificationLifecycle,
     VerificationState,
 )
+from protocore.contracts.hooks import IHookManager
+from protocore.contracts.interrupt import (
+    InterruptKind,
+    InterruptResolutionError,
+    PendingInterrupt,
+    deserialise_interrupts,
+    find_interrupt_for_call,
+    interrupts_of_kind,
+    new_interrupt_id,
+    park_interrupt,
+    release_interrupt,
+    serialise_interrupts,
+)
+from protocore.contracts.llm import ILLMProvider, IProviderChain
+from protocore.contracts.middleware import ILifecycleRegistry
+from protocore.contracts.observability import (
+    REQUEST_MANIFEST_SCHEMA_KEY,
+    CacheObserverProtocol,
+    IRequestManifestSink,
+    ManifestSchemaError,
+    RequestManifest,
+    read_manifest_schema_version,
+)
+from protocore.contracts.prompts import IPromptTemplateProvider
+from protocore.contracts.resilience import IResilienceClassifier
+from protocore.contracts.run_state import RunScopedState
+from protocore.contracts.runtime_constants import LoopConstants
+from protocore.contracts.skills import ISkillStore, SkillBundle
+from protocore.contracts.snapshot import (
+    RUN_SCOPED_STATE_SNAPSHOT_KEY,
+    SNAPSHOT_SCHEMA_KEY,
+    SNAPSHOT_SCHEMA_VERSION,
+    migrate_snapshot,
+)
+from protocore.contracts.tool_registry import IToolRegistry, ToolVisibilityPolicy
+from protocore.contracts.tool_roles import (
+    EMPTY_TOOL_ROLE_MAP,
+    ToolRoleMap,
+    narrow_tool_capabilities,
+)
+from protocore.contracts.types import (
+    Message,
+    MessageRole,
+    ToolCall,
+    ToolPrecondition,
+    ToolResultBlock,
+    ToolUseBlock,
+)
+from protocore.prompts import bundled_prompt_provider
 from protocore.runtime.candidate_delivery import CandidateDeliveryGate
 from protocore.runtime.context.compaction import CompactionState
 from protocore.runtime.context.manager import ContextManager
@@ -54,20 +103,22 @@ from protocore.runtime.events import EventType, TurnEvent
 from protocore.runtime.loop_state import (
     InvalidStateTransitionError,
     LoopState,
+    assert_awaiting_is_witnessed,
     assert_transition,
     is_terminal,
 )
-from protocore.runtime.tool_dispatch import clear_run_scoped_helpers
 from protocore.runtime.usage import TokenUsage
 
+_logger = logging.getLogger(__name__)
+
 if TYPE_CHECKING:
-    pass
+    from protocore.runtime.turn_policies import TurnPolicyRegistry
 
 
 # The two orthogonal loop axes. Kept as the
 # single source of truth for the ``QueryEngineConfig.__post_init__`` validators
 # so the accepted vocabularies are declared once (mirrors the Field ``pattern``
-# carried by the Pydantic-side RuntimeConstants defaults).
+# carried by the Pydantic-side LoopConstants defaults).
 RUN_MODES: tuple[str, ...] = ("direct", "deep")
 REASONING_EFFORTS: tuple[str, ...] = ("minimal", "low", "medium", "high", "xhigh")
 
@@ -87,32 +138,194 @@ _READER_TURN_INTERIOR_EVENT_TYPES = frozenset(
 )
 
 
+def _as_snapshot_count(value: Any) -> int:
+    """Coerce a persisted non-negative count, rejecting ``bool`` and non-ints."""
+    if isinstance(value, bool) or not isinstance(value, int):
+        return 0
+    return max(0, int(value))
+
+
+#: The run continuity a snapshot must state outright. Every one of these
+#: survives ``rearm()``, so a resume that invented a default for a missing key
+#: would hand the run a different agent while looking like a clean restore —
+#: which is exactly what the schema version exists to make impossible. An older
+#: payload is brought up to this shape by the upcaster chain before it gets
+#: here, so a key still absent at this point is a corrupt payload, not an old
+#: one.
+_REQUIRED_CONTINUITY_FIELDS: tuple[str, ...] = (
+    "compact_checkpoint",
+    "active_rule_paths",
+    "discovered_rules",
+    "session_grants",
+    "profile_audit",
+    "spans",
+    "context_manager_pinned_tools",
+    "skill_catalog_block_sha256",
+)
+
+
+@dataclass(frozen=True)
+class _RunContinuity:
+    """The parsed continuity block, built before the engine is touched."""
+
+    compact_checkpoint: Any
+    active_rule_paths: list[str]
+    discovered_rules: list[Any]
+    session_grants: list[Any]
+    profile_audit: list[dict[str, Any]]
+    spans: list[Any]
+    pinned_tools: list[str]
+    skill_catalog_block_sha256: str | None
+
+
+def _parse_request_manifest_reference(
+    snapshot: dict[str, Any],
+) -> dict[str, Any] | None:
+    """Read the last request manifest's reference, or refuse the snapshot.
+
+    Three outcomes, and the difference between the last two is the whole point
+    of the field. Absent or ``None`` — this run has no manifest recorded, which
+    is what a run configured with no sink looks like and also what a run whose
+    manifests have aged out of the host's store looks like; the resume carries
+    on. Present and readable — the id travels, so the resumed process can name
+    the call the run was on. Present and written under a schema version this
+    build does not know — refused, because a reference whose fields this build
+    cannot place would otherwise be read as far as it goes, and half a
+    reference points at nothing in particular.
+    """
+    reference = snapshot.get("last_request_manifest")
+    if reference is None:
+        return None
+    if not isinstance(reference, dict):
+        raise ManifestSchemaError(
+            "last_request_manifest must be a mapping or absent, got "
+            f"{type(reference).__name__}"
+        )
+    read_manifest_schema_version(reference)
+    manifest_id = reference.get("manifest_id")
+    if not isinstance(manifest_id, str) or not manifest_id:
+        raise ManifestSchemaError(
+            "last_request_manifest states no manifest_id; a reference without "
+            "one addresses nothing"
+        )
+    return dict(reference)
+
+
+def _parse_run_continuity(snapshot: dict[str, Any]) -> _RunContinuity:
+    """Read the continuity block out of a snapshot, or refuse the snapshot."""
+    from protocore.runtime.compact_checkpoint import CompactCheckpoint
+    from protocore.runtime.permission_widen import CommandGrant
+    from protocore.runtime.rules_activation import RuleFile
+    from protocore.runtime.telemetry import Span
+
+    for key in _REQUIRED_CONTINUITY_FIELDS:
+        if key not in snapshot:
+            raise ValueError(f"snapshot is missing the run continuity field {key!r}")
+
+    raw_checkpoint = snapshot["compact_checkpoint"]
+    checkpoint: Any = None
+    if isinstance(raw_checkpoint, dict):
+        checkpoint = CompactCheckpoint(
+            entry_id=str(raw_checkpoint.get("entry_id", "")),
+            summary=str(raw_checkpoint.get("summary", "")),
+            retained_from_index=_as_snapshot_count(
+                raw_checkpoint.get("retained_from_index")
+            ),
+            file_op_facts=[
+                str(fact) for fact in raw_checkpoint.get("file_op_facts") or []
+            ],
+            instructions=str(raw_checkpoint.get("instructions", "")),
+            reason=str(raw_checkpoint.get("reason", "manual")),
+        )
+    elif raw_checkpoint is not None:
+        raise ValueError("snapshot compact_checkpoint is neither a mapping nor absent")
+
+    raw_rules = snapshot["discovered_rules"]
+    if not isinstance(raw_rules, list):
+        raise ValueError("snapshot discovered_rules is not a list")
+
+    return _RunContinuity(
+        compact_checkpoint=checkpoint,
+        active_rule_paths=[
+            path for path in snapshot["active_rule_paths"] or [] if isinstance(path, str)
+        ],
+        discovered_rules=[
+            RuleFile(
+                path=str(item.get("path", "")),
+                body=str(item.get("body", "")),
+                origin=str(item.get("origin", "workspace")),
+            )
+            for item in raw_rules
+            if isinstance(item, dict)
+        ],
+        # The profile audit is the host's own record and comes back as the
+        # plain rows the snapshot carried. The grants do NOT: the approval
+        # gate asks each one whether it covers a command
+        # (``tool_permission._session_grant_covers`` →
+        # ``permission_widen.grant_covers``), and a row is not something that
+        # can answer. Handing the gate rows made every grant a session widened
+        # before the pause raise on the first command after it, so a resumed
+        # run asked for approval again for exactly the commands a person had
+        # already widened. Rows are read back into grants here; anything that
+        # is already a grant travels as itself.
+        session_grants=[
+            CommandGrant.from_dict(item) if isinstance(item, dict) else item
+            for item in snapshot["session_grants"] or []
+        ],
+        profile_audit=[
+            dict(item) for item in snapshot["profile_audit"] or [] if isinstance(item, dict)
+        ],
+        spans=[
+            Span(name=str(item.get("name", "")), attributes=dict(item.get("attributes") or {}))
+            for item in snapshot["spans"] or []
+            if isinstance(item, dict)
+        ],
+        pinned_tools=[
+            name
+            for name in snapshot["context_manager_pinned_tools"] or []
+            if isinstance(name, str)
+        ],
+        skill_catalog_block_sha256=(
+            digest if isinstance(digest := snapshot["skill_catalog_block_sha256"], str) else None
+        ),
+    )
+
+
 @dataclass(frozen=True)
 class QueryEngineConfig:
     """Immutable per-conversation config bound at engine construction.
 
- ``model_name`` is a REQUIRED field — it MUST come from the
- ``llm_provider_config`` PG row the executor resolves at admission
- time. There is no fallback to a baked-in model name (no inline magic
- numbers / no hardcoded defaults).
+ ``model_name`` is a REQUIRED field — it comes from the provider
+ configuration the caller resolved before starting the run. There is no
+ fallback to a baked-in model name: this package ships no default for it.
  """
 
     run_id: str
     tenant_id: str
-    """Scope id (``tenants.id``). Keys hooks, secrets, RC, workspace, sessions."""
+    """The run's scope, as an opaque key.
+
+    Core neither parses it nor knows what a host addresses with it: it keys
+    hooks, secrets, constants, workspace and sessions, and each of those is
+    reached through a contract the host implements.
+    """
     session_id: str
     model_name: str
     account_id: str = ""
-    """Owning account id (``tenants.account_id``) for the run's scope.
+    """The key the run's skill bank is addressed by, as an opaque value.
 
-    The skill bank is ACCOUNT-WIDE and flat (keyed on ``skills.account_id``), so
-    the run's skill catalog build + project-pin merge (``query._ensure_run_skill_catalog``
-    / ``_merge_pinned_skills``) and the per-turn ``ToolContext`` the engine builds
-    MUST key skill-store reads on this id — NOT ``tenant_id``, which is the
-    (possibly different) scope id. The host executor resolves
-    scope→account once per run via ``_resolve_account_id_for_scope`` and threads
-    it here. Empty only when the scope's account could not be resolved; a skill
-    lookup then resolves nothing rather than silently keying on the wrong id.
+    A bank is shared by every scope that draws on it, so it is a key of its
+    own and not the run's :attr:`tenant_id`: the two differ wherever a host
+    keeps more than one scope against one bank, and reading skills under the
+    scope id would then resolve a different bank or none. Every skill-store
+    read the engine makes — the once-per-run catalog build, the project-pin
+    merge, a chained skill body — keys on this. Whoever composes the run
+    resolves it; empty means no bank could be named for the run, and a lookup
+    then resolves nothing rather than silently reading someone else's.
+
+    The NAME is a leftover and is kept on purpose: it is the spelling every
+    embedder already passes, and renaming the field would rename it across
+    :class:`~protocore.contracts.skills.ISkillStore` and every caller for no
+    change in meaning. Read the description, not the identifier.
     """
     subagent_id: str | None = None
     parent_run_id: str | None = None
@@ -151,7 +364,7 @@ class QueryEngineConfig:
     ``agent_project_skills`` by the host executor. Empty (the default)
     means the catalog is exactly the account's enabled skills.
     """
-    rc: RuntimeConstants = field(default_factory=RuntimeConstants)
+    rc: LoopConstants = field(default_factory=LoopConstants)
     execution_profile: str = "default"
     """Published tool profile: ``default`` | ``plan``. Orthogonal to run_mode."""
     run_mode: str = "direct"
@@ -162,7 +375,7 @@ class QueryEngineConfig:
     bounded by ``reasoning_effort``) → emits one ``REASONING_STEP`` event →
     then drives the shared action loop. Validated in ``__post_init__``
     against ``^(direct|deep)$``. Routed from ``run.mode`` by the executor;
-    default per tenant from ``RuntimeConstants.agent_loop_default_mode``.
+    default per tenant from ``LoopConstants.agent_loop_default_mode``.
     """
     thinking_enabled: bool = False
     """Native chain-of-thought toggle (the second, orthogonal axis).
@@ -200,6 +413,19 @@ class QueryEngineConfig:
  ``protocore.runtime.query._stream_one_assistant_message``). Core
  cannot import its host — implementations live there.
  """
+    request_manifest_sink: IRequestManifestSink | None = None
+    """Optional sink for the record of every provider call this run makes.
+
+    When set, the runtime builds a
+    ``protocore.contracts.observability.RequestManifest`` for each request and
+    hands it over BEFORE the first delta of that request's stream, so a run cut
+    off mid-stream still leaves behind exactly what it had asked for. When
+    unset the machinery is inert and nothing is built — the manifest costs the
+    hashing of the outbound messages, which is not free on a long history.
+
+    Where the manifest is kept, and for how long, is the host's decision. The
+    core stores nothing, deletes nothing, and never reads a manifest back.
+    """
     pre_terminal_self_verify_trigger: (
         Callable[[QueryEngine], str | None] | None
     ) = None
@@ -208,7 +434,7 @@ class QueryEngineConfig:
     Called by the query loop at the moment a terminal-tool result would be
     committed (and only when ``rc.pre_terminal_self_verify_enabled`` is True
     and the per-run latch has not yet fired). It receives the engine (so it
-    can inspect ``history`` and any caller-provided helper-bag state) and
+    can inspect ``history`` and the run's state) and
     returns:
 
       * a non-empty corrective-instruction string → the loop injects ONE
@@ -239,7 +465,7 @@ class QueryEngineConfig:
         ``engine._self_verify_extra_turns_used``) is not exhausted.
 
     It receives the engine AND the un-submitted :class:`ToolCall` (so it can
-    inspect ``tool_call.arguments`` against caller-provided helper-bag state)
+    inspect ``tool_call.arguments`` against the run's state)
     and returns:
 
       * a non-empty corrective-instruction string → the loop VETOES the
@@ -256,6 +482,46 @@ class QueryEngineConfig:
     Core never hardcodes domain-specific verification logic — the predicate is
     tenant-supplied. ``None`` (the default) means no pre-dispatch veto ever
     fires, reproducing prior behaviour.
+    """
+
+    resilience_classifier: IResilienceClassifier | None = None
+    """Who says what kind of failure a tool's error message describes.
+
+    The wordings a failing tool produces belong to whatever the host put
+    behind it, so the runtime never learns to read them: it asks this, and
+    acts on the neutral class it gets back. Today one answer changes what the
+    run does — a class in
+    :data:`~protocore.contracts.resilience.TRANSPORT_DOWN_ERROR_CLASSES` means
+    the way out to the tool is down rather than the call being wrong, so a run
+    of such failures collapses to one signature and, at the threshold, tells
+    the model to reach its goal another way. A run with none bound tells its
+    failures apart by their own text and never reads a run of them as an
+    outage.
+    """
+
+    tool_roles: ToolRoleMap = field(default_factory=lambda: EMPTY_TOOL_ROLE_MAP)
+    """What this run's tools DO, declared by the host that registered them.
+
+    The runtime never compares a tool name against a name of its own: it asks
+    this map which of the host's names reads a file, which produces bytes at a
+    path, which runs a shell command, and which is never handed to a child. A
+    run whose map is empty has no tool in any role, so the features that turn
+    on one — large-file convergence, the read-back gate, the plan profile's
+    mask, the shell deny patterns — have nothing to act on and say so in the
+    log rather than going quietly inert.
+    """
+
+    work_session_id: str = ""
+    """The pool scope this run's OWN background work lives under.
+
+    Empty — the value every root run carries — means the run's background work
+    is the session's, and the session outlives the run. A child run given a
+    scope of its own is saying the opposite: the work started under it belongs
+    to this run and nothing else will be left watching it, which is what lets
+    the run retire that work before it ends (see
+    :meth:`QueryEngine.retire_own_background_work`). A child that shares its
+    parent's scope owns nothing to retire, and must not be allowed to stop its
+    parent's commands on the way out.
     """
 
     subagent_tool_allowlist: frozenset[str] = field(default_factory=frozenset)
@@ -292,6 +558,19 @@ class QueryEngineConfig:
     Empty (the default) means the mechanism never engages — no state, no forced
     choice, no extra failure path — so a run that carries none behaves exactly
     as it did before the field existed.
+    """
+
+    prompt_provider: IPromptTemplateProvider | None = None
+    """Renders the named prompt templates the loop injects into the run.
+
+    ``None`` selects the provider bundled with this package, which reads the
+    templates shipped alongside it. A host supplies its own to serve an
+    operator-edited body, or a translation, in place of a bundled one: the
+    override happens at the template, so the same substitution reaches every
+    text the loop speaks, and a host that wants none of it passes nothing.
+
+    Resolution goes through :attr:`QueryEngine.prompt_provider`, never this
+    field directly, so a caller cannot accidentally read the ``None``.
     """
 
     def __post_init__(self) -> None:
@@ -423,10 +702,19 @@ class QueryEngine:
             "hooks",
             "skills",
             "blobs",
-            "typed_hook_registry",
+            "lifecycle_hooks",
+            # The set of turn policies this run is driven by. A host that
+            # installed its own for the run means it for the whole run, not
+            # for the first turn of it.
+            "turn_policies",
             # A primitive, not state: tool handlers acquire it around cross-call
             # appends, and swapping the object under a holder buys nothing.
             "_tool_shared_state_lock",
+            # The run's own state. The object belongs to the RUN — and, through
+            # the tree ledger inside it, to every subagent still drawing on it —
+            # so a turn boundary may not swap it. What a turn boundary DOES
+            # clear are the per-run cells inside it, by name, in ``rearm``.
+            "run_state",
             # ── The continuity that makes the next turn a continuation ──────
             # The conversation and everything derived from it. ``context_manager``
             # is here for two things it holds: the compaction machinery and the
@@ -440,9 +728,18 @@ class QueryEngine:
             "last_heartbeat_ms",
             "_pinned_tool_result_ids",
             "_skill_catalog_block",
+            # The digest the run's catalog block had before it was picked up,
+            # kept until the new process rebuilds one and can be compared
+            # against it. Cleared by that comparison, not by a turn boundary.
+            "_resumed_skill_catalog_sha256",
             "active_rule_paths",
             "discovered_rules",
             "background_pool",
+            # What the resumed run knows was running when it was cut off. Not a
+            # per-turn allowance: it is the only witness that a command exists
+            # at all, and clearing it would let the next turn read the pool's
+            # silence as an empty session again.
+            "_resumed_background_task_ids",
             # Ledgers and lanes the caller owns and reads back. These are records
             # of what the agent did, not allowances it may spend; emptying one at a
             # turn boundary destroys evidence rather than freeing a budget, and
@@ -461,6 +758,11 @@ class QueryEngine:
             "_live_model_name",
             "_live_thinking_enabled",
             "_live_reasoning_effort",
+            # The id of the last request this run made. It is evidence about
+            # the run rather than an allowance the turn spends, and a re-arm
+            # that dropped it would leave the next process with no way to say
+            # which call the run was on when it was picked up.
+            "_last_request_manifest",
         }
     )
 
@@ -474,9 +776,9 @@ class QueryEngine:
     #: Dropped: rebuilt on next use, or a latch that belongs to one run.
     _REARM_ATTACHED_DROPPED: ClassVar[frozenset[str]] = frozenset(
         {
-            # Caches a tool-error counter read out of the helper bag when it was
+            # Caches a tool-error counter read off the run's state when it was
             # first built. Rebuilt on demand, and rebuilding is what keeps that
-            # counter from going stale under a bag the host has since replaced.
+            # counter from going stale under a state the host has since replaced.
             "_tool_dispatcher",
             # Fire-once warning latch. Left raised, the warning it guards is
             # emitted once in the life of the engine rather than once per run.
@@ -484,14 +786,10 @@ class QueryEngine:
         }
     )
 
-    #: Kept: the host owns it. The bag itself survives, but the per-run cells
-    #: this package keeps inside it do not — see
-    #: :data:`~protocore.runtime.tool_dispatch.RUN_SCOPED_HELPER_KEYS`.
-    #:
-    #: ``run_work_ledger`` is deliberately NOT among those cleared: it is the run
-    #: *tree's* ledger, shared with subagents that may still be reading it, so
-    #: emptying it from the leader would be a decision about their budget too.
-    _REARM_ATTACHED_KEPT: ClassVar[frozenset[str]] = frozenset({"_helpers"})
+    #: Kept: nothing. Everything a host used to attach to an engine after
+    #: construction now lives on :attr:`run_state`, which the constructor
+    #: declares and :data:`_REARM_PRESERVED_ATTRS` keeps.
+    _REARM_ATTACHED_KEPT: ClassVar[frozenset[str]] = frozenset()
 
     def __init__(
         self,
@@ -505,6 +803,8 @@ class QueryEngine:
         blob_store: IBlobStore,
         compaction_provider: ILLMProvider | None = None,
         provider_chain: IProviderChain | None = None,
+        background_pool: IBackgroundTaskPool | None = None,
+        lifecycle_hooks: ILifecycleRegistry | None = None,
     ) -> None:
         self.config = config
         self.llm: ILLMProvider = llm_provider
@@ -519,8 +819,19 @@ class QueryEngine:
         self.tools = tool_registry
         self.events = event_stream
         self.hooks = hook_manager
+        # The lifecycle seam. ``None`` is a host that registered nothing, and
+        # the loop's coordinates then cost one attribute read apiece.
+        self.lifecycle_hooks: ILifecycleRegistry | None = lifecycle_hooks
         self.skills = skill_store
         self.blobs = blob_store
+
+        # The turn policies this run is driven by. ``None`` means the core's
+        # own set, built by the turn driver; a host or a test that installs its
+        # own set does it here, per run, rather than by patching a module. What
+        # is installed here is merged into the core's set BY NAME rather than
+        # put in its place: a policy replaces the core policy that answers to
+        # the same name, and the bounds nobody named stay where they are.
+        self.turn_policies: TurnPolicyRegistry | None = None
 
         # Mutable per-conversation state
         self.history: list[Message] = []
@@ -582,7 +893,11 @@ class QueryEngine:
         self._wire_round_seq = 0
         # Per-turn pending tool calls
         self._pending_tool_call_names: dict[str, str] = {}
-        self._pending_approval_tool_call_id: str | None = None
+        # Everything this run is waiting for a person to answer, in the order
+        # it started waiting. A list rather than a latch because calls park in
+        # batches: three dangerous calls in one assistant message are one
+        # ``AWAITING`` with three interrupts, answered by one map.
+        self._pending_interrupts: tuple[PendingInterrupt, ...] = ()
 
         # ── Recovery state (reset per assistant message) ──
         # Only one force_compaction attempt allowed per message
@@ -790,7 +1105,22 @@ class QueryEngine:
         # resume hands the model back the surface the stop just took away.
         self._soft_stop_cause: str | None = None
         self._soft_stop_stage: str = ""
-        self.background_pool: Any = None
+        # Session-scoped background commands, owned by the host because they
+        # outlive the run that spawned them. ``None`` is a run that was never
+        # given one; a run resumed on a fresh process is given a pool that has
+        # to be re-attached to the session before it can speak for it, which is
+        # what ``ensure_session_attached`` is asked before every wake check.
+        self.background_pool: IBackgroundTaskPool | None = background_pool
+        # Fire-once-per-turn latch on the detached-pool report, so a run whose
+        # pool cannot speak for its session says so on the record instead of
+        # repeating it at every assistant message.
+        self._background_detach_reported: bool = False
+        # Ids of this session's still-running background commands as of the
+        # snapshot this run was resumed from. A pool that keeps its records in
+        # memory cannot notice that a dead process's commands are missing —
+        # there is nothing left to compare against — so the run carries the
+        # comparison itself. Empty for a run that was never resumed.
+        self._resumed_background_task_ids: tuple[str, ...] = ()
         self.compact_checkpoint: Any = None
         self.active_rule_paths: list[str] = []
         self.discovered_rules: list[Any] = []
@@ -802,7 +1132,6 @@ class QueryEngine:
         self.open_intents: list[Any] = []
         self.usage_rows: list[Any] = []
         self.lanes: list[Any] = []
-        self.typed_hook_registry: Any = None
         self.spans: list[Any] = []
 
         # Has this run handed work to a subagent? Set the moment a delegation
@@ -830,9 +1159,9 @@ class QueryEngine:
         # ``_circuit_breaker_notified_tools`` is the at-most-once latch for the
         # corrective convergence turn (one per broken tool). ``_circuit_breaker_
         # streak`` is the IN-FLIGHT pre-trip streak — ``{tool_name, error_class,
-        # count}`` or ``None`` — held on the engine (NOT the per-run helper bag)
+        # count}`` or ``None`` — held on the engine (NOT the per-run state)
         # so it is snapshot-persisted: a cross-pod resume BEFORE the trip would
-        # otherwise rebuild a fresh helper bag and reset the count, letting a run
+        # otherwise rebuild a fresh run state and reset the count, letting a run
         # exceed ``max_consecutive_tool_errors`` without tripping.
         # All three are PER-RUN and SNAPSHOT-PERSISTED (cross-pod resume safe)
         # so a re-driven run keeps the tool blocked, the streak intact, and
@@ -985,6 +1314,14 @@ class QueryEngine:
         # to use it.
         self._tool_shared_state_lock = asyncio.Lock()
 
+        # Everything this run carries across its own tool calls: the streaks,
+        # the tree's budgets, the cancel event, the satisfied preconditions, and
+        # whatever slots the host wires for its own tools. A run composed by a
+        # host is handed the object its tree shares; a run built without one
+        # gets this empty state, which bounds only itself.
+        self.run_state: RunScopedState = RunScopedState()
+        self.run_state.tool_shared_state_lock = self._tool_shared_state_lock
+
         # Skill catalog block (the enabled account catalog + project pins
         # rendered into a ``<system-reminder>``): RUN-STABLE — built at most
         # ONCE per run by ``_ensure_run_skill_catalog`` and reused byte-for-byte
@@ -993,11 +1330,21 @@ class QueryEngine:
         # the not-yet-built sentinel; an empty string is a valid built value
         # (no skills / no store).
         self._skill_catalog_block: str | None = None
+        # Set only by a resume, and only until the catalog is rebuilt: the
+        # digest the run's block had in the process that wrote the snapshot.
+        self._resumed_skill_catalog_sha256: str | None = None
         # ``<command-name>`` trigger-loaded skill bodies: PER-TURN — rebuilt
         # every turn from that turn's user message (a Layer-3 prepend), so a
         # trigger in a later turn still force-loads its body. NOT cached like
         # the catalog block.
         self._skill_loaded_bundles: list[SkillBundle] = []
+        # The reference — id and schema version — to the manifest of the last
+        # provider request this run built. The manifest ITSELF is not here and
+        # is never carried in the snapshot: it is addressed by id, and the copy
+        # lives wherever the host put it. ``None`` means no request has been
+        # manifested, which is also what a run configured with no sink looks
+        # like.
+        self._last_request_manifest: dict[str, Any] | None = None
 
         # Context manager — rebuild on each turn for fresh RC
         self.context_manager = ContextManager(
@@ -1022,7 +1369,7 @@ class QueryEngine:
         Called by EVERY entry that opens a turn, because the state below is
         private: no caller outside the engine can put it back itself, however
         carefully it prepares the engine. There are two such entries —
-        :meth:`run` and :func:`~protocore.runtime.query.query` — and they reach
+        :meth:`run` and :func:`~protocore.runtime.query.resume` — and they reach
         the same private generator, so a reset owned by one of them is a reset
         the other silently skips. It lives here, called from both, rather than
         inside that generator: :meth:`run` persists a snapshot immediately
@@ -1073,6 +1420,25 @@ class QueryEngine:
     # Public API
     # ------------------------------------------------------------------
 
+    def _history_can_be_continued(self) -> bool:
+        """Whether the existing history gives the model something to answer."""
+        last = self.history[-1]
+        if last.role is MessageRole.user:
+            return True
+        if any(isinstance(block, ToolResultBlock) for block in last.content_blocks):
+            return True
+        if last.role is not MessageRole.assistant:
+            return False
+        settled: set[str] = set()
+        for message in self.history:
+            for block in message.content_blocks:
+                if isinstance(block, ToolResultBlock):
+                    settled.add(block.tool_call_id)
+        return any(
+            isinstance(block, ToolUseBlock) and block.tool_call_id not in settled
+            for block in last.content_blocks
+        )
+
     async def run(
         self, initial_message: Message | None = None
     ) -> AsyncIterator[TurnEvent]:
@@ -1084,12 +1450,20 @@ class QueryEngine:
         ``initial_message`` is appended to ``history`` before the loop drives,
         as the user input that opens this turn. Pass ``None`` to generate an
         assistant turn against the EXISTING ``history`` as-is, with nothing
-        appended — a continuation run. The existing ``history`` MUST then
-        already be non-empty and end with a ``user`` message (the input the
-        turn answers); a ``ValueError`` is raised otherwise. No empty/blank
-        message is ever fabricated to stand in for the missing input: an
-        empty prompt drives the model with no question to answer, which it
-        reliably fills with confabulated content.
+        appended — a continuation run. No empty/blank message is ever
+        fabricated to stand in for a missing input: an empty prompt drives the
+        model with no question to answer, which it reliably fills with
+        confabulated content.
+
+        A continuation needs something for the model to answer, and there are
+        three shapes of that, not one. A ``user`` message is the obvious one. A
+        tool result is the second: it is the answer to the call the assistant
+        just made, and a run picked up on another pod right after a tool
+        settled has exactly that at the end of its history. An assistant tool
+        call still waiting for its result is the third, and it is the most
+        common way a run dies — killed while a tool was in flight. Refusing it
+        would leave the single most frequent recovery case with no public entry
+        point at all. Anything else raises ``ValueError``.
         """
         # Lazy import to break circular dependency between query_engine and
         # the per-turn async generator.
@@ -1101,14 +1475,23 @@ class QueryEngine:
                     "run(initial_message=None) needs a non-empty history to "
                     "continue from, but history is empty."
                 )
-            if self.history[-1].role is not MessageRole.user:
+            if not self._history_can_be_continued():
                 raise ValueError(
                     "run(initial_message=None) continues against the existing "
-                    "history, whose last message must have role 'user'; the "
+                    "history, which must end with a 'user' message, a tool "
+                    "result, or an assistant tool call still awaiting one; the "
                     f"last message is role {self.history[-1].role.value!r}."
                 )
         else:
             self.history.append(initial_message)
+            # A tool result the CALLER brings — the answer to a question the
+            # run parked on — is the result of that call, and the dispatcher
+            # never sees it. Fold it into run-level precondition progress here
+            # or an entry naming the asking tool is never satisfied and the
+            # next entry in the sequence is never forced.
+            from protocore.runtime import run_tool_preconditions as _run_preconditions
+
+            _run_preconditions.observe_injected_result_message(self, initial_message)
         self.turn_count += 1
         self._reset_per_turn_state()
         # Stamp the run-start clock ONCE for the wall-clock budget. A resumed run
@@ -1147,14 +1530,86 @@ class QueryEngine:
         # skips ``.cancel()`` when called from THIS task — e.g. the in-loop
         # cancel poll — so it never injects ``CancelledError`` into itself
         # mid-iteration; the cooperative checkpoints handle that case).
-        self._current_turn_task = asyncio.current_task()
-        try:
+        async with self.driving_turn():
             async for evt in _query_raw(self):
                 for projected in self._project_public_turn_event(evt):
                     yield projected
+
+    @contextlib.asynccontextmanager
+    async def driving_turn(self) -> AsyncIterator[None]:
+        """Hold the cancellation handle and the closing snapshot for one drive.
+
+        Every public drive of this engine — the turn loop and the approved-tool
+        resume alike — runs inside this scope, so the two obligations that make
+        a drive interruptible and resumable are owned in one place instead of
+        being re-stated (and eventually forgotten) at each entry.
+
+        While the scope is open ``_current_turn_task`` names the task doing the
+        driving, which is the handle :meth:`stop` cancels through; without it
+        ``stop()`` degrades to its cooperative flag and cannot interrupt a
+        drive parked inside an ``await``.  On the way out — normal exit,
+        exception or cancellation — the handle is dropped and a snapshot is
+        persisted, so a drive that died mid-flight still leaves a pickup point
+        for another process.
+
+        The snapshot goes first and the retire second, in that order and not
+        the other one. Both are awaits, and a cancellation delivered at either
+        skips whatever follows it: a teardown that cancels a second time while
+        the retire is spending its grace would cost a run its pickup point, and
+        the pickup point is the obligation that must not be skippable. The
+        retire is shielded for the same reason from the other side — a
+        cancellation arriving mid-sweep leaves it to finish rather than
+        abandoning the work half-stopped.
+        """
+        self._current_turn_task = asyncio.current_task()
+        try:
+            yield
         finally:
             self._current_turn_task = None
             await self._persist_snapshot()
+            await asyncio.shield(
+                asyncio.ensure_future(self.retire_own_background_work())
+            )
+
+    async def retire_own_background_work(self) -> None:
+        """Stop the background work this run owns, once the run is over.
+
+        A child run that walks away from its own background commands leaks
+        them: the pool goes on holding a scope no live run is watching, nothing
+        in the tree knows to look, and the processes behind the records outlive
+        the tree that started them. Nobody was doing this — the pool has never
+        known about the run tree, so there was no one whose job it was.
+
+        Only a run with a work scope of its OWN retires anything. A run sharing
+        the session's scope is sharing it with whatever comes next, and stopping
+        that on the way out would kill its parent's commands.
+
+        The grace comes out of this run's own time, deliberately: a child that
+        takes a while to retire is late rather than over its ceiling, and a
+        caller that budgeted for the child budgeted for its teardown too. A pool
+        that raises while stopping is logged and swallowed — a failure to clean
+        up is not a failure of the run that just finished, and re-raising here
+        would turn a completed run into a failed one at the very last step.
+        """
+        scope = self.config.work_session_id
+        pool = self.background_pool
+        if not scope or scope == self.config.session_id or pool is None:
+            return
+        if not is_terminal(self.state):
+            return
+        stopper = getattr(pool, "stop_session", None)
+        if stopper is None:
+            return
+        try:
+            await stopper(scope, self.config.rc.child_run_retire_grace_seconds)
+        except Exception:
+            _logger.warning(
+                "DIAG engine.retire_background_failed run=%s tenant=%s scope=%s",
+                self.config.run_id,
+                self.config.tenant_id,
+                scope,
+                exc_info=True,
+            )
 
     def _project_public_turn_event(self, event: TurnEvent) -> tuple[TurnEvent, ...]:
         """Apply the authoritative public delivery boundary to one turn event.
@@ -1169,7 +1624,7 @@ class QueryEngine:
 
         The run's outcome is stamped onto the terminal ``message_stop`` here
         because here is the one place every public event iterator passes
-        through — ``run`` and ``query`` both delegate to it — and because the
+        through — every public drive delegates to it — and because the
         loop reaches a terminal stop from eighteen different places. Stamping
         at each of them is eighteen chances to add a nineteenth that forgets.
         """
@@ -1256,12 +1711,12 @@ class QueryEngine:
         return event.model_copy(update={"payload": payload})
 
     def stop(self) -> None:
-        """Request graceful stop. ``query()`` checks ``_stop_requested`` between phases.
+        """Request graceful stop. The loop checks ``_stop_requested`` between phases.
 
         Sets the cooperative ``_stop_requested`` flag, and — when called from a
-        DIFFERENT task than the one driving :meth:`run` — hard-cancels the run
-        task so a blocking ``await`` (a long tool / subagent dispatch) is
-        interrupted now (#6). Calling ``stop()`` from within the run task itself
+        DIFFERENT task than the one inside :meth:`driving_turn` — hard-cancels
+        that task so a blocking ``await`` (a long tool / subagent dispatch) is
+        interrupted now. Calling ``stop()`` from within the driving task itself
         (the in-loop cancel poll) only sets the flag: a self-``cancel()`` would
         inject ``CancelledError`` into the current frame mid-iteration, so the
         cooperative checkpoints / the caller's own ``break`` finish the unwind.
@@ -1281,6 +1736,40 @@ class QueryEngine:
     @property
     def stop_requested(self) -> bool:
         return self._stop_requested.is_set()
+
+    @property
+    def rc(self) -> LoopConstants:
+        """This run's constants.
+
+        The same object as ``config.rc``, reachable in one hop because the
+        turn policies read it constantly and ``engine.config.rc.x`` says
+        nothing ``engine.rc.x`` does not.
+        """
+        return self.config.rc
+
+    @property
+    def prompt_provider(self) -> IPromptTemplateProvider:
+        """The provider that renders this run's prompt templates.
+
+        Falls back to the bundled one when the config names none, so every
+        call site can render unconditionally instead of carrying a branch for
+        the host that configured nothing.
+        """
+        configured = self.config.prompt_provider
+        if configured is not None:
+            return configured
+        return bundled_prompt_provider()
+
+    def prompt_text(self, name: str, /, **context: Any) -> str:
+        """Render the named prompt template for this run.
+
+        The loop speaks to the model in more places than the system prompt:
+        it nudges a run towards its terminal tool, it explains a truncated
+        tool call, it stands a placeholder in for a result that never
+        arrived. Each of those is a template, and this is how the loop reaches
+        one.
+        """
+        return self.prompt_provider.render(name, dict(context))
 
     @property
     def tool_call_ledger(self) -> list[dict[str, Any]]:
@@ -1307,7 +1796,7 @@ class QueryEngine:
         Called once per call, in transcript order, from the dispatch path —
         both the serial one and the transcript-order replay the parallel
         branch runs after its gather. Past
-        :attr:`RuntimeConstants.run_tool_call_ledger_max_entries` the entry is
+        :attr:`LoopConstants.run_tool_call_ledger_max_entries` the entry is
         dropped and :attr:`tool_call_ledger_truncated` latches; the ordinal
         still advances so ``seq`` keeps meaning "the Nth call this run made".
         """
@@ -1332,7 +1821,7 @@ class QueryEngine:
         recovery scaffolding, are excluded: an earlier run's fluent reply is
         the exact thing that would make an unanswered run look answered.
         """
-        # Deferred import: ``query`` imports this module, and the rule about
+        # Deferred import: the turn driver imports this module, and the rule about
         # what counts as this run's own words is stated there, next to the
         # other run-scoped predicates that share it.
         from protocore.runtime.query import run_has_final_answer
@@ -1343,7 +1832,7 @@ class QueryEngine:
     def effective_tool_policy(self) -> ToolVisibilityPolicy:
         """Per-turn surface policy with the RC core tool-surface floor applied.
 
-        ``RuntimeConstants.tool_surface_forced_pins``
+        ``LoopConstants.tool_surface_forced_pins``
         is the UNIVERSAL floor (default: Agent plus the six core file tools). The core
         engine itself merges it into ``ToolVisibilityPolicy.forced_pinned`` here
         so the floor is active on the live ``compute_effective_surface`` path
@@ -1386,6 +1875,7 @@ class QueryEngine:
             policy,
             profile=self.config.execution_profile,
             rc=self.config.rc,
+            roles=self.config.tool_roles,
         )
         # The wind-down has the last word, and it has to. Everything above this
         # line is a mechanism for keeping a tool on the surface — the RC floor
@@ -1422,7 +1912,14 @@ class QueryEngine:
         declared = self.config.subagent_tool_allowlist
         if not declared:
             return None
-        return frozenset(declared) | self.effective_tool_policy.forced_pinned
+        allowed = frozenset(declared) | self.effective_tool_policy.forced_pinned
+        # The narrowing rule, applied at the catalogue. A child never reaches a
+        # tool its host declared ``never_delegated``, and the tool-surface floor
+        # is no exception: the floor exists so the model is not handed a schema
+        # it cannot call, and a name withheld from every child is not on this
+        # child's surface to begin with. The gate applies the same rule again on
+        # the call itself, because the two used to be free to disagree.
+        return narrow_tool_capabilities(allowed, roles=self.config.tool_roles)
 
     def rearm(self) -> None:
         """Return a settled engine to PENDING so it can take another turn.
@@ -1488,6 +1985,7 @@ class QueryEngine:
             blob_store=self.blobs,
             compaction_provider=self.compaction_llm,
             provider_chain=self.provider_chain,
+            background_pool=self.background_pool,
         )
         for name, value in vars(fresh).items():
             if name not in self._REARM_PRESERVED_ATTRS:
@@ -1500,9 +1998,10 @@ class QueryEngine:
             if hasattr(self, name):
                 delattr(self, name)
 
-        # The helper bag stays — the host owns it — but the per-run streaks and
-        # one-shot signals kept inside it are allowances like any other.
-        clear_run_scoped_helpers(getattr(self, "_helpers", None))
+        # The run's state object stays — its tree ledger is shared with
+        # subagents that may still be drawing on it — but the per-run streaks
+        # and one-shot signals inside it are allowances like any other.
+        self.run_state.clear_run_scoped_streaks()
 
     def transition_to(self, new_state: LoopState) -> None:
         """Validate then apply a state transition.
@@ -1511,6 +2010,11 @@ class QueryEngine:
         if the transition violates the legal table.
         """
         assert_transition(self.state, new_state)
+        # An ``AWAITING`` with nothing parked beside it is a run that stops and
+        # can never be resumed, because nothing names the answer that would
+        # move it. Refused here, where the caller that forgot to record the
+        # wait is still on the stack.
+        assert_awaiting_is_witnessed(new_state, len(self._pending_interrupts))
         self.state = new_state
 
     def turn_id(self) -> str:
@@ -1603,11 +2107,117 @@ class QueryEngine:
     def forget_tool_name(self, tool_call_id: str) -> None:
         self._pending_tool_call_names.pop(tool_call_id, None)
 
-    def mark_pending_approval(self, tool_call_id: str) -> None:
-        self._pending_approval_tool_call_id = tool_call_id
+    @property
+    def pending_interrupts(self) -> tuple[PendingInterrupt, ...]:
+        """Everything this run is waiting for, in the order it started waiting.
+
+        The order is the order the calls appear in history, so a host renders
+        a parked batch the way the model asked for it and a resumed run lands
+        the results in the same sequence.
+        """
+        return self._pending_interrupts
+
+    def park_interrupt(self, interrupt: PendingInterrupt) -> PendingInterrupt:
+        """Record one wait and return it as it was actually parked.
+
+        The returned value is what a host must quote to resolve it: a second
+        park of the same call keeps the identity the host was already handed,
+        so a re-drive that re-parks a call does not silently mint a second id
+        for the same wait.
+        """
+        self._pending_interrupts = park_interrupt(self._pending_interrupts, interrupt)
+        parked = find_interrupt_for_call(self._pending_interrupts, interrupt.tool_call_id)
+        if parked is None:  # pragma: no cover — just inserted, by construction
+            raise InterruptResolutionError(
+                f"parking the wait on {interrupt.tool_call_id!r} left nothing "
+                "recorded against it"
+            )
+        return parked
+
+    def _interrupt_expiry_ms(self, created_at_ms: int) -> int | None:
+        seconds = self.config.rc.pending_interrupt_ttl_seconds
+        if seconds <= 0:
+            return None
+        return created_at_ms + seconds * 1000
+
+    def mark_pending_approval(
+        self,
+        tool_call_id: str,
+        *,
+        tool_name: str = "",
+        payload: dict[str, Any] | None = None,
+    ) -> PendingInterrupt:
+        """Park a call at an approval gate, as a typed wait with an identity.
+
+        The single choke point through which every approval park passes, and
+        therefore the one place the durable record of the call can be moved
+        off "dispatched" without eighteen callers remembering to. A record
+        left saying "dispatched" for a call that never ran would tell a
+        resumed run the outcome is unknown — and a call parked at a gate has
+        no outcome to be unknown about.
+        """
+        from protocore.runtime.intent import find_intent, mark_pending_approval
+
+        created = int(time.time() * 1000)
+        parked = self.park_interrupt(
+            PendingInterrupt(
+                interrupt_id=new_interrupt_id(),
+                kind=InterruptKind.approval,
+                tool_call_id=tool_call_id,
+                tool_name=tool_name or self.tool_name_for(tool_call_id),
+                payload=dict(payload or {}),
+                created_at_ms=created,
+                expires_at_ms=self._interrupt_expiry_ms(created),
+            )
+        )
+        record = find_intent(self.open_intents, tool_call_id)
+        if record is not None:
+            mark_pending_approval(record)
+        return parked
+
+    def mark_awaiting_answer(
+        self,
+        tool_call_id: str,
+        *,
+        tool_name: str = "",
+        payload: dict[str, Any] | None = None,
+        kind: InterruptKind = InterruptKind.question,
+    ) -> PendingInterrupt:
+        """Park a call that is waiting for an answer rather than a decision.
+
+        The difference from an approval is the whole reason the kind exists.
+        An approval is a call that has NOT run and may be refused; a question
+        is a call that HAS run, far enough to ask, and whose answer is its
+        result. Answering the first would run a tool nobody approved; approving
+        the second would write "approved" where the transcript wants the reply.
+        """
+        created = int(time.time() * 1000)
+        return self.park_interrupt(
+            PendingInterrupt(
+                interrupt_id=new_interrupt_id(),
+                kind=kind,
+                tool_call_id=tool_call_id,
+                tool_name=tool_name or self.tool_name_for(tool_call_id),
+                payload=dict(payload or {}),
+                created_at_ms=created,
+                expires_at_ms=self._interrupt_expiry_ms(created),
+            )
+        )
 
     def pending_approval_tool_call_id(self) -> str | None:
-        return self._pending_approval_tool_call_id
+        """The call parked for a DECISION, when exactly one is.
+
+        Deliberately blind to every other kind of wait: a question waiting for
+        its answer is not an approval, and reporting it as one is what made an
+        answered question arrive at the approval door. Deliberately blind to a
+        batch as well — a caller asking for "the" pending approval when three
+        are parked has a question that has no single answer, and reading
+        :attr:`pending_interrupts` is the one that does.
+        """
+        approvals = interrupts_of_kind(self._pending_interrupts, InterruptKind.approval)
+        if len(approvals) != 1:
+            return None
+        return approvals[0].tool_call_id
 
     @property
     def verification_lifecycle(self) -> VerificationLifecycle:
@@ -1797,21 +2407,42 @@ class QueryEngine:
         return CandidateReleasedProjection.from_lifecycle(self._verification_lifecycle)
 
     def clear_pending_approval(self, tool_call_id: str) -> None:
-        if self._pending_approval_tool_call_id == tool_call_id:
-            self._pending_approval_tool_call_id = None
+        """Release the wait recorded against ``tool_call_id``, if any."""
+        self._pending_interrupts = release_interrupt(
+            self._pending_interrupts, tool_call_id=tool_call_id
+        )
+
+    def release_interrupt(self, interrupt_id: str) -> None:
+        """Release one wait by its own identity."""
+        self._pending_interrupts = release_interrupt(
+            self._pending_interrupts, interrupt_id=interrupt_id
+        )
 
     # ------------------------------------------------------------------
     # Snapshot / resume
     # ------------------------------------------------------------------
 
     def snapshot(self) -> dict[str, Any]:
-        """Serialise engine state for Redis Hash ``run:{id}``.
+        """Serialise the run so another process can pick it up.
 
- 1 + .5.
- ``last_heartbeat_ms`` is surfaced as a discrete field for the
- stuck-runs-reaper fast scan.
- """
+        The payload is a flat JSON-compatible mapping, which is what lets a
+        host keep it in a hot key-value store. ``last_heartbeat_ms`` is a
+        discrete top-level field rather than a nested one so a reaper scanning
+        for stalled runs can read it without parsing the rest.
+
+        The first field is :data:`~protocore.contracts.snapshot.SNAPSHOT_SCHEMA_KEY`:
+        every other field is only meaningful under a version the reader knows.
+        """
+        # Resolved rather than read best-effort: the run's own LLM calls are
+        # charged before it ever delegates, so a ledger that only came into
+        # existence at the first dispatch would start counting late — and a
+        # snapshot without one is refused on the way back in.
+        self.run_state.ensure_run_work_ledger(self.config.rc)
         snapshot = {
+            # The schema the reader must recognise before it reads anything
+            # else. Stated first because everything below it is only meaningful
+            # under a version the reader knows.
+            SNAPSHOT_SCHEMA_KEY: SNAPSHOT_SCHEMA_VERSION,
             "run_id": self.config.run_id,
             "tenant_id": self.config.tenant_id,
             "session_id": self.config.session_id,
@@ -1830,7 +2461,10 @@ class QueryEngine:
             "history": [m.model_dump(mode="json") for m in self.history],
             "state": self.state.value,
             "turn_count": self.turn_count,
-            "pending_approval_tool_call_id": self._pending_approval_tool_call_id,
+            # Everything the run is waiting for, typed. A resumed process
+            # reads this to know which answers would move it — and, for a
+            # parked batch, that there is more than one.
+            "pending_interrupts": serialise_interrupts(self._pending_interrupts),
             "usage": self.total_usage.to_dict(),
             "last_observed_prompt_tokens": self.last_observed_prompt_tokens,
             "compaction": {
@@ -1970,7 +2604,122 @@ class QueryEngine:
             # consumer reading the snapshot does not have to re-derive the
             # run-scoping rule to find out.
             "has_final_answer": self.has_final_answer,
+            # Persist the requested cancellation. A stop is a durable FACT about
+            # the run, in the same class as ``terminal_only_active`` and
+            # ``run_delegated``, and it was living only in a per-process
+            # ``asyncio.Event``. An operator who cancelled a run moments before
+            # the process died would otherwise see the run picked up elsewhere
+            # and carry on spending budget on work nobody wants; the first
+            # stop-check of the resumed turn now closes it instead.
+            "stop_requested": self.stop_requested,
+            # Persist how far down the provider chain this run has been demoted.
+            # The cursor is one-way for the life of a run, so without the count
+            # a resumed run walked back onto a provider it had already proved
+            # unhealthy and did it with a fresh advance budget — under a
+            # degrading upstream that is a loop, one full expensive turn per
+            # round, doubling load on the endpoint that is already sick.
+            # Which of this session's background commands were still running.
+            # The pool is the host's and holds nothing durable, so this is the
+            # only record that survives a process death: a resumed run compares
+            # it against what the pool came back holding and can then tell the
+            # agent that nobody is watching its command, instead of reporting
+            # the silence as "nothing finished".
+            "background_task_ids": self._live_background_task_ids(),
+            "provider_chain_advances": self._provider_chain_advances,
+            # The rung the run is actually SITTING ON, taken from the chain
+            # rather than from the configured model name. The two are not the
+            # same fact: the configured name is what the host asked this run to
+            # speak to and can be an override the chain rows never carry, so
+            # asserting the chain against it refuses to resume a run that was
+            # never demoted at all. ``None`` for a run with no chain.
+            "provider_chain_model_name": (
+                self.provider_chain.current_model_name()
+                if self.provider_chain is not None
+                else None
+            ),
+            # The run's state: the tree's CUMULATIVE work ledger, which is the
+            # only bound on the TOTAL work a run tree may do. Without it every
+            # cold re-drive handed the tree a fresh budget of child runs and
+            # tokens, and the loop "die, get picked up, spend the cap again" had
+            # no upper bound.
+            # The tree's concurrency budget rides along in the same payload: it
+            # is a LIVE semaphore shared by reference down the tree, so there is
+            # no object to persist and nothing to reattach to on a cold start.
+            # What survives is the pair (capacity, slots taken); a resumed run
+            # rebuilds a semaphore from it. Absent entirely for a tree that never
+            # fanned out — the budget is deliberately minted at the first
+            # parallel fan-out, and persisting it earlier would invent a bound
+            # the run never had.
+            RUN_SCOPED_STATE_SNAPSHOT_KEY: self.run_state.to_snapshot(),
         }
+        # ── The continuity a re-arm keeps, so a cold resume keeps it too ────
+        # Everything below survives ``rearm()``, which means the engine already
+        # treats it as belonging to the RUN rather than to the turn. A snapshot
+        # that dropped it would hand the resumed run a different agent: one that
+        # has forgotten what it compacted away, which rule files it had
+        # activated, which tools it had pinned into the prompt prefix, and what
+        # it recorded about its own work.
+        #
+        # The checkpoint is the only place the folded-away history survives at
+        # all — losing it on resume loses those turns for good.
+        snapshot["compact_checkpoint"] = (
+            self.compact_checkpoint.to_dict()
+            if hasattr(self.compact_checkpoint, "to_dict")
+            else self.compact_checkpoint
+        )
+        # Which directory-scoped rule files were discovered, and which of them
+        # the run has already activated. Re-deriving discovery costs a walk the
+        # resumed process may not be able to repeat (the workspace is the
+        # host's), and re-deriving activation is impossible: it is a record of
+        # which files this run happened to touch.
+        snapshot["active_rule_paths"] = list(self.active_rule_paths)
+        snapshot["discovered_rules"] = [
+            item.to_dict() if hasattr(item, "to_dict") else item
+            for item in self.discovered_rules
+        ]
+        # Records the caller reads back — permissions the session granted, the
+        # execution-profile changes and who made them, and the spans. None of
+        # them is an allowance the run may spend again; each is evidence, and a
+        # resume that dropped it would destroy the evidence rather than free a
+        # budget.
+        snapshot["session_grants"] = [
+            item.to_dict() if hasattr(item, "to_dict") else item
+            for item in self.session_grants
+        ]
+        snapshot["profile_audit"] = [dict(item) for item in self.profile_audit]
+        snapshot["spans"] = [
+            item.to_dict() if hasattr(item, "to_dict") else item for item in self.spans
+        ]
+        # The context manager itself is rebuilt from the config on the new pod.
+        # The one thing it holds that no rebuild can produce is the pin LRU —
+        # the tools the agent went looking for and asked to keep — so that is
+        # what travels, in LRU order, least-recently-pinned first.
+        snapshot["context_manager_pinned_tools"] = list(
+            self.context_manager.pinned_tool_names()
+        )
+        # The skill catalog block is rebuilt from the store on the new pod, so
+        # its BYTES are not carried; its digest is, because those bytes are the
+        # head of the cached prompt prefix and a resume that silently rebuilds
+        # a different block invalidates the cache for the rest of the run.
+        # ``None`` means the run had not built one yet, which is distinct from
+        # having built an empty one.
+        snapshot["skill_catalog_block_sha256"] = (
+            hashlib.sha256(self._skill_catalog_block.encode("utf-8")).hexdigest()
+            if self._skill_catalog_block is not None
+            else None
+        )
+        # The manifest of the last request this run made, BY ID. The manifest
+        # is a record of megabytes of messages and tool definitions; copying it
+        # into every snapshot would make the snapshot grow with the history it
+        # already carries once. What travels is the id and the schema version
+        # the manifest was written under, which is what a reader needs to go
+        # and ask the host's store for it — and to refuse it if this build
+        # cannot read that version.
+        snapshot["last_request_manifest"] = (
+            dict(self._last_request_manifest)
+            if self._last_request_manifest is not None
+            else None
+        )
         if self._verification_lifecycle != VerificationLifecycle():
             snapshot["verification"] = self._verification_lifecycle.snapshot()
         snapshot["open_intents"] = [
@@ -1984,13 +2733,117 @@ class QueryEngine:
         ]
         return snapshot
 
-    async def resume_from_snapshot(self, snapshot: dict[str, Any]) -> None:
-        """Rehydrate engine from snapshot dict.
+    def _live_background_task_ids(self) -> list[str]:
+        """Ids of this session's background commands that have not finished."""
+        pool = self.background_pool
+        if pool is None:
+            return []
+        return sorted(
+            item.id
+            for item in pool.list(self.config.session_id)
+            if item.status not in BACKGROUND_TERMINAL_STATUSES
+        )
 
- Called by an executor pod that picks up an orphaned run. Per
- .3 the caller is expected to also wire an
- emitter for the ``state_changed`` "resumed_from_snapshot" event.
- """
+    async def _restore_provider_chain_position(self, snapshot: dict[str, Any]) -> None:
+        """Re-seat the run on the chain rung it had reached when it was cut off.
+
+        The chain cursor is one-way and lives in the host's chain object, so a
+        process that picks a run up starts wherever that object is — position
+        zero on a cold start, and wherever THIS run already walked it to when
+        the same live engine is resumed from its own snapshot mid-turn. The walk
+        is therefore RELATIVE: forward by whatever is left between where the
+        chain stands and where the snapshot says it should be, and a snapshot
+        that is already seated moves nothing. Walking absolutely would demote a
+        live run one rung further every time it was resumed.
+
+        The identity of the rung is the chain's own model name, persisted
+        beside the count. It is NOT the configured ``model_name``: the host may
+        pin a run to a model the chain rows never name, and asserting the chain
+        against that pin refuses every resume of every run in such a scope,
+        demoted or not. The configured name is applied from the snapshot as
+        before — it is the outcome of a one-way demotion and outranks whatever
+        this process started on.
+
+        A chain that no longer contains the persisted rung — reordered, or a
+        model withdrawn between the two processes — is an explicit refusal.
+
+        The whole provider moves, never the name alone: rebinding only the
+        configured model name would leave the previous vendor's endpoint and key
+        in place, holding a name that endpoint does not serve.
+        """
+        persisted_model_name = snapshot.get("model_name")
+        if not isinstance(persisted_model_name, str) or not persisted_model_name:
+            raise ValueError("snapshot is missing model_name")
+        advances = _as_snapshot_count(snapshot.get("provider_chain_advances"))
+        chain = self.provider_chain
+        if chain is None:
+            if advances:
+                raise ValueError(
+                    "snapshot records a demoted provider but this engine has no "
+                    "provider chain to re-seat it on"
+                )
+            self.config = replace(self.config, model_name=persisted_model_name)
+            return
+        walked = self._provider_chain_advances
+        if walked > advances:
+            raise ValueError(
+                f"snapshot records position {advances} but this run has already "
+                f"advanced to {walked}; the chain cursor does not rewind"
+            )
+        if advances == 0:
+            # Never demoted, so there is no rung to verify and nothing to
+            # re-seat: position zero is where a cold start already stands, and
+            # the rewind check above has ruled out this engine being past it.
+            # Demanding the persisted rung here would make every snapshot
+            # written before it was recorded unresumable in every scope that
+            # configures a chain — including the runs that never left the
+            # primary, which is most of them.
+            self.config = replace(self.config, model_name=persisted_model_name)
+            return
+        persisted_rung = snapshot.get("provider_chain_model_name")
+        if not isinstance(persisted_rung, str) or not persisted_rung:
+            raise ValueError("snapshot is missing provider_chain_model_name")
+        for _ in range(advances - walked):
+            if not await chain.advance(reason="snapshot_restore"):
+                raise ValueError(
+                    f"provider chain is exhausted before reaching the snapshot "
+                    f"rung {persisted_rung!r}"
+                )
+        if chain.current_model_name() != persisted_rung:
+            raise ValueError(
+                f"provider chain does not contain the snapshot rung "
+                f"{persisted_rung!r} at position {advances}"
+            )
+        self.llm = chain.current()
+        self.config = replace(self.config, model_name=persisted_model_name)
+        self._provider_chain_advances = advances
+
+    async def resume_from_snapshot(self, snapshot: dict[str, Any]) -> None:
+        """Rehydrate this engine from a snapshot, or refuse it and change nothing.
+
+        Called by a process that picks up a run another process left behind.
+        The caller is expected to emit the ``state_changed`` event announcing
+        the resume; the engine does not, because only the caller knows whether
+        the run is being resumed or replayed.
+
+        Refusals are the point of the ordering below: the schema, the delivery
+        binding, the run identity and every value that can fail to parse are all
+        settled before the first mutation, so a rejected snapshot leaves the
+        engine exactly as it was.
+        """
+        # The schema comes first, before the delivery binding and before the
+        # run identity below it. Every other check reads named fields, and what
+        # a name means is a property of the schema: a payload this build cannot
+        # place is one whose absent fields are indistinguishable from fields
+        # that were legitimately empty. Refuse it while the run is untouched.
+        #
+        # An older payload that the chain can bring forward is upgraded here
+        # rather than refused, and everything below reads the upgraded copy —
+        # so the restore is written once, against the current shape, and the
+        # knowledge of what an older shape looked like stays in the one place
+        # that owns it.
+        snapshot = migrate_snapshot(snapshot)
+
         # A delivery-mode downgrade would make held provider content visible
         # after recovery.  Treat the mode as an immutable run binding and stop
         # before restoring any state or driving the public iterator when it is
@@ -2004,6 +2857,38 @@ class QueryEngine:
         if persisted_delivery != expected_delivery:
             raise ValueError("verification delivery snapshot binding does not match engine")
 
+        # Bind the snapshot to THIS run, unconditionally and before any state is
+        # applied. Restoring a snapshot belongs to exactly one run in one scope
+        # and one session; anything else splices one run's history — and its
+        # tenant's data — into another, silently, with the counters and usage
+        # overwritten to match. Nothing downstream can tell that apart from
+        # normal operation, so the only safe posture is fail-closed. The engine
+        # cannot audit the key the caller read the snapshot under, but it can
+        # refuse a snapshot that does not describe itself.
+        #
+        # A missing field is a mismatch, not a permissive default: a snapshot
+        # that does not state its own identity has not been bound, and the
+        # historical fail-open shape is exactly what this rejects.
+        #
+        # ``model_name`` is deliberately NOT on this list — it is the result of
+        # a one-way provider demotion and is APPLIED, not compared.
+        for field_name, expected in (
+            ("run_id", self.config.run_id),
+            ("tenant_id", self.config.tenant_id),
+            ("session_id", self.config.session_id),
+            ("root_run_id", self.config.root_run_id),
+            ("parent_run_id", self.config.parent_run_id),
+            ("subagent_id", self.config.subagent_id),
+        ):
+            if field_name not in snapshot:
+                raise ValueError(
+                    f"snapshot is missing the run identity field {field_name!r}"
+                )
+            if snapshot[field_name] != expected:
+                raise ValueError(
+                    f"snapshot run identity does not match engine: {field_name!r}"
+                )
+
         # Validate deadline fields before any engine mutation. A future epoch
         # is legal (clock skew); NaN/Inf/negative/non-numeric values are not.
         restored_deadline = restore_deadline_clock(
@@ -2013,25 +2898,90 @@ class QueryEngine:
             now_monotonic=time.monotonic(),
         )
 
+        # The tree's cumulative work ledger is a hard admission requirement, not
+        # a best-effort restore. Minting a fresh one for a run that is being
+        # picked up would hand the tree the whole cap again, which is exactly
+        # the unbounded "die and get re-driven" loop the ledger exists to close.
+        # Checked before any mutation so a snapshot without one is refused
+        # rather than half-applied.
+        persisted_run_state = snapshot.get(RUN_SCOPED_STATE_SNAPSHOT_KEY)
+        if not isinstance(persisted_run_state, dict) or not isinstance(
+            persisted_run_state.get("run_work_ledger"), dict
+        ):
+            raise ValueError(
+                f"snapshot is missing {RUN_SCOPED_STATE_SNAPSHOT_KEY}"
+                ".run_work_ledger; a resumed run may not be granted a fresh "
+                "tree work budget"
+            )
+
+        # Parsed BEFORE the chain is touched. Re-seating the chain moves a
+        # one-way cursor on an object the host owns and that outlives this
+        # call, so it is the last thing to happen that cannot be undone: a
+        # snapshot whose history will not parse must be refused with the chain
+        # standing exactly where it was, not left demoted for a run that never
+        # came up.
         history_data = snapshot.get("history", [])
-        self.history = [Message.model_validate(m) for m in history_data]
-        self.state = LoopState(snapshot.get("state", LoopState.PENDING.value))
-        self.turn_count = int(snapshot.get("turn_count", 0))
-        pending_approval_tool_call_id = snapshot.get("pending_approval_tool_call_id")
-        self._pending_approval_tool_call_id = (
-            pending_approval_tool_call_id if isinstance(pending_approval_tool_call_id, str) else None
-        )
-        self.total_usage = TokenUsage.from_dict(snapshot.get("usage", {}))
-        self.last_observed_prompt_tokens = int(
+        restored_history = [Message.model_validate(m) for m in history_data]
+
+        # Every remaining value that can REFUSE a malformed snapshot is parsed
+        # here, into locals, for the same reason the history is: an unknown
+        # state name, a non-numeric turn count, a usage or compaction block
+        # that will not coerce all raise, and each of them would otherwise
+        # raise AFTER the chain had been moved.
+        restored_state = LoopState(snapshot.get("state", LoopState.PENDING.value))
+        restored_turn_count = int(snapshot.get("turn_count", 0))
+        restored_total_usage = TokenUsage.from_dict(snapshot.get("usage", {}))
+        restored_observed_prompt_tokens = int(
             snapshot.get("last_observed_prompt_tokens", 0)
         )
-
+        # The run continuity — checkpoint, rules, pins, records. Parsed here for
+        # the same reason as the history above: a missing or malformed block
+        # must refuse the snapshot with the chain standing where it was, not
+        # after half the engine has been overwritten.
+        restored_continuity = _parse_run_continuity(snapshot)
+        # The manifest reference, checked here — among the parses, before the
+        # first mutation — so an unreadable one refuses the snapshot with the
+        # engine untouched. A reference this build cannot place is refused
+        # loudly; an ABSENT one is not a refusal at all, because a manifest the
+        # host never kept, or has since aged out, is evidence this run does not
+        # have rather than a run that cannot continue.
+        restored_manifest_reference = _parse_request_manifest_reference(snapshot)
         compaction = snapshot.get("compaction", {})
-        self.compaction_state = CompactionState(
+        restored_compaction = CompactionState(
             retry_count=int(compaction.get("retry_count", 0)),
             summarised_turn_ids=set(compaction.get("summarised_turn_ids", [])),
             blob_refs_created=list(compaction.get("blob_refs_created", [])),
         )
+
+        # Put the run back on the provider it was demoted to. An unreachable
+        # rung is a refusal, not a silent fall back to the primary.
+        # ``model_name`` is APPLIED rather than compared — the snapshot's value
+        # is the outcome of a one-way demotion, so it is the authority over
+        # whatever rung this process happened to start on.
+        await self._restore_provider_chain_position(snapshot)
+
+        self.history = restored_history
+        self.state = restored_state
+        self.turn_count = restored_turn_count
+        self._pending_interrupts = deserialise_interrupts(
+            snapshot.get("pending_interrupts")
+        )
+        # The same rule the live transition enforces, applied to the durable
+        # record. A restore assigns the state directly — it is putting the run
+        # back where it was, not moving it — so without this the one shape the
+        # rule forbids could still walk in from storage, and a host would pick
+        # up a run that says it is waiting and names nothing that could end the
+        # wait. Refused here, while the payload is still identifiable.
+        assert_awaiting_is_witnessed(self.state, len(self._pending_interrupts))
+        restored_background_ids = snapshot.get("background_task_ids")
+        self._resumed_background_task_ids = (
+            tuple(item for item in restored_background_ids if isinstance(item, str))
+            if isinstance(restored_background_ids, list)
+            else ()
+        )
+        self.total_usage = restored_total_usage
+        self.last_observed_prompt_tokens = restored_observed_prompt_tokens
+        self.compaction_state = restored_compaction
         self.last_heartbeat_ms = int(snapshot.get("last_heartbeat_ms", 0))
         snapshot_root_run_id = snapshot.get("root_run_id", self.config.root_run_id)
         root_binding_matches = (
@@ -2073,6 +3023,12 @@ class QueryEngine:
         # the field existed resumes as a run that never delegated — the
         # untouched side, which is the safe one.
         self._run_delegated = bool(snapshot.get("run_delegated", False))
+        # Restore the requested cancellation. Only ever SET here: the flag is
+        # one-way for the life of a run, and a snapshot taken before the stop
+        # landed must not clear a cancellation this process has already been
+        # given.
+        if bool(snapshot.get("stop_requested", False)):
+            self._stop_requested.set()
         # Apply the deadline clock validated before any restore mutation.
         # The synthetic monotonic start can legitimately be negative when
         # persisted elapsed exceeds this process's uptime; zero alone is the
@@ -2334,15 +3290,7 @@ class QueryEngine:
 
         restored_intents = snapshot.get("open_intents") or []
         self.open_intents = [
-            IntentRecord(
-                operation_id=str(item.get("operation_id", "")),
-                tool_name=str(item.get("tool_name", "")),
-                tool_call_id=str(item.get("tool_call_id", "")),
-                reserved_result_ids=list(item.get("reserved_result_ids") or []),
-                replay=item.get("replay") or "safe",
-                status=item.get("status") or "open",
-                result=item.get("result"),
-            )
+            IntentRecord.from_dict(item)
             for item in restored_intents
             if isinstance(item, dict)
         ]
@@ -2373,6 +3321,48 @@ class QueryEngine:
             for item in restored_lanes
             if isinstance(item, dict)
         ]
+        # Put the run continuity back. The pin LRU is re-pinned in the order it
+        # was persisted so the least-recently-pinned entry is still the one the
+        # next overflow evicts; the manager's own cap applies as it would to a
+        # live pin, which is what keeps a snapshot from restoring more pins than
+        # the current configuration allows.
+        self.compact_checkpoint = restored_continuity.compact_checkpoint
+        self.active_rule_paths = restored_continuity.active_rule_paths
+        self.discovered_rules = restored_continuity.discovered_rules
+        self.session_grants = restored_continuity.session_grants
+        self.profile_audit = restored_continuity.profile_audit
+        self.spans = restored_continuity.spans
+        self._resumed_skill_catalog_sha256 = restored_continuity.skill_catalog_block_sha256
+        self._last_request_manifest = restored_manifest_reference
+        for pinned_name in restored_continuity.pinned_tools:
+            self.context_manager.pin_tool(pinned_name)
+
+        # Put the tree budgets back into the state object the whole tree shares
+        # by reference, so the resumed run and everything it dispatches keep
+        # spending the SAME cumulative allowance the dead process was spending.
+        #
+        # Capacity comes back, occupancy does NOT: the concurrency slots the
+        # snapshot records were held by coroutines in a process that is gone, no
+        # permit object survived into this one, nothing here can ever release
+        # them, and a budget rebuilt with them taken loses that much capacity for
+        # the rest of the run's life — or, at full occupancy, hands the resumed
+        # run a semaphore with no permits at all, on which its first delegation
+        # waits forever. The bound that DOES carry across a restart is the
+        # cumulative ledger; the other is a live permit and a dead process holds
+        # none. A budget THIS process is still holding slots on — a run resumed
+        # from its own snapshot mid-turn, with descendants in flight — is left
+        # alone by the same rule, or their permits would be stranded on an object
+        # nothing can reach.
+        self.run_state.apply_snapshot(persisted_run_state)
+
+    async def persist_snapshot(self) -> None:
+        """Write the run's durable state.
+
+        The public name for what the loop's own call sites reach through
+        ``_persist_snapshot``: a turn policy is handed the run as a narrow
+        protocol, and a protocol whose members are private names is not one.
+        """
+        await self._persist_snapshot()
 
     async def _persist_snapshot(self) -> None:
         """Write the snapshot via :class:`IEventStream`.
@@ -2484,6 +3474,32 @@ class QueryEngine:
             self.history,
             observed_prompt_tokens=self.last_observed_prompt_tokens,
         )
+
+    @property
+    def last_request_manifest(self) -> dict[str, Any] | None:
+        """The reference to the last request this run manifested, or ``None``.
+
+        A copy: the caller reads evidence and must not be able to edit the
+        run's record of it.
+        """
+        return (
+            dict(self._last_request_manifest)
+            if self._last_request_manifest is not None
+            else None
+        )
+
+    def note_request_manifest(self, manifest: RequestManifest) -> None:
+        """Record that ``manifest`` describes the request now being made.
+
+        Called by the loop the moment the manifest exists, which is BEFORE the
+        provider is asked and therefore before the first delta. Only the id and
+        the schema version are kept; the manifest itself belongs to the host.
+        """
+        self._last_request_manifest = {
+            "manifest_id": manifest.manifest_id,
+            REQUEST_MANIFEST_SCHEMA_KEY: manifest.manifest_schema_version,
+            "attempt_id": manifest.attempt_id,
+        }
 
     def history_snapshot(self) -> Sequence[Message]:
         return tuple(self.history)

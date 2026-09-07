@@ -90,8 +90,8 @@ def test_event_name_has_expected_categories() -> None:
     # Compaction
     assert "compaction_routine_start" in names
     assert "compaction_emergency_start" in names
-    # Sandbox
-    assert "sandbox_starting" in names
+    # Tool transport
+    assert "tool_transport_starting" in names
     # Subagent
     assert "subagent_spawn" in names
     # Hooks

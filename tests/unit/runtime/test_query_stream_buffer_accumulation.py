@@ -14,7 +14,7 @@ from collections.abc import AsyncIterator
 import pytest
 
 from protocore.contracts.llm import ProviderDelta, ProviderDeltaKind
-from protocore.contracts.runtime_constants import RuntimeConstants
+from protocore.contracts.runtime_constants import LoopConstants
 from protocore.contracts.types import Message, MessageRole, TextBlock
 from protocore.runtime.query import (
     _drive_one_stream,
@@ -46,7 +46,7 @@ def _make_provider_deltas(
 
 @pytest.mark.asyncio
 async def test_text_buffer_joins_many_fragments_in_order(engine_factory) -> None:
-    engine = engine_factory(rc=RuntimeConstants(model_context_window=4_096))
+    engine = engine_factory(rc=LoopConstants(model_context_window=4_096))
     engine.history.append(_user_message("hi"))
     fragments = [f"chunk-{i}-" for i in range(500)]
     deltas = [
@@ -67,7 +67,7 @@ async def test_text_buffer_joins_many_fragments_in_order(engine_factory) -> None
 
 @pytest.mark.asyncio
 async def test_reasoning_buffer_joins_fragments_independently(engine_factory) -> None:
-    engine = engine_factory(rc=RuntimeConstants(model_context_window=4_096))
+    engine = engine_factory(rc=LoopConstants(model_context_window=4_096))
     engine.history.append(_user_message("hi"))
     deltas = [
         ProviderDelta(kind=ProviderDeltaKind.thinking, content="re"),
@@ -90,7 +90,7 @@ async def test_reasoning_buffer_joins_fragments_independently(engine_factory) ->
 
 @pytest.mark.asyncio
 async def test_empty_and_none_content_fragments_are_ignored(engine_factory) -> None:
-    engine = engine_factory(rc=RuntimeConstants(model_context_window=4_096))
+    engine = engine_factory(rc=LoopConstants(model_context_window=4_096))
     engine.history.append(_user_message("hi"))
     deltas = [
         ProviderDelta(kind=ProviderDeltaKind.text, content="x"),

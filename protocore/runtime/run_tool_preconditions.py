@@ -45,7 +45,7 @@ from __future__ import annotations
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:  # pragma: no cover - typing only
-    from protocore.contracts.types import ToolCall, ToolPrecondition
+    from protocore.contracts.types import Message, ToolCall, ToolPrecondition
     from protocore.runtime.query_engine import QueryEngine
 
 
@@ -120,6 +120,73 @@ def observe_tool_result(
         # nothing is forced again for the rest of the run.
         engine._tool_precondition_index += 1
         engine._tool_precondition_calls = 0
+
+
+def observe_injected_result_message(engine: QueryEngine, message: Message) -> None:
+    """Fold a tool-result message a CALLER injected into precondition progress.
+
+    Every ordinary tool result reaches :func:`observe_tool_result` from the
+    dispatcher, right after the call it settles. One result never goes through
+    the dispatcher at all: the answer to a question. ``AskUser`` runs far
+    enough to ask and then parks the run — the loop returns before the
+    post-dispatch bookkeeping — and the answer arrives later, as a tool-result
+    message handed to :meth:`QueryEngine.run` by whoever collected it.
+
+    Nothing folded that message into progress, so an entry naming the asking
+    tool could never be satisfied: a declared sequence of
+    ``[{AskUser, 1}, {Bash, 1}]`` stayed parked on its first entry forever
+    after the answer landed, and the turn that should have forced ``Bash``
+    forced either an already-answered ``AskUser`` or — when the asking tool is
+    no longer on the turn's surface — nothing at all, which is what a run
+    measured live did. The caller's message is the result of the call, so it
+    counts exactly as the dispatcher's would.
+
+    The call's tool NAME is read back from history rather than trusted from
+    the caller, because the caller has only the id. A result whose call cannot
+    be found in history is not progress on anything and is skipped.
+    """
+
+    from protocore.contracts.types import (
+        ContentBlockKind,
+        MessageRole,
+        ToolCall,
+        ToolResultBlock,
+    )
+
+    if message.role is not MessageRole.tool:
+        return
+    for block in message.content_blocks:
+        if not isinstance(block, ToolResultBlock):
+            continue
+        if block.kind is not ContentBlockKind.tool_result:  # pragma: no cover
+            continue
+        name = _tool_name_in_history(engine, block.tool_call_id)
+        if not name:
+            continue
+        observe_tool_result(
+            engine,
+            ToolCall(id=block.tool_call_id, name=name),
+            block.content,
+            is_error=block.is_error,
+        )
+
+
+def _tool_name_in_history(engine: QueryEngine, tool_call_id: str) -> str:
+    """The name of the call ``tool_call_id`` names, as the transcript records it.
+
+    Scoped to THIS run's messages. A prior run of the same session is seeded
+    into the same history, and a call id from one of those is not a call this
+    run's preconditions are about.
+    """
+
+    from protocore.contracts.types import ToolUseBlock
+    from protocore.runtime.query import _this_run_messages
+
+    for message in reversed(_this_run_messages(engine)):
+        for block in message.content_blocks:
+            if isinstance(block, ToolUseBlock) and block.tool_call_id == tool_call_id:
+                return block.name
+    return ""
 
 
 def is_exhausted(engine: QueryEngine) -> bool:

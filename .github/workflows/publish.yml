@@ -14,6 +14,12 @@ name: Publish
 #   Environment name  : pypi
 #
 # After that, publishing a GitHub Release uploads the matching version.
+#
+# One-time setup on GitHub, and it is not optional: Settings → Environments →
+# `pypi` → Required reviewers. The environment is the only point in this
+# workflow where an upload physically stops and waits for a person, and it is
+# the only one a release event cannot walk around. Everything below narrows the
+# ways in; the reviewer is what makes the last one deliberate.
 
 on:
   release:
@@ -25,11 +31,88 @@ on:
         required: true
         default: testpypi
         type: choice
-        options: [testpypi, pypi]
+        # The real index is deliberately absent. Uploading to it by hand was a
+        # second door into an irreversible action, opened without a release,
+        # without a tag, and without the version check that reads one. A PyPI
+        # version number can never be reused, so the door is closed rather than
+        # guarded.
+        options: [testpypi]
 
 jobs:
+  gates:
+    name: Release gates
+    # A dispatch to TestPyPI is a rehearsal against a throwaway index; it does
+    # not need — and must not wait on — the gates that govern the real one.
+    if: github.event_name == 'release'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      actions: read
+      statuses: read
+    env:
+      GH_TOKEN: ${{ github.token }}
+      SHA: ${{ github.sha }}
+    steps:
+      # "The tests were green" has to be a statement about THIS commit. The CI
+      # workflow runs on the release event as well, so a run for this exact SHA
+      # exists; requiring one is what turns the claim into a check.
+      - name: Require a completed, successful test run for this commit
+        run: |
+          set -euo pipefail
+          for attempt in $(seq 1 60); do
+            state=$(gh api \
+              "repos/${GITHUB_REPOSITORY}/actions/workflows/ci.yml/runs?head_sha=${SHA}" \
+              --jq '[.workflow_runs[] | select(.status == "completed")] | first | .conclusion // "pending"')
+            if [ "$state" = "success" ]; then
+              echo "the test workflow concluded successfully for ${SHA}"
+              exit 0
+            fi
+            if [ "$state" != "pending" ]; then
+              echo "::error::the test workflow concluded '${state}' for ${SHA}"
+              exit 1
+            fi
+            echo "waiting for the test workflow on ${SHA} (attempt ${attempt})"
+            sleep 30
+          done
+          echo "::error::no completed test run for ${SHA} after 30 minutes"
+          exit 1
+
+      # The publication scan itself is not here and cannot be. It matches
+      # against a list of the things that must never appear in this repository,
+      # and that list describes them by name — so a scanner published here would
+      # publish the very list it exists to enforce, and so would a repository
+      # secret or variable holding it, which anyone able to add a workflow step
+      # can print. The scan therefore runs outside this repository, from a
+      # private checkout, against this repository's public HEAD, and reports its
+      # verdict back as a commit status. This step reads the verdict; it never
+      # sees the list.
+      #
+      # Contract with the external scanner:
+      #   context     : publication/leak-scan
+      #   target SHA  : the commit the release points at
+      #   state       : success only when the scan found nothing
+      #   description : a count, never a matched string
+      - name: Require a clean publication scan for this commit
+        run: |
+          set -euo pipefail
+          state=$(gh api \
+            "repos/${GITHUB_REPOSITORY}/commits/${SHA}/status" \
+            --jq 'first(.statuses[] | select(.context == "publication/leak-scan") | .state) // "missing"')
+          if [ "$state" != "success" ]; then
+            echo "::error::publication scan status for ${SHA} is '${state}', expected 'success'."
+            echo "Run the scan from the private checkout against this SHA and let it report."
+            exit 1
+          fi
+          echo "publication scan is clean for ${SHA}"
+
   build:
     name: Build distributions
+    needs: [gates]
+    # `needs` on a skipped job skips this one too, and the gates job is skipped
+    # on a TestPyPI rehearsal on purpose. `always()` plus an explicit reading of
+    # the result keeps the rehearsal working while a failed or cancelled gate
+    # still stops a real release.
+    if: always() && (needs.gates.result == 'success' || github.event_name == 'workflow_dispatch')
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -87,7 +170,9 @@ jobs:
 
   pypi:
     name: Upload to PyPI
-    if: github.event_name == 'release' || (github.event_name == 'workflow_dispatch' && inputs.target == 'pypi')
+    # A published release, and nothing else. The manual route to this index no
+    # longer exists as a form, so this condition has one branch rather than two.
+    if: github.event_name == 'release'
     needs: build
     runs-on: ubuntu-latest
     environment:

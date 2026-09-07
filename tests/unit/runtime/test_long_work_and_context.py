@@ -5,7 +5,7 @@ import json
 
 import pytest
 
-from protocore.contracts.runtime_constants import RuntimeConstants
+from protocore.contracts.runtime_constants import LoopConstants
 from protocore.contracts.skills import SkillIndexEntry
 from protocore.contracts.tool_registry import ToolVisibilityPolicy
 from protocore.contracts.types import (
@@ -15,28 +15,22 @@ from protocore.contracts.types import (
     ToolResultBlock,
     ToolUseBlock,
 )
-from protocore.runtime.background import (
-    BackgroundPool,
-    FakeRunner,
-    adopt_notice,
-    compute_hard_timeout_seconds,
-    decide_foreground,
-    reap_is_safe,
-    refuse_notify_when_disabled,
-)
+from protocore.prompts import bundled_prompt_provider
 from protocore.runtime.compact_checkpoint import (
+    CompactCheckpoint,
     apply_checkpoint,
     build_checkpoint,
+    tracked_tool_names,
 )
 from protocore.runtime.events import EventType
 from protocore.runtime.execution_profile import apply_execution_profile, plan_forbids
-from protocore.runtime.path_policy import deny_reason, paths_in_command
 from protocore.runtime.permission_widen import (
+    CommandGrant,
     apply_widen,
     grant_covers,
     preview_widen,
 )
-from protocore.runtime.query import query
+from protocore.runtime.query import _query as query
 from protocore.runtime.result_eviction import evict_history_for_llm
 from protocore.runtime.rules_activation import (
     activate_on_filesystem_touch,
@@ -45,214 +39,45 @@ from protocore.runtime.rules_activation import (
     discover_agents_md,
 )
 from protocore.runtime.skill_index import render_skills_catalog
-from protocore.runtime.tool_result_split import split_result
+from protocore.runtime.tool_result_split import project_result_content
 from protocore.tests_support.adapters import InMemoryLLMProvider
+from tests._fixtures.tool_roles import CONVENTIONAL_TOOL_ROLES
+from tests.unit.runtime.fake_background_pool import FakeBackgroundPool
 
 
-def _on(**overrides: object) -> RuntimeConstants:
+def _on(**overrides: object) -> LoopConstants:
     values: dict[str, object] = {
         "model_context_window": 4096,
         "background_tasks_enabled": True,
-        "foreground_adopt_enabled": True,
         "execution_profile_plan_enabled": True,
         "permission_widening_enabled": True,
         "compaction_manual_enabled": True,
         "rules_discovery_enabled": True,
         "skills_hot_reload_enabled": True,
         "tool_result_split_enabled": True,
-        "path_protection_enabled": True,
         "run_settled_enabled": True,
     }
     values.update(overrides)
-    return RuntimeConstants(**values)  # type: ignore[arg-type]
-
-
-def test_notify_off_flag_refuses() -> None:
-    with pytest.raises(ValueError, match="background_tasks_disabled"):
-        refuse_notify_when_disabled(enabled=False, notify_on_finish=True)
-    refuse_notify_when_disabled(enabled=False, notify_on_finish=False)
-    refuse_notify_when_disabled(enabled=True, notify_on_finish=True)
-
-
-def test_timeout_formula_uses_rc() -> None:
-    rc = _on()
-    assert compute_hard_timeout_seconds(explicit=10, expected_seconds=100, rc=rc) == 10
-    expected = compute_hard_timeout_seconds(
-        explicit=None, expected_seconds=20, rc=rc
-    )
-    assert expected == max(
-        20 * rc.background_expected_timeout_multiplier,
-        rc.background_expected_timeout_floor_seconds,
-    )
-    assert expected <= rc.background_max_timeout_seconds
-    assert (
-        compute_hard_timeout_seconds(explicit=None, expected_seconds=None, rc=rc)
-        == rc.background_default_timeout_seconds
-    )
-
-
-@pytest.mark.asyncio
-async def test_pool_start_list_output_stop_and_one_wake() -> None:
-    rc = _on()
-    runner = FakeRunner()
-    pool = BackgroundPool(runner=runner, rc=rc)
-    task = await pool.start(
-        command="pytest -q",
-        session_id="s",
-        tenant_id="t",
-        notify_on_finish=True,
-    )
-    listed = pool.list("s")
-    assert listed[0].status == "running"
-    handle = runner.handles["pytest -q"]
-    handle.output = ".... 12 passed"
-    handle.finish("succeeded", ".... 12 passed")
-    refreshed = await pool.refresh(task.id)
-    assert refreshed is not None
-    assert refreshed.status == "succeeded"
-    assert "12 passed" in refreshed.output
-    wakes = pool.drain_wakes("s")
-    assert wakes == [task.id]
-    assert pool.drain_wakes("s") == []
-
-
-@pytest.mark.asyncio
-async def test_three_finishes_one_wake() -> None:
-    rc = _on()
-    runner = FakeRunner()
-    pool = BackgroundPool(runner=runner, rc=rc)
-    ids = []
-    for name in ("a", "b", "c"):
-        task = await pool.start(
-            command=name, session_id="s", tenant_id="t", notify_on_finish=True
-        )
-        runner.handles[name].finish("succeeded", "ok")
-        await pool.refresh(task.id)
-        ids.append(task.id)
-    wakes = pool.drain_wakes("s")
-    assert set(wakes) == set(ids)
-    assert pool.wakes_used == 1
-
-
-@pytest.mark.asyncio
-async def test_worker_death_orphans_not_running() -> None:
-    rc = _on()
-    runner = FakeRunner()
-    pool = BackgroundPool(runner=runner, rc=rc)
-    task = await pool.start(command="sleep 5", session_id="s", tenant_id="t")
-    assert task.status == "running"
-    pool.worker_died(task.worker_id)
-    assert pool.get(task.id).status == "orphaned"  # type: ignore[union-attr]
-    assert pool.get(task.id).status != "running"  # type: ignore[union-attr]
-
-
-@pytest.mark.asyncio
-async def test_reap_skips_reused_pid() -> None:
-    rc = _on()
-    runner = FakeRunner()
-    pool = BackgroundPool(runner=runner, rc=rc)
-    task = await pool.start(command="old", session_id="s", tenant_id="t")
-    handle = runner.handles["old"]
-    handle.start_token = "other-process"
-    reaped = await pool.reap(task.id)
-    assert reaped is not None
-    assert reaped.reason == "reap_identity_mismatch"
-    assert not handle.killed
-    assert reap_is_safe(
-        recorded_pid=1,
-        recorded_start_token="a",
-        live_pid=1,
-        live_start_token="b",
-    ) is False
-
-
-@pytest.mark.asyncio
-async def test_pool_full_and_shutdown_silent() -> None:
-    rc = _on(background_max_concurrent_per_session=1)
-    runner = FakeRunner()
-    pool = BackgroundPool(runner=runner, rc=rc)
-    await pool.start(command="one", session_id="s", tenant_id="t", notify_on_finish=True)
-    with pytest.raises(ValueError, match="background_pool_full"):
-        await pool.start(command="two", session_id="s", tenant_id="t")
-    runner.handles["one"].finish("succeeded")
-    await pool.refresh(pool.list("s")[0].id)
-    pool.shutting_down = True
-    assert pool.drain_wakes("s") == []
-
-
-def test_foreground_adopt_and_cancel() -> None:
-    rc = _on()
-    assert (
-        decide_foreground(
-            background_enabled=True,
-            adopt_enabled=True,
-            elapsed_seconds=5,
-            timeout_seconds=1,
-            cancelled=False,
-            pool_full=False,
-        )
-        == "adopt"
-    )
-    assert (
-        decide_foreground(
-            background_enabled=True,
-            adopt_enabled=True,
-            elapsed_seconds=5,
-            timeout_seconds=1,
-            cancelled=True,
-            pool_full=False,
-        )
-        == "kill_cancel"
-    )
-    assert (
-        decide_foreground(
-            background_enabled=True,
-            adopt_enabled=True,
-            elapsed_seconds=5,
-            timeout_seconds=1,
-            cancelled=False,
-            pool_full=True,
-        )
-        == "kill_pool_full"
-    )
-    notice = adopt_notice("bg_x", "output-tail", rc)
-    assert notice.startswith("Command still running")
-    assert "bg_x" in notice
-    assert "Do NOT run this command again" in notice
-
-
-def test_flags_off_background_is_noop() -> None:
-    rc = RuntimeConstants(model_context_window=4096)
-    assert rc.background_tasks_enabled is False
-    with pytest.raises(ValueError, match="background_tasks_disabled"):
-        refuse_notify_when_disabled(enabled=rc.background_tasks_enabled, notify_on_finish=True)
-    assert (
-        decide_foreground(
-            background_enabled=False,
-            adopt_enabled=False,
-            elapsed_seconds=99,
-            timeout_seconds=1,
-            cancelled=False,
-            pool_full=False,
-        )
-        == "kill_disabled"
-    )
+    return LoopConstants(**values)  # type: ignore[arg-type]
 
 
 def test_plan_profile_hides_writes_orthogonal_to_deep() -> None:
     rc = _on()
     policy = ToolVisibilityPolicy()
-    planned = apply_execution_profile(policy, profile="plan", rc=rc)
+    roles = CONVENTIONAL_TOOL_ROLES
+    planned = apply_execution_profile(policy, profile="plan", rc=rc, roles=roles)
     assert "Write" in planned.blocked
     assert "Edit" in planned.blocked
     assert "Bash" in planned.blocked
     assert "Read" in planned.visible
     assert plan_forbids("Write", profile="plan", rc=rc)
     assert not plan_forbids("Write", profile="default", rc=rc)
-    deep_plan = apply_execution_profile(policy, profile="plan", rc=rc)
-    direct_plan = apply_execution_profile(policy, profile="plan", rc=rc)
+    deep_plan = apply_execution_profile(policy, profile="plan", rc=rc, roles=roles)
+    direct_plan = apply_execution_profile(policy, profile="plan", rc=rc, roles=roles)
     assert deep_plan.blocked == direct_plan.blocked
-    off = apply_execution_profile(policy, profile="plan", rc=RuntimeConstants())
+    off = apply_execution_profile(
+        policy, profile="plan", rc=LoopConstants(), roles=roles
+    )
     assert off.blocked == policy.blocked
 
 
@@ -271,7 +96,7 @@ def test_widen_program_and_pipe_asks_again() -> None:
     env = preview_widen("TOKEN=secret curl x", rc)
     assert env.kind == "exact"
     with pytest.raises(ValueError, match="permission_widening_disabled"):
-        apply_widen([], "curl x", kind="program", rc=RuntimeConstants())
+        apply_widen([], "curl x", kind="program", rc=LoopConstants())
 
 
 def test_compact_checkpoint_keep_two_of_four() -> None:
@@ -303,6 +128,7 @@ def test_compact_checkpoint_keep_two_of_four() -> None:
         instructions="keep file ops",
         reason="manual",
         enabled=True,
+        tracked_tool_names=tracked_tool_names(_on(), CONVENTIONAL_TOOL_ROLES),
     )
     assert ckpt is not None
     view = apply_checkpoint(history, ckpt)
@@ -335,6 +161,7 @@ def test_nested_agents_activate_on_read_not_bash() -> None:
         discovered=discovered,
         already_active=[],
         rc=rc,
+        roles=CONVENTIONAL_TOOL_ROLES,
     )
     assert after_bash == []
     after_read = activate_on_filesystem_touch(
@@ -343,6 +170,7 @@ def test_nested_agents_activate_on_read_not_bash() -> None:
         discovered=discovered,
         already_active=[],
         rc=rc,
+        roles=CONVENTIONAL_TOOL_ROLES,
     )
     assert "a/AGENTS.md" in after_read
     assert "a/b/AGENTS.md" in after_read
@@ -355,6 +183,7 @@ def test_nested_agents_activate_on_read_not_bash() -> None:
         discovered=written,
         already_active=[],
         rc=rc,
+        roles=CONVENTIONAL_TOOL_ROLES,
     )
     assert active == []
     prompt = bodies_for_prompt(discovered, after_read, rc)
@@ -381,28 +210,32 @@ async def test_skill_index_is_descriptions_not_bodies() -> None:
     assert "huge body" not in block
 
 
-def test_split_and_path_deny() -> None:
+def test_a_long_result_is_projected_down_and_says_how_much_is_missing() -> None:
     rc = _on(tool_result_content_max_chars=20)
-    content, details = split_result("x" * 100, rc=rc)
-    assert "truncated" in content
-    assert details is not None and details["full_content"] == "x" * 100
-    off_c, off_d = split_result("x" * 100, rc=RuntimeConstants())
-    assert off_c == "x" * 100 and off_d is None
-    assert deny_reason("/etc/passwd", workspace_root="ws", user_id="u1", rc=rc) == "outside_workspace"
-    assert deny_reason("../../../etc/passwd", workspace_root="ws", user_id="u1", rc=rc)
-    foreign = deny_reason(
-        "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee/secret",
-        workspace_root="u1",
-        user_id="u1",
-        rc=rc,
-    )
-    assert foreign in {"foreign_workspace", "protected_path", "outside_workspace"} or foreign
-    assert deny_reason("ok.txt", workspace_root="u1", user_id="u1", rc=rc) is None
-    assert deny_reason("/etc/passwd", workspace_root="ws", user_id="u1", rc=RuntimeConstants()) is None
-    assert "/etc/passwd" in paths_in_command("cat /etc/passwd")
-    assert "../../../etc/shadow" in paths_in_command("cat ../../../etc/shadow")
-    assert paths_in_command("curl https://example.com/x") == []
-    assert paths_in_command("echo hello") == []
+
+    projection = project_result_content("x" * 100, rc=rc, canonical_ref="blob-1")
+
+    assert projection.is_shortened and projection.dropped_chars == 80
+    assert "truncated 80 chars" in projection.content
+    # The pointer names where the whole value still is, so the model reads a
+    # value that continues elsewhere rather than one that simply ended here.
+    assert "blob-1" in projection.content
+    assert projection.content.startswith("x" * 20)
+
+
+def test_a_result_that_fits_is_its_own_projection() -> None:
+    rc = _on(tool_result_content_max_chars=200)
+
+    projection = project_result_content("x" * 100, rc=rc)
+
+    assert projection.content == "x" * 100
+    assert not projection.is_shortened and projection.dropped_chars == 0
+
+
+def test_projection_is_off_until_the_run_asks_for_it() -> None:
+    projection = project_result_content("x" * 100, rc=LoopConstants())
+
+    assert projection.content == "x" * 100 and not projection.is_shortened
 
 
 @pytest.mark.asyncio
@@ -579,17 +412,12 @@ async def test_query_drains_one_batched_wake(
     llm.queue_response(text="woke")
     rc = _on()
     engine = engine_factory(rc=rc)
-    runner = FakeRunner()
-    pool = BackgroundPool(runner=runner, rc=rc)
+    pool = FakeBackgroundPool()
     engine.background_pool = pool
-    first = await pool.start(
-        command="one", session_id=engine.config.session_id, tenant_id="t", notify_on_finish=True
-    )
-    second = await pool.start(
-        command="two", session_id=engine.config.session_id, tenant_id="t", notify_on_finish=True
-    )
-    runner.handles["one"].finish("succeeded", "ok1")
-    runner.handles["two"].finish("succeeded", "ok2")
+    first = pool.start(engine.config.session_id, notify_on_finish=True)
+    second = pool.start(engine.config.session_id, notify_on_finish=True)
+    pool.finish(first.id)
+    pool.finish(second.id)
     engine.history.append(Message(role=MessageRole.user, content_blocks=[TextBlock(text="go")]))
     events = [evt async for evt in query(engine)]
     wakes = [evt for evt in events if evt.type == EventType.BACKGROUND_WAKE]
@@ -602,6 +430,7 @@ async def test_query_drains_one_batched_wake(
 @pytest.mark.asyncio
 async def test_grant_covers_skips_approval_on_real_gate() -> None:
     from protocore.contracts.hooks import HookActionKind, HookResult
+    from protocore.contracts.run_state import RunScopedState
     from protocore.contracts.tools import ToolContext
     from protocore.contracts.types import HookEvent
     from protocore.runtime.tool_permission import ToolPermissionGate, ToolPermissionOutcome
@@ -622,9 +451,9 @@ async def test_grant_covers_skips_approval_on_real_gate() -> None:
         run_id="r",
         tenant_id="t",
         session_id="s",
-        metadata={"protocore.helpers": {"session_grants": [grant]}},
+        run_state=RunScopedState(session_grants=[grant]),
     )
-    decision = await ToolPermissionGate().check(
+    decision = await ToolPermissionGate(roles=CONVENTIONAL_TOOL_ROLES).check(
         tool=MockTool(tool_name="Bash"),
         arguments={"command": "curl https://example.com/b"},
         ctx=ctx,
@@ -641,7 +470,7 @@ async def test_grant_covers_skips_approval_on_real_gate() -> None:
             modifications={"requires_approval": True, "approval_token": "tok2"},
         ),
     )
-    other = await ToolPermissionGate().check(
+    other = await ToolPermissionGate(roles=CONVENTIONAL_TOOL_ROLES).check(
         tool=MockTool(tool_name="Bash"),
         arguments={"command": "wget https://example.com/b"},
         ctx=ctx,
@@ -697,8 +526,8 @@ def test_checkpoint_tracks_the_tenant_s_own_tool_names() -> None:
     assert "Write:" not in facts, "a verb this tenant never registered must not be tracked"
 
 
-def test_checkpoint_default_still_tracks_the_coding_verbs() -> None:
-    """Callers that pass no names keep the historical behaviour."""
+def test_checkpoint_tracks_the_tools_the_host_declared() -> None:
+    """No configured names: the tracked set comes from the declared roles."""
     history = [
         Message(role=MessageRole.user, content_blocks=[TextBlock(text=f"turn {i}")])
         for i in range(4)
@@ -706,7 +535,14 @@ def test_checkpoint_default_still_tracks_the_coding_verbs() -> None:
     history.insert(1, _assistant_tool_call("Write", "w1"))
 
     ckpt = build_checkpoint(
-        history, keep_recent_turns=1, instructions="", reason="manual", enabled=True
+        history,
+        keep_recent_turns=1,
+        instructions="",
+        reason="manual",
+        enabled=True,
+        tracked_tool_names=tracked_tool_names(
+            LoopConstants(compaction_tracked_tool_names=()), CONVENTIONAL_TOOL_ROLES
+        ),
     )
     assert ckpt is not None
     assert any("Write:" in fact for fact in ckpt.file_op_facts)
@@ -720,11 +556,11 @@ def test_eviction_targets_the_tenant_s_own_read_shaped_tools() -> None:
         _assistant_tool_call("say", "s1"),
         _tool_result("s1", "hello"),
     ]
-    rc = RuntimeConstants(
+    rc = LoopConstants(
         result_eviction_enabled=True,
         result_eviction_tool_names=("look", "inspect"),
     )
-    view, evicted = evict_history_for_llm(history, rc)
+    view, evicted = evict_history_for_llm(history, rc, bundled_prompt_provider())
 
     assert evicted == ["l1"]
     assert history[1].content_blocks[0].content.startswith("a very large tile map")
@@ -734,7 +570,66 @@ def test_eviction_targets_the_tenant_s_own_read_shaped_tools() -> None:
 
 def test_eviction_with_no_names_is_a_no_op() -> None:
     history = [_assistant_tool_call("look", "l1"), _tool_result("l1", "big" * 100)]
-    rc = RuntimeConstants(result_eviction_enabled=True, result_eviction_tool_names=())
-    view, evicted = evict_history_for_llm(history, rc)
+    rc = LoopConstants(result_eviction_enabled=True, result_eviction_tool_names=())
+    view, evicted = evict_history_for_llm(history, rc, bundled_prompt_provider())
     assert evicted == []
     assert view == list(history)
+
+
+def test_a_grant_read_back_out_of_its_row_still_answers_the_gate() -> None:
+    """A grant that crossed a process boundary is a grant again.
+
+    ``to_dict`` is how a grant leaves the process that made it — into a run
+    snapshot, or into the shared store the API pod and the executor pod both
+    read. What comes back is a row, and the approval gate does not ask a row
+    anything: it asks the grant whether it covers the command. So the reader
+    has to exist, and the object it returns has to match the same commands the
+    original did.
+    """
+    original = apply_widen(
+        [], "git status", kind="multiplexer_verb", rc=_on()
+    )[0]
+    restored = CommandGrant.from_dict(original.to_dict())
+
+    assert restored == original
+    assert grant_covers(restored, "git status --short") is True
+    assert grant_covers(restored, "git push") is False
+
+
+def test_a_grant_row_naming_an_unknown_kind_widens_nothing() -> None:
+    """The narrowest reading of a row this build cannot understand."""
+    restored = CommandGrant.from_dict({"kind": "everything", "value": "rm -rf /"})
+
+    assert restored.kind == "exact"
+    assert grant_covers(restored, "rm -rf /tmp") is False
+    assert grant_covers(restored, "rm -rf /") is True
+
+
+def test_a_checkpoint_read_back_out_of_its_row_is_the_same_checkpoint() -> None:
+    """The folded-away turns survive in the checkpoint and nowhere else."""
+    history = [
+        Message(role=MessageRole.user, content_blocks=[TextBlock(text=f"m{i}")])
+        for i in range(4)
+    ]
+    built = build_checkpoint(
+        history,
+        keep_recent_turns=2,
+        instructions="keep the decisions",
+        reason="manual",
+        enabled=True,
+    )
+    assert built is not None
+
+    restored = CompactCheckpoint.from_dict(built.to_dict())
+
+    assert restored == built
+
+
+def test_a_partial_checkpoint_row_is_read_rather_than_refused() -> None:
+    """A row missing a field is a poorer checkpoint, not a broken resume."""
+    restored = CompactCheckpoint.from_dict({"summary": "what was folded"})
+
+    assert restored.summary == "what was folded"
+    assert restored.retained_from_index == 0
+    assert restored.file_op_facts == []
+    assert restored.reason == "manual"

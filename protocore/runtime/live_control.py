@@ -5,7 +5,7 @@ from dataclasses import dataclass, field
 from typing import Any, Literal
 from uuid import uuid4
 
-from protocore.contracts.runtime_constants import RuntimeConstants
+from protocore.contracts.runtime_constants import LoopConstants
 from protocore.contracts.types import Message, MessageRole, TextBlock
 
 QueueKind = Literal["steer", "follow_up"]
@@ -57,7 +57,7 @@ def new_queued_prompt(
 def enqueue(
     queue: list[QueuedPrompt],
     item: QueuedPrompt,
-    rc: RuntimeConstants,
+    rc: LoopConstants,
 ) -> list[QueuedPrompt]:
     """Append if under caps. Raises ValueError when the item or queue is over cap."""
     if not rc.steer_follow_up_enabled:

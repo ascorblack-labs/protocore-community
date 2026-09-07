@@ -13,7 +13,7 @@ from typing import Any
 import pytest
 
 from protocore.contracts.hooks import HookActionKind, HookResult
-from protocore.contracts.runtime_constants import RuntimeConstants
+from protocore.contracts.runtime_constants import LoopConstants
 from protocore.contracts.tool_registry import ToolVisibilityPolicy
 from protocore.contracts.tools import ToolContext
 from protocore.contracts.types import (
@@ -33,9 +33,7 @@ from protocore.runtime.events import EventType, TurnEvent
 from protocore.runtime.loop_state import LoopState
 from protocore.runtime.tool_dispatch import (
     TOOL_CALL_SOFT_CAP_METADATA_KEY,
-    TOOL_CALL_SOFT_CAP_STATE_HELPER_KEY,
     TOOL_CALL_SOFT_CAP_WARNINGS_METADATA_KEY,
-    TOOL_CALL_SOFT_CAPS_HELPER_KEY,
 )
 
 from ._tool_fixtures import MockTool
@@ -172,10 +170,7 @@ async def test_tool_call_soft_cap_warning_is_provider_visible(
 ) -> None:
     """Subagent soft-cap diagnostics annotate tool_result without blocking."""
     engine = engine_factory()
-    engine._helpers = {  # type: ignore[attr-defined]
-        TOOL_CALL_SOFT_CAPS_HELPER_KEY: {"MyTool": 1},
-        TOOL_CALL_SOFT_CAP_STATE_HELPER_KEY: {"counts": {}, "warnings": []},
-    }
+    engine.run_state.tool_call_soft_caps = {"MyTool": 1}
     tool = MockTool(
         tool_name="MyTool",
         description="Mock tool",
@@ -214,7 +209,7 @@ async def test_tool_call_soft_cap_warning_is_provider_visible(
     assert tool_result.metadata[TOOL_CALL_SOFT_CAP_METADATA_KEY]["status"] == "reached"
     assert len(tool_result.metadata[TOOL_CALL_SOFT_CAP_WARNINGS_METADATA_KEY]) == 1
     assert (
-        engine._helpers[TOOL_CALL_SOFT_CAP_STATE_HELPER_KEY]["counts"]["MyTool"]  # type: ignore[attr-defined]
+        engine.run_state.tool_call_soft_cap_state.counts["MyTool"]
         == 1
     )
 
@@ -226,10 +221,7 @@ async def test_tool_call_soft_cap_zero_is_unlimited(
 ) -> None:
     """A limit of 0 disables warnings for that tool."""
     engine = engine_factory()
-    engine._helpers = {  # type: ignore[attr-defined]
-        TOOL_CALL_SOFT_CAPS_HELPER_KEY: {"MyTool": 0},
-        TOOL_CALL_SOFT_CAP_STATE_HELPER_KEY: {"counts": {}, "warnings": []},
-    }
+    engine.run_state.tool_call_soft_caps = {"MyTool": 0}
     tool = MockTool(
         tool_name="MyTool",
         description="Mock tool",
@@ -252,8 +244,8 @@ async def test_tool_call_soft_cap_zero_is_unlimited(
     assert "tool-output-here" in result_text
     assert "[Tool call soft-cap warning]" not in result_text
     assert TOOL_CALL_SOFT_CAP_METADATA_KEY not in result_evt.payload.get("metadata", {})
-    assert engine._helpers[TOOL_CALL_SOFT_CAP_STATE_HELPER_KEY]["counts"] == {}  # type: ignore[attr-defined]
-    assert engine._helpers[TOOL_CALL_SOFT_CAP_STATE_HELPER_KEY]["warnings"] == []  # type: ignore[attr-defined]
+    assert engine.run_state.tool_call_soft_cap_state.counts == {}
+    assert engine.run_state.tool_call_soft_cap_state.warnings == []
 
 
 @pytest.mark.asyncio
@@ -269,7 +261,7 @@ async def test_the_cumulative_tool_budget_stops_the_run_rather_than_advising_it(
     budget now starts the wind-down, and the wind-down takes the tools away.
     """
     engine = engine_factory(
-        rc=RuntimeConstants(model_context_window=4_096, leader_tool_call_soft_cap=1),
+        rc=LoopConstants(model_context_window=4_096, leader_tool_call_soft_cap=1),
     )
     tool = MockTool(
         tool_name="MyTool",
@@ -308,7 +300,7 @@ async def test_a_zero_cumulative_tool_budget_never_stops_the_run(
     in_memory_runtime,
 ) -> None:
     engine = engine_factory(
-        rc=RuntimeConstants(model_context_window=4_096, leader_tool_call_soft_cap=0),
+        rc=LoopConstants(model_context_window=4_096, leader_tool_call_soft_cap=0),
     )
     tool = MockTool(
         tool_name="MyTool", description="Mock tool", response_content="ok"
@@ -457,21 +449,17 @@ async def test_forged_run_metadata_cannot_shadow_tool_call_id(
     operator-supplied per-run metadata envelope must NOT shadow the
     runtime-internal authoritative tool-call id on a normal tool call.
 
-    The public ``POST /v1/runs.metadata`` envelope flows into the helper
-    bag's ``run_metadata`` and is merged onto ``ToolContext.metadata`` by
+    The operator-supplied per-run envelope is merged onto ``ToolContext.metadata`` by
     the dispatcher path; a forged ``tool_call_id`` would otherwise poison
     every tool-result correlation / subagent-parent edge / answer RPC
     binding for the whole run."""
     engine = engine_factory()
-    # Simulate the executor wiring the helper bag with a *forged* run_metadata
-    # envelope. A legit (non-internal) key still flows through.
-    engine._helpers = {  # type: ignore[attr-defined]
-        "run_metadata": {
-            "tool_call_id": "FORGED_BY_OPERATOR",
-            "protocore.helpers": "forged-bag",
-            "protocore.synthetic_recovery": "forged-recovery",
-            "pac_trial_id": "trial-42",
-        },
+    # Simulate the host wiring a *forged* run_metadata envelope onto the run.
+    # A legit (non-internal) key still flows through.
+    engine.run_state.run_metadata = {
+        "tool_call_id": "FORGED_BY_OPERATOR",
+        "protocore.synthetic_recovery": "forged-recovery",
+        "pac_trial_id": "trial-42",
     }
     tool = _ContextCapturingTool(
         tool_name="MyTool",
@@ -494,8 +482,6 @@ async def test_forged_run_metadata_cannot_shadow_tool_call_id(
     md = tool.contexts[0].metadata
     # The authoritative runtime id wins — the forged value is rejected.
     assert md["tool_call_id"] == "toolu_authoritative_999"
-    # The helper bag namespace is never replaced by a forged value.
-    assert md["protocore.helpers"] != "forged-bag"
     # No forged ``protocore.*`` runtime-internal key leaks through.
     assert md.get("protocore.synthetic_recovery") != "forged-recovery"
     # A genuinely operator-scoped (non-internal) key DOES still pass through.
@@ -572,17 +558,17 @@ async def test_unregistered_tool_surfaces_unknown_tool_error(engine_factory, in_
 
 
 # ----------------------------------------------------------------------
-# Sandbox cold-start event — adapter owns emission, NOT core
+# Tool-transport cold-start event — the host owns emission, never core
 # ----------------------------------------------------------------------
 
 
 @pytest.mark.asyncio
-async def test_core_does_not_emit_sandbox_starting_for_bash(engine_factory, in_memory_runtime) -> None:
-    """The sandbox adapter is the sole emitter of ``sandbox_starting``.
-    The core dispatcher cannot tell hot vs cold pod, so it MUST NOT emit.
-    The adapter's integration test
-    ``protocore-the host/tests/integration/sandbox/test_dispatcher.py::
-    test_first_dispatch_spawns_pod`` validates the adapter side.
+async def test_core_does_not_emit_transport_starting_for_a_shell_tool(
+    engine_factory, in_memory_runtime
+) -> None:
+    """The host's transport is the sole emitter of ``tool_transport_starting``.
+
+    The runtime cannot tell a cold start from a warm one, so it must not emit.
     """
     engine = engine_factory()
     bash = MockTool(tool_name="Bash", description="run shell", response_content="ok")
@@ -599,8 +585,8 @@ async def test_core_does_not_emit_sandbox_starting_for_bash(engine_factory, in_m
     async for evt in engine.run(user_msg):
         events.append(evt)
 
-    sandbox = [e for e in events if e.type is EventType.SANDBOX_STARTING]
-    assert sandbox == []
+    starting = [e for e in events if e.type is EventType.TOOL_TRANSPORT_STARTING]
+    assert starting == []
 
 
 # ----------------------------------------------------------------------
@@ -608,7 +594,7 @@ async def test_core_does_not_emit_sandbox_starting_for_bash(engine_factory, in_m
 # ----------------------------------------------------------------------
 #
 # -G (2026-05-20) — these tests assert the CLI-mode
-# behaviour where ``RuntimeConstants.approval_gate_web_enabled=True``
+# behaviour where ``LoopConstants.approval_gate_web_enabled=True``
 # preserves the pause / TOOL_CALL_PENDING / AWAITING flow. The default
 # (False) downgrades approvals; see ``test_approval_downgrade_*`` below.
 
@@ -616,7 +602,7 @@ async def test_core_does_not_emit_sandbox_starting_for_bash(engine_factory, in_m
 @pytest.mark.asyncio
 async def test_approval_required_transitions_to_awaiting(engine_factory, in_memory_runtime) -> None:
     engine = engine_factory(
-        rc=RuntimeConstants(model_context_window=4_096, approval_gate_web_enabled=True),
+        rc=LoopConstants(model_context_window=4_096, approval_gate_web_enabled=True),
     )
     tool = MockTool(tool_name="MyTool")
     in_memory_runtime["tools"].register(tool)
@@ -659,7 +645,7 @@ async def test_resume_approved_tool_executes_pending_call_once(
     from protocore.runtime.query import resume_approved_tool
 
     engine = engine_factory(
-        rc=RuntimeConstants(model_context_window=4_096, approval_gate_web_enabled=True),
+        rc=LoopConstants(model_context_window=4_096, approval_gate_web_enabled=True),
     )
     tool = MockTool(tool_name="MyTool", response_content="approved-output")
     in_memory_runtime["tools"].register(tool)
@@ -708,6 +694,58 @@ async def test_resume_approved_tool_executes_pending_call_once(
     assert tool_results[0].tool_call_id == "toolu_q"
     assert tool_results[0].content == "approved-output"
     assert tool_results[0].is_error is False
+
+
+@pytest.mark.asyncio
+async def test_resume_approved_tool_refuses_a_cancelled_run(
+    engine_factory,
+    in_memory_runtime,
+) -> None:
+    """An approval that lands on a cancelled run does not run the tool.
+
+    This entry never passes the turn loop's stop checkpoint, so the cancel a
+    resumed run restored would otherwise be ignored exactly once — on the one
+    call the operator was asked about.
+    """
+    from protocore.runtime.query import resume_approved_tool
+
+    engine = engine_factory(
+        rc=LoopConstants(model_context_window=4_096, approval_gate_web_enabled=True),
+    )
+    tool = MockTool(tool_name="MyTool", response_content="approved-output")
+    in_memory_runtime["tools"].register(tool)
+    in_memory_runtime["hooks"].queue_action(
+        HookEvent.pre_tool_use,
+        HookResult(
+            action=HookActionKind.ALLOW,
+            modifications={"requires_approval": True, "approval_token": "tok-1"},
+            reason="awaiting user",
+        ),
+    )
+    in_memory_runtime["llm"].queue_tool_call_response(
+        tool_call_id="toolu_q",
+        tool_name="MyTool",
+        tool_input={"v": "approved"},
+    )
+
+    user_msg = Message(role=MessageRole.user, content_blocks=[TextBlock(text="go")])
+    async for _evt in engine.run(user_msg):
+        pass
+    assert engine.state is LoopState.AWAITING
+
+    engine.stop()
+
+    resumed_events = [
+        evt
+        async for evt in resume_approved_tool(
+            engine,
+            ToolCall(id="toolu_q", name="MyTool", arguments={"v": "approved"}),
+        )
+    ]
+
+    assert tool.calls == []
+    assert engine.state is LoopState.CANCELLED
+    assert any(evt.type is EventType.MESSAGE_STOP for evt in resumed_events)
 
 
 @pytest.mark.asyncio
@@ -855,7 +893,7 @@ async def test_resume_approved_tool_rejects_unapproved_sibling_tool_call(
     engine.transition_to(LoopState.RUNNING)
     engine.transition_to(LoopState.AWAITING)
 
-    with pytest.raises(ValueError, match="not the pending approval"):
+    with pytest.raises(ValueError, match="not a parked approval"):
         _ = [
             evt
             async for evt in resume_approved_tool(
@@ -960,8 +998,8 @@ async def test_approval_downgrade_web_mode_default_runs_tool_and_no_pending_even
  ``require_approval``) which can only happen via the gate's
  short-circuit branch.
  """
-    # ``RuntimeConstants()`` defaults to ``approval_gate_web_enabled=False``.
-    engine = engine_factory(rc=RuntimeConstants(model_context_window=4_096))
+    # ``LoopConstants()`` defaults to ``approval_gate_web_enabled=False``.
+    engine = engine_factory(rc=LoopConstants(model_context_window=4_096))
     assert engine.config.rc.approval_gate_web_enabled is False  # sanity
     tool = MockTool(tool_name="MyTool", response_content="ran-anyway")
     in_memory_runtime["tools"].register(tool)
@@ -1063,7 +1101,7 @@ async def test_approval_kill_switch_on_preserves_awaiting_flow(
     variable is the RC flag.
     """
     engine = engine_factory(
-        rc=RuntimeConstants(model_context_window=4_096, approval_gate_web_enabled=True),
+        rc=LoopConstants(model_context_window=4_096, approval_gate_web_enabled=True),
     )
     tool = MockTool(tool_name="MyTool", response_content="should-not-run")
     in_memory_runtime["tools"].register(tool)
@@ -1108,7 +1146,7 @@ async def test_approval_downgrade_emits_warning_log(
  """
     import logging
 
-    engine = engine_factory(rc=RuntimeConstants(model_context_window=4_096))
+    engine = engine_factory(rc=LoopConstants(model_context_window=4_096))
     tool = MockTool(tool_name="MyTool", response_content="ran")
     in_memory_runtime["tools"].register(tool)
     in_memory_runtime["hooks"].queue_action(
@@ -1231,8 +1269,8 @@ async def test_event_ordering_invariant(engine_factory, in_memory_runtime) -> No
         hook_fired(post)            ──┤
         tool_result                 ──┘
 
-    ``sandbox_starting`` is emitted by the sandbox adapter on cold
-    start only.
+    ``tool_transport_starting`` is emitted by the host's transport on a
+    cold start only.
     """
     engine = engine_factory()
     tool = MockTool(tool_name="MyTool", response_content="x")

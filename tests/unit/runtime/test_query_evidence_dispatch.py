@@ -8,8 +8,14 @@ from typing import Any
 
 import pytest
 
+from protocore.contracts.evidence import (
+    EvidenceLedger,
+    EvidenceProducerBinding,
+    EvidenceRecord,
+    RunTreeOrigin,
+)
 from protocore.contracts.llm import LLMStreamEvent
-from protocore.contracts.runtime_constants import RuntimeConstants
+from protocore.contracts.runtime_constants import LoopConstants
 from protocore.contracts.tools import ToolContext
 from protocore.contracts.types import (
     Message,
@@ -21,19 +27,14 @@ from protocore.contracts.types import (
     ToolResult,
     ToolResultBlock,
 )
-from protocore.contracts.verification import (
-    EvidenceLedger,
-    EvidenceProducerBinding,
-    EvidenceRecord,
-    RunTreeOrigin,
-)
 from protocore.runtime.events import EventType
+from tests._fixtures.delegation import DelegationContract
 
 from ._tool_fixtures import MockTool
 
 
 def _record(context: ToolContext, record_id: str) -> EvidenceRecord:
-    origin = context.evidence_origin or RunTreeOrigin(
+    origin = (context.evidence.origin if context.evidence else None) or RunTreeOrigin(
         run_id=context.run_id, root_run_id=context.run_id, depth=0
     )
     return EvidenceRecord(
@@ -252,10 +253,10 @@ async def test_rejected_evidence_never_satisfies_a_serial_dependency_or_resets_f
 
     engine = engine_factory(
         run_id="serial-dependency-run",
-        rc=RuntimeConstants(model_context_window=4_096, tool_preconditions_enabled=True),
+        rc=LoopConstants(model_context_window=4_096, tool_preconditions_enabled=True),
     )
     engine.begin_evidence_collection(ledger_id="serial-dependency-ledger")
-    engine._helpers = {"rc": engine.config.rc}
+    engine.run_state.rc = engine.config.rc
     existing_context = ToolContext(
         run_id=engine.config.run_id,
         tenant_id=engine.config.tenant_id,
@@ -292,7 +293,8 @@ async def test_rejected_evidence_never_satisfies_a_serial_dependency_or_resets_f
     assert dependent.calls == []
     # A failed evidence admission must advance, not clear, the normal dispatch
     # failure streak.  This is the state the following call observes.
-    assert engine._helpers["tool_dispatch.consecutive_error_state"]["tool_name"] == "Consume"
+    assert engine.run_state.consecutive_error is not None
+    assert engine.run_state.consecutive_error.tool_name == "Consume"
 
 
 @pytest.mark.asyncio
@@ -426,10 +428,10 @@ async def _assert_rejected_evidence_locks_out_same_batch_dependency(
 ) -> None:
     engine = engine_factory(
         run_id=f"{producer.tool_name}-parallel-run",
-        rc=RuntimeConstants(model_context_window=4_096, tool_preconditions_enabled=True),
+        rc=LoopConstants(model_context_window=4_096, tool_preconditions_enabled=True),
     )
     engine.begin_evidence_collection(ledger_id=f"{producer.tool_name}-parallel-ledger")
-    engine._helpers = {"rc": engine.config.rc}
+    engine.run_state.rc = engine.config.rc
     existing_context = ToolContext(
         run_id=engine.config.run_id,
         tenant_id=engine.config.tenant_id,
@@ -461,7 +463,10 @@ async def _assert_rejected_evidence_locks_out_same_batch_dependency(
     assert results[1].is_error is True
     assert "PRECONDITION NOT MET" in results[1].content
     assert dependent.calls == []
-    assert engine._helpers["tool_dispatch.consecutive_error_state"]["tool_name"] == dependent.tool_name
+    assert engine.run_state.consecutive_error is not None
+    assert (
+        engine.run_state.consecutive_error.tool_name == dependent.tool_name
+    )
 
 
 @pytest.mark.asyncio
@@ -488,13 +493,11 @@ async def test_parallel_safe_replay_treats_rejected_evidence_as_failure_before_d
 async def test_delegation_fanout_replay_treats_rejected_evidence_as_failure_before_dependencies(
     engine_factory, in_memory_runtime
 ) -> None:
-    class _DelegationProducer(_PrerequisiteEvidenceTool):
+    class _DelegationProducer(DelegationContract, _PrerequisiteEvidenceTool):
         is_concurrent_safe = False
-        is_parallel_delegation = True
 
-    class _DelegationDependent(_DependentTool):
+    class _DelegationDependent(DelegationContract, _DependentTool):
         is_concurrent_safe = False
-        is_parallel_delegation = True
 
     await _assert_rejected_evidence_locks_out_same_batch_dependency(
         engine_factory,
@@ -536,9 +539,8 @@ async def test_parallel_delegation_replays_evidence_in_llm_order_after_inverse_c
 ) -> None:
     """The separate delegation fan-out has the same deterministic ledger order."""
 
-    class _EvidenceDelegationTool(_EvidenceTool):
+    class _EvidenceDelegationTool(DelegationContract, _EvidenceTool):
         is_concurrent_safe = False
-        is_parallel_delegation = True
 
     engine = engine_factory(run_id="delegation-run")
     engine.begin_evidence_collection(ledger_id="delegation-ledger")

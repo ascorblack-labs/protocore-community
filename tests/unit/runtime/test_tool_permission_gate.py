@@ -9,6 +9,7 @@ from protocore.contracts.hooks import (
     IHookManager,
 )
 from protocore.contracts.tool_registry import ToolVisibilityPolicy
+from protocore.contracts.tool_roles import ToolArgumentSlot, ToolRole, ToolRoleMap
 from protocore.contracts.types import HookEvent
 from protocore.runtime.tool_permission import (
     SIDE_EFFECT_HTTP,
@@ -22,6 +23,7 @@ from protocore.runtime.tool_permission import (
     WorkspacePathPolicy,
 )
 from protocore.tests_support.adapters import InMemoryHookManager
+from tests._fixtures.tool_roles import CONVENTIONAL_TOOL_ROLES
 
 from ._tool_fixtures import MockTool, make_default_ctx
 
@@ -32,7 +34,7 @@ from ._tool_fixtures import MockTool, make_default_ctx
 
 @pytest.mark.asyncio
 async def test_blocked_tool_denied() -> None:
-    gate = ToolPermissionGate()
+    gate = ToolPermissionGate(roles=CONVENTIONAL_TOOL_ROLES)
     tool = MockTool(tool_name="Banned")
     decision = await gate.check(
         tool=tool,
@@ -46,7 +48,7 @@ async def test_blocked_tool_denied() -> None:
 
 @pytest.mark.asyncio
 async def test_visible_set_excludes_tool() -> None:
-    gate = ToolPermissionGate()
+    gate = ToolPermissionGate(roles=CONVENTIONAL_TOOL_ROLES)
     tool = MockTool(tool_name="Other")
     decision = await gate.check(
         tool=tool,
@@ -67,7 +69,7 @@ async def test_forced_pinned_tool_allowed_despite_visible_whitelist() -> None:
     unconditionally (the core floor); the gate must permit them too, or the
     model gets a callable tool that deterministically fails at execution.
     """
-    gate = ToolPermissionGate()
+    gate = ToolPermissionGate(roles=CONVENTIONAL_TOOL_ROLES)
     tool = MockTool(tool_name="Bash")
     decision = await gate.check(
         tool=tool,
@@ -84,7 +86,7 @@ async def test_forced_pinned_tool_allowed_despite_visible_whitelist() -> None:
 async def test_pinned_tool_allowed_despite_visible_whitelist() -> None:
     """The ``pinned`` (progressive-discovery) set is also part of the allowed
     set under a non-empty ``visible`` whitelist — pins are always included."""
-    gate = ToolPermissionGate()
+    gate = ToolPermissionGate(roles=CONVENTIONAL_TOOL_ROLES)
     tool = MockTool(tool_name="Bash")
     decision = await gate.check(
         tool=tool,
@@ -100,7 +102,7 @@ async def test_pinned_tool_allowed_despite_visible_whitelist() -> None:
 @pytest.mark.asyncio
 async def test_blocked_overrides_forced_pinned_at_gate() -> None:
     """``blocked`` is the first override — it denies even a forced-pinned tool."""
-    gate = ToolPermissionGate()
+    gate = ToolPermissionGate(roles=CONVENTIONAL_TOOL_ROLES)
     tool = MockTool(tool_name="Bash")
     decision = await gate.check(
         tool=tool,
@@ -118,7 +120,7 @@ async def test_blocked_overrides_forced_pinned_at_gate() -> None:
 
 @pytest.mark.asyncio
 async def test_subagent_whitelist_narrows_scope() -> None:
-    gate = ToolPermissionGate()
+    gate = ToolPermissionGate(roles=CONVENTIONAL_TOOL_ROLES)
     tool = MockTool(tool_name="Read")
     decision = await gate.check(
         tool=tool,
@@ -134,7 +136,7 @@ async def test_subagent_whitelist_narrows_scope() -> None:
 @pytest.mark.asyncio
 async def test_empty_subagent_whitelist_is_inclusive() -> None:
     """Empty whitelist == no narrowing (subagent inherits tenant scope)."""
-    gate = ToolPermissionGate()
+    gate = ToolPermissionGate(roles=CONVENTIONAL_TOOL_ROLES)
     tool = MockTool(tool_name="Read")
     decision = await gate.check(
         tool=tool,
@@ -153,7 +155,7 @@ async def test_empty_subagent_whitelist_is_inclusive() -> None:
 
 @pytest.mark.asyncio
 async def test_bash_rm_rf_denied() -> None:
-    gate = ToolPermissionGate()
+    gate = ToolPermissionGate(roles=CONVENTIONAL_TOOL_ROLES)
     tool = MockTool(tool_name="Bash")
     decision = await gate.check(
         tool=tool,
@@ -167,7 +169,7 @@ async def test_bash_rm_rf_denied() -> None:
 
 @pytest.mark.asyncio
 async def test_bash_safe_command_allowed() -> None:
-    gate = ToolPermissionGate()
+    gate = ToolPermissionGate(roles=CONVENTIONAL_TOOL_ROLES)
     tool = MockTool(tool_name="Bash")
     decision = await gate.check(
         tool=tool,
@@ -180,7 +182,7 @@ async def test_bash_safe_command_allowed() -> None:
 
 @pytest.mark.asyncio
 async def test_bash_curl_pipe_sh_denied() -> None:
-    gate = ToolPermissionGate()
+    gate = ToolPermissionGate(roles=CONVENTIONAL_TOOL_ROLES)
     tool = MockTool(tool_name="Bash")
     decision = await gate.check(
         tool=tool,
@@ -200,7 +202,7 @@ async def test_bash_dangerous_command_denied_via_cmd_alias() -> None:
     A dangerous call emitted as ``{"cmd": ...}`` MUST still be denied — reading
     only ``arguments['command']`` let it skip the deny patterns and execute.
     """
-    gate = ToolPermissionGate()
+    gate = ToolPermissionGate(roles=CONVENTIONAL_TOOL_ROLES)
     tool = MockTool(tool_name="Bash")
     decision = await gate.check(
         tool=tool,
@@ -215,7 +217,7 @@ async def test_bash_dangerous_command_denied_via_cmd_alias() -> None:
 @pytest.mark.asyncio
 async def test_bash_dangerous_command_denied_via_shell_alias() -> None:
     """regression: same as above for the ``shell`` alias."""
-    gate = ToolPermissionGate()
+    gate = ToolPermissionGate(roles=CONVENTIONAL_TOOL_ROLES)
     tool = MockTool(tool_name="Bash")
     decision = await gate.check(
         tool=tool,
@@ -231,7 +233,7 @@ async def test_bash_dangerous_command_denied_via_shell_alias() -> None:
 async def test_bash_safe_command_allowed_via_cmd_alias() -> None:
     """A benign command under the ``cmd`` alias is still allowed — the alias
     fix must not over-deny."""
-    gate = ToolPermissionGate()
+    gate = ToolPermissionGate(roles=CONVENTIONAL_TOOL_ROLES)
     tool = MockTool(tool_name="Bash")
     decision = await gate.check(
         tool=tool,
@@ -244,7 +246,7 @@ async def test_bash_safe_command_allowed_via_cmd_alias() -> None:
 
 @pytest.mark.asyncio
 async def test_shell_policy_only_applies_to_sandbox_class() -> None:
-    gate = ToolPermissionGate()
+    gate = ToolPermissionGate(roles=CONVENTIONAL_TOOL_ROLES)
     # Tool name not in sandbox map → classified as state_only.
     tool = MockTool(tool_name="MyTool")
     decision = await gate.check(
@@ -259,7 +261,7 @@ async def test_shell_policy_only_applies_to_sandbox_class() -> None:
 
 @pytest.mark.asyncio
 async def test_tool_declared_side_effect_overrides_default_map() -> None:
-    gate = ToolPermissionGate()
+    gate = ToolPermissionGate(roles=CONVENTIONAL_TOOL_ROLES)
     # MockTool with side_effect_class="sandbox" — exercises classify().
     tool = MockTool(tool_name="CustomShellTool", side_effect_class=SIDE_EFFECT_SANDBOX)
     decision = await gate.check(
@@ -279,8 +281,10 @@ async def test_tool_declared_side_effect_overrides_default_map() -> None:
 
 @pytest.mark.asyncio
 async def test_dns_allowlist_permits_listed_host() -> None:
-    gate = ToolPermissionGate()
-    gate.register_policy(HttpDnsAllowlistPolicy(allowed_hosts=frozenset({"api.openai.com"})))
+    gate = ToolPermissionGate(roles=CONVENTIONAL_TOOL_ROLES)
+    gate.register_policy(HttpDnsAllowlistPolicy(
+            allowed_hosts=frozenset({"api.openai.com"}), roles=CONVENTIONAL_TOOL_ROLES
+        ))
     tool = MockTool(tool_name="WebFetch")
     decision = await gate.check(
         tool=tool,
@@ -293,8 +297,10 @@ async def test_dns_allowlist_permits_listed_host() -> None:
 
 @pytest.mark.asyncio
 async def test_dns_allowlist_denies_non_listed_host() -> None:
-    gate = ToolPermissionGate()
-    gate.register_policy(HttpDnsAllowlistPolicy(allowed_hosts=frozenset({"api.openai.com"})))
+    gate = ToolPermissionGate(roles=CONVENTIONAL_TOOL_ROLES)
+    gate.register_policy(HttpDnsAllowlistPolicy(
+            allowed_hosts=frozenset({"api.openai.com"}), roles=CONVENTIONAL_TOOL_ROLES
+        ))
     tool = MockTool(tool_name="WebFetch")
     decision = await gate.check(
         tool=tool,
@@ -309,11 +315,12 @@ async def test_dns_allowlist_denies_non_listed_host() -> None:
 
 @pytest.mark.asyncio
 async def test_dns_blocklist_overrides_allowlist() -> None:
-    gate = ToolPermissionGate()
+    gate = ToolPermissionGate(roles=CONVENTIONAL_TOOL_ROLES)
     gate.register_policy(
         HttpDnsAllowlistPolicy(
             allowed_hosts=frozenset({"evil.example.com"}),
             blocked_hosts=frozenset({"evil.example.com"}),
+            roles=CONVENTIONAL_TOOL_ROLES,
         )
     )
     tool = MockTool(tool_name="WebFetch")
@@ -329,8 +336,8 @@ async def test_dns_blocklist_overrides_allowlist() -> None:
 
 @pytest.mark.asyncio
 async def test_empty_dns_allowlist_means_any_host_allowed() -> None:
-    gate = ToolPermissionGate()
-    gate.register_policy(HttpDnsAllowlistPolicy())  # empty allowlist
+    gate = ToolPermissionGate(roles=CONVENTIONAL_TOOL_ROLES)
+    gate.register_policy(HttpDnsAllowlistPolicy(roles=CONVENTIONAL_TOOL_ROLES))  # empty allowlist
     tool = MockTool(tool_name="WebFetch")
     decision = await gate.check(
         tool=tool,
@@ -343,8 +350,8 @@ async def test_empty_dns_allowlist_means_any_host_allowed() -> None:
 
 @pytest.mark.asyncio
 async def test_dns_policy_rejects_url_with_no_host() -> None:
-    gate = ToolPermissionGate()
-    gate.register_policy(HttpDnsAllowlistPolicy())
+    gate = ToolPermissionGate(roles=CONVENTIONAL_TOOL_ROLES)
+    gate.register_policy(HttpDnsAllowlistPolicy(roles=CONVENTIONAL_TOOL_ROLES))
     tool = MockTool(tool_name="WebFetch")
     decision = await gate.check(
         tool=tool,
@@ -361,8 +368,10 @@ async def test_dns_blocklist_is_case_insensitive() -> None:
     """: a mixed-case blocklist entry must still block the
     lowercased host that ``urlparse`` produces (hostnames are
     case-insensitive per RFC 4343)."""
-    gate = ToolPermissionGate()
-    gate.register_policy(HttpDnsAllowlistPolicy(blocked_hosts=frozenset({"Evil.COM"})))
+    gate = ToolPermissionGate(roles=CONVENTIONAL_TOOL_ROLES)
+    gate.register_policy(HttpDnsAllowlistPolicy(
+            blocked_hosts=frozenset({"Evil.COM"}), roles=CONVENTIONAL_TOOL_ROLES
+        ))
     tool = MockTool(tool_name="WebFetch")
     decision = await gate.check(
         tool=tool,
@@ -379,9 +388,11 @@ async def test_dns_allowlist_is_case_insensitive() -> None:
     """: a mixed-case allowlist entry must still permit the
     lowercased host that ``urlparse`` produces (otherwise the policy
     silently over-denies every request)."""
-    gate = ToolPermissionGate()
+    gate = ToolPermissionGate(roles=CONVENTIONAL_TOOL_ROLES)
     gate.register_policy(
-        HttpDnsAllowlistPolicy(allowed_hosts=frozenset({"Api.OpenAI.com"}))
+        HttpDnsAllowlistPolicy(
+            allowed_hosts=frozenset({"Api.OpenAI.com"}), roles=CONVENTIONAL_TOOL_ROLES
+        )
     )
     tool = MockTool(tool_name="WebFetch")
     decision = await gate.check(
@@ -398,9 +409,11 @@ async def test_dns_allowlist_denies_mixed_case_intruder() -> None:
     """regression guard: case-folding must not accidentally widen
     the allowlist — a host NOT on the (case-folded) allowlist is denied
     even when the request uses unusual casing in the URL."""
-    gate = ToolPermissionGate()
+    gate = ToolPermissionGate(roles=CONVENTIONAL_TOOL_ROLES)
     gate.register_policy(
-        HttpDnsAllowlistPolicy(allowed_hosts=frozenset({"Api.OpenAI.com"}))
+        HttpDnsAllowlistPolicy(
+            allowed_hosts=frozenset({"Api.OpenAI.com"}), roles=CONVENTIONAL_TOOL_ROLES
+        )
     )
     tool = MockTool(tool_name="WebFetch")
     decision = await gate.check(
@@ -420,7 +433,7 @@ async def test_dns_allowlist_denies_mixed_case_intruder() -> None:
 
 @pytest.mark.asyncio
 async def test_workspace_path_policy_denies_prefix() -> None:
-    gate = ToolPermissionGate()
+    gate = ToolPermissionGate(roles=CONVENTIONAL_TOOL_ROLES)
     gate.register_policy(
         WorkspacePathPolicy(denied_path_prefixes=frozenset({"/etc/secrets"}))
     )
@@ -439,7 +452,7 @@ async def test_workspace_path_policy_denies_prefix() -> None:
 
 @pytest.mark.asyncio
 async def test_workspace_path_policy_allows_non_denied() -> None:
-    gate = ToolPermissionGate()
+    gate = ToolPermissionGate(roles=CONVENTIONAL_TOOL_ROLES)
     gate.register_policy(
         WorkspacePathPolicy(denied_path_prefixes=frozenset({"/etc/secrets"}))
     )
@@ -455,7 +468,7 @@ async def test_workspace_path_policy_allows_non_denied() -> None:
 
 @pytest.mark.asyncio
 async def test_workspace_path_exact_match() -> None:
-    gate = ToolPermissionGate()
+    gate = ToolPermissionGate(roles=CONVENTIONAL_TOOL_ROLES)
     gate.register_policy(
         WorkspacePathPolicy(denied_path_prefixes=frozenset({"/etc/passwd"}))
     )
@@ -485,7 +498,7 @@ async def test_workspace_path_policy_denies_path_canonical_alias() -> None:
  , ``arguments.get("file_path")`` returned ``None`` for the
  canonical-shape call and the deny patterns were bypassed.
  """
-    gate = ToolPermissionGate()
+    gate = ToolPermissionGate(roles=CONVENTIONAL_TOOL_ROLES)
     gate.register_policy(
         WorkspacePathPolicy(denied_path_prefixes=frozenset({"/etc"}))
     )
@@ -503,7 +516,7 @@ async def test_workspace_path_policy_denies_path_canonical_alias() -> None:
 @pytest.mark.asyncio
 async def test_workspace_path_policy_allows_non_denied_path_alias() -> None:
     """non-denied canonical ``path`` is allowed (no false-positive)."""
-    gate = ToolPermissionGate()
+    gate = ToolPermissionGate(roles=CONVENTIONAL_TOOL_ROLES)
     gate.register_policy(
         WorkspacePathPolicy(denied_path_prefixes=frozenset({"/etc"}))
     )
@@ -518,29 +531,30 @@ async def test_workspace_path_policy_allows_non_denied_path_alias() -> None:
 
 
 @pytest.mark.asyncio
-async def test_workspace_path_policy_prefers_canonical_over_alias() -> None:
-    """When both ``path`` AND ``file_path`` are present, the canonical wins.
+async def test_workspace_path_policy_reads_the_spellings_in_declared_order() -> None:
+    """When both spellings are present, the one the host named first wins.
 
-    The tool's input model normally exposes only one field; this case
-    is degenerate (a model sending both). The policy should still deny
-    deterministically — first present alias wins (file_path is checked
-    before path in :data:`_WORKSPACE_PATH_ARG_ALIASES`).
+    The tool's input model normally exposes only one field; this case is
+    degenerate (a model sending both). The resolution is still deterministic,
+    and it is the host's declared order that fixes it — the gate reads raw
+    arguments, so it has no other way to know which field the tool will use.
     """
-    gate = ToolPermissionGate()
+    gate = ToolPermissionGate(roles=CONVENTIONAL_TOOL_ROLES)
     gate.register_policy(
-        WorkspacePathPolicy(denied_path_prefixes=frozenset({"/etc"}))
+        WorkspacePathPolicy(
+            denied_path_prefixes=frozenset({"/etc"}), roles=CONVENTIONAL_TOOL_ROLES
+        )
     )
     tool = MockTool(tool_name="Write", side_effect_class=SIDE_EFFECT_WORKSPACE)
-    # file_path is allowed, path is denied → first-present alias (file_path)
-    # wins, so the call is allowed. Pin the documented resolution order
-    # so a future reshuffle does not silently flip a denial to an allow.
+    # ``path`` is declared first, and it names a denied prefix, so the call is
+    # refused however harmless the second spelling looks.
     decision = await gate.check(
         tool=tool,
         arguments={"file_path": "/home/user/x.py", "path": "/etc/passwd"},
         ctx=make_default_ctx(),
         visibility_policy=ToolVisibilityPolicy(),
     )
-    assert decision.outcome is ToolPermissionOutcome.allow
+    assert decision.outcome is ToolPermissionOutcome.deny
 
 
 # ----------------------------------------------------------------------
@@ -550,7 +564,7 @@ async def test_workspace_path_policy_prefers_canonical_over_alias() -> None:
 
 @pytest.mark.asyncio
 async def test_hook_deny_returns_deny() -> None:
-    gate = ToolPermissionGate()
+    gate = ToolPermissionGate(roles=CONVENTIONAL_TOOL_ROLES)
     hooks = InMemoryHookManager()
     hooks.queue_action(
         HookEvent.pre_tool_use,
@@ -571,7 +585,7 @@ async def test_hook_deny_returns_deny() -> None:
 
 @pytest.mark.asyncio
 async def test_hook_modify_returns_allow_with_mutated_input() -> None:
-    gate = ToolPermissionGate()
+    gate = ToolPermissionGate(roles=CONVENTIONAL_TOOL_ROLES)
     hooks = InMemoryHookManager()
     hooks.queue_action(
         HookEvent.pre_tool_use,
@@ -594,7 +608,7 @@ async def test_hook_modify_returns_allow_with_mutated_input() -> None:
 
 @pytest.mark.asyncio
 async def test_hook_requires_approval_short_circuits() -> None:
-    gate = ToolPermissionGate()
+    gate = ToolPermissionGate(roles=CONVENTIONAL_TOOL_ROLES)
     hooks = InMemoryHookManager()
     hooks.queue_action(
         HookEvent.pre_tool_use,
@@ -618,7 +632,7 @@ async def test_hook_requires_approval_short_circuits() -> None:
 
 @pytest.mark.asyncio
 async def test_hook_modify_without_tool_input_falls_through_as_allow() -> None:
-    gate = ToolPermissionGate()
+    gate = ToolPermissionGate(roles=CONVENTIONAL_TOOL_ROLES)
     hooks = InMemoryHookManager()
     hooks.queue_action(
         HookEvent.pre_tool_use,
@@ -640,8 +654,14 @@ async def test_hook_modify_without_tool_input_falls_through_as_allow() -> None:
 
 
 @pytest.mark.asyncio
-async def test_hook_exception_isolated_as_allow() -> None:
-    """A raising hook MUST NOT take down the loop — gate returns allow."""
+async def test_hook_exception_denies_rather_than_allowing() -> None:
+    """A raising hook must not take down the loop — and must not open it either.
+
+    The stage exists to answer whether the call may run. An executor that
+    crashed did not say yes, so reading its failure as consent removed the
+    permission layer for the whole time the executor was down, with nothing in
+    the caller's result to say that anything had been skipped.
+    """
 
     class BoomHookManager(IHookManager):
         async def invoke(self, event, payload, tenant_id):  # type: ignore[no-untyped-def]
@@ -656,7 +676,7 @@ async def test_hook_exception_isolated_as_allow() -> None:
         async def list(self, tenant_id, *, event=None):  # type: ignore[no-untyped-def]
             return []
 
-    gate = ToolPermissionGate()
+    gate = ToolPermissionGate(roles=CONVENTIONAL_TOOL_ROLES)
     decision = await gate.check(
         tool=MockTool(tool_name="MyTool"),
         arguments={},
@@ -664,14 +684,14 @@ async def test_hook_exception_isolated_as_allow() -> None:
         visibility_policy=ToolVisibilityPolicy(),
         hook_manager=BoomHookManager(),
     )
-    assert decision.outcome is ToolPermissionOutcome.allow
+    assert decision.outcome is ToolPermissionOutcome.deny
     assert decision.stage is PermissionStage.hook
     assert "hook dispatch failed" in decision.reason
 
 
 @pytest.mark.asyncio
 async def test_no_hook_manager_skips_hook_stage() -> None:
-    gate = ToolPermissionGate()
+    gate = ToolPermissionGate(roles=CONVENTIONAL_TOOL_ROLES)
     decision = await gate.check(
         tool=MockTool(tool_name="MyTool"),
         arguments={},
@@ -687,8 +707,8 @@ async def test_no_hook_manager_skips_hook_stage() -> None:
 # ----------------------------------------------------------------------
 
 
-def test_classify_default_map() -> None:
-    gate = ToolPermissionGate()
+def test_classify_follows_the_declared_roles() -> None:
+    gate = ToolPermissionGate(roles=CONVENTIONAL_TOOL_ROLES)
     assert gate.classify(MockTool(tool_name="Bash")) == SIDE_EFFECT_SANDBOX
     assert gate.classify(MockTool(tool_name="WebFetch")) == SIDE_EFFECT_HTTP
     assert gate.classify(MockTool(tool_name="Write")) == SIDE_EFFECT_WORKSPACE
@@ -696,18 +716,18 @@ def test_classify_default_map() -> None:
 
 
 def test_classify_unknown_tool_defaults_state_only() -> None:
-    gate = ToolPermissionGate()
+    gate = ToolPermissionGate(roles=CONVENTIONAL_TOOL_ROLES)
     assert gate.classify(MockTool(tool_name="ZeroDayTool")) == SIDE_EFFECT_STATE_ONLY
 
 
 def test_classify_honours_classvar_attribute() -> None:
-    gate = ToolPermissionGate()
+    gate = ToolPermissionGate(roles=CONVENTIONAL_TOOL_ROLES)
     tool = MockTool(tool_name="WhoKnows", side_effect_class=SIDE_EFFECT_SANDBOX)
     assert gate.classify(tool) == SIDE_EFFECT_SANDBOX
 
 
 def test_set_side_effect_class_override() -> None:
-    gate = ToolPermissionGate()
+    gate = ToolPermissionGate(roles=CONVENTIONAL_TOOL_ROLES)
     gate.set_side_effect_class("MyTool", SIDE_EFFECT_HTTP)
     # No ClassVar present — falls back to map.
     assert gate.classify(MockTool(tool_name="MyTool")) == SIDE_EFFECT_HTTP
@@ -721,7 +741,7 @@ def test_set_side_effect_class_override() -> None:
 @pytest.mark.asyncio
 async def test_whitelist_wins_over_safety_policy() -> None:
     """If the tool is blocked, we never reach the safety policy stage."""
-    gate = ToolPermissionGate()
+    gate = ToolPermissionGate(roles=CONVENTIONAL_TOOL_ROLES)
     tool = MockTool(tool_name="Bash")
     decision = await gate.check(
         tool=tool,
@@ -736,7 +756,7 @@ async def test_whitelist_wins_over_safety_policy() -> None:
 @pytest.mark.asyncio
 async def test_safety_policy_wins_over_hook() -> None:
     """If safety policy denies, the hook never fires."""
-    gate = ToolPermissionGate()
+    gate = ToolPermissionGate(roles=CONVENTIONAL_TOOL_ROLES)
     hooks = InMemoryHookManager()
     # Queue a permissive hook response — should never be consumed.
     hooks.queue_action(
@@ -754,3 +774,83 @@ async def test_safety_policy_wins_over_hook() -> None:
     assert decision.stage is PermissionStage.safety_policy
     # Hook was never invoked.
     assert not hooks.invocations
+
+
+# ----------------------------------------------------------------------
+# Safety policies with nothing to read — a declaration the host never made
+# ----------------------------------------------------------------------
+
+
+_NO_SPELLINGS: ToolRoleMap = ToolRoleMap.declare(
+    {"Shell": [ToolRole.runs_shell], "Fetch": [ToolRole.fetches_url]}
+)
+
+
+@pytest.mark.asyncio
+async def test_shell_with_no_declared_command_spelling_goes_to_a_person() -> None:
+    """A command the policy cannot read is not a command it found harmless."""
+    gate = ToolPermissionGate(roles=_NO_SPELLINGS)
+    decision = await gate.check(
+        tool=MockTool(tool_name="Shell"),
+        arguments={"command": "rm -rf /"},
+        ctx=make_default_ctx(),
+        visibility_policy=ToolVisibilityPolicy(),
+    )
+    assert decision.outcome is ToolPermissionOutcome.require_approval
+    assert decision.stage is PermissionStage.safety_policy
+
+
+@pytest.mark.asyncio
+async def test_shell_deny_patterns_run_once_the_spelling_is_declared() -> None:
+    gate = ToolPermissionGate(
+        roles=ToolRoleMap.declare(
+            {"Shell": [ToolRole.runs_shell]},
+            argument_aliases={ToolArgumentSlot.shell_command: ["command"]},
+        )
+    )
+    decision = await gate.check(
+        tool=MockTool(tool_name="Shell"),
+        arguments={"command": "rm -rf /"},
+        ctx=make_default_ctx(),
+        visibility_policy=ToolVisibilityPolicy(),
+    )
+    assert decision.outcome is ToolPermissionOutcome.deny
+    assert decision.stage is PermissionStage.safety_policy
+
+
+@pytest.mark.asyncio
+async def test_host_allowlist_with_no_declared_url_spelling_goes_to_a_person() -> None:
+    gate = ToolPermissionGate(roles=_NO_SPELLINGS)
+    gate.register_policy(
+        HttpDnsAllowlistPolicy(allowed_hosts=frozenset({"api.example.com"}))
+    )
+    decision = await gate.check(
+        tool=MockTool(tool_name="Fetch"),
+        arguments={"target_url": "https://intruder.example.com/"},
+        ctx=make_default_ctx(),
+        visibility_policy=ToolVisibilityPolicy(),
+    )
+    assert decision.outcome is ToolPermissionOutcome.require_approval
+    assert decision.stage is PermissionStage.safety_policy
+
+
+@pytest.mark.asyncio
+async def test_host_allowlist_reads_the_spelling_the_host_declared() -> None:
+    roles = ToolRoleMap.declare(
+        {"Fetch": [ToolRole.fetches_url]},
+        argument_aliases={ToolArgumentSlot.url: ["target_url"]},
+    )
+    gate = ToolPermissionGate(roles=roles)
+    gate.register_policy(
+        HttpDnsAllowlistPolicy(
+            allowed_hosts=frozenset({"api.example.com"}), roles=roles
+        )
+    )
+    decision = await gate.check(
+        tool=MockTool(tool_name="Fetch"),
+        arguments={"target_url": "https://intruder.example.com/"},
+        ctx=make_default_ctx(),
+        visibility_policy=ToolVisibilityPolicy(),
+    )
+    assert decision.outcome is ToolPermissionOutcome.deny
+    assert "allowlist" in decision.reason

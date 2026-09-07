@@ -1,15 +1,15 @@
 """IRunStore Protocol — durable per-run state.
 
-Reference shape: a relational summary row paired with an object-store
-detail blob.
+Reference shape: a short summary record paired with a detail blob held
+wherever the host keeps large values.
 
 ``flush_terminal`` is called once a run reaches a terminal status
-(completed/error/cancelled) to write the S3 blob and update the PG row.
+(completed/error/cancelled) to write the detail blob and update the summary.
 
 ``IRunToolErrorCounter`` is the narrow protocol the core
 :class:`~protocore.runtime.tool_dispatch.ToolDispatcher` uses to record
-per-run tool dispatch errors. Reference shape: one atomic
-``UPDATE runs SET tool_errors_count = tool_errors_count + N``. Keeping
+per-run tool dispatch errors. Reference shape: one atomic increment of a
+per-run counter. Keeping
 the protocol in core lets the dispatcher remain host-agnostic while
 still surfacing the per-run counter for the terminal classifier.
 """

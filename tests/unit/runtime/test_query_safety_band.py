@@ -1,52 +1,54 @@
-"""AdaptiveSafetyBand resolver in query.
+"""The safety-band resolver in query.
 
-Covers ``_resolve_safety_band_value`` — the helper-bag-aware band
-lookup that ``_drive_one_stream`` consults to reduce
-``LLMRequest.max_tokens`` by the calibrated drift margin.
+Covers ``_resolve_safety_band_value`` — the band lookup that
+``_drive_one_stream`` consults to reduce ``LLMRequest.max_tokens`` by the
+calibrated drift margin. The band itself is whatever the host wired onto the
+run's state; all the loop asks of it is ``current()``.
 """
 from __future__ import annotations
 
 from unittest.mock import MagicMock
 
-from protocore.contracts.runtime_constants import RuntimeConstants
-from protocore.runtime.adaptive_safety_band import AdaptiveSafetyBand
+from protocore.contracts.run_state import RunScopedState
+from protocore.contracts.runtime_constants import LoopConstants
 from protocore.runtime.query import _resolve_safety_band_value
 
 
-def _engine_stub(*, rc: RuntimeConstants, helpers: object | None) -> object:
+class _Band:
+    """The whole of what the loop asks a safety band for."""
+
+    def __init__(self, value: int) -> None:
+        self._value = value
+
+    def current(self) -> int:
+        return self._value
+
+
+def _engine_stub(*, rc: LoopConstants, band: object | None) -> object:
     engine = MagicMock()
     engine.config = MagicMock()
     engine.config.rc = rc
-    if helpers is None:
-        del engine._helpers
-    else:
-        engine._helpers = helpers
+    engine.run_state = RunScopedState(adaptive_safety_band=band)
     return engine
 
 
 def test_resolver_returns_zero_when_killswitch_off() -> None:
-    band = AdaptiveSafetyBand(provider="acme", model="acme-model-1", initial=512)
-    rc = RuntimeConstants(adaptive_safety_band_enabled=False)
-    engine = _engine_stub(rc=rc, helpers={"adaptive_safety_band": band})
+    band = _Band(512)
+    rc = LoopConstants(adaptive_safety_band_enabled=False)
+    engine = _engine_stub(rc=rc, band=band)
     assert _resolve_safety_band_value(engine) == 0
 
 
-def test_resolver_returns_zero_when_helpers_missing() -> None:
-    rc = RuntimeConstants()  # kill-switch defaults to enabled
-    engine = _engine_stub(rc=rc, helpers=None)
-    assert _resolve_safety_band_value(engine) == 0
-
-
-def test_resolver_returns_zero_when_band_missing() -> None:
-    rc = RuntimeConstants()
-    engine = _engine_stub(rc=rc, helpers={})
+def test_resolver_returns_zero_when_the_run_carries_no_band() -> None:
+    rc = LoopConstants()  # kill-switch defaults to enabled
+    engine = _engine_stub(rc=rc, band=None)
     assert _resolve_safety_band_value(engine) == 0
 
 
 def test_resolver_reads_band_current() -> None:
-    band = AdaptiveSafetyBand(provider="vllm", model="qwen-7b", initial=768)
-    rc = RuntimeConstants()
-    engine = _engine_stub(rc=rc, helpers={"adaptive_safety_band": band})
+    band = _Band(768)
+    rc = LoopConstants()
+    engine = _engine_stub(rc=rc, band=band)
     assert _resolve_safety_band_value(engine) == 768
 
 
@@ -57,8 +59,8 @@ def test_resolver_negative_band_clamped_to_zero() -> None:
         def current(self) -> int:
             return -42
 
-    rc = RuntimeConstants()
-    engine = _engine_stub(rc=rc, helpers={"adaptive_safety_band": _BrokenBand()})
+    rc = LoopConstants()
+    engine = _engine_stub(rc=rc, band=_BrokenBand())
     assert _resolve_safety_band_value(engine) == 0
 
 
@@ -69,6 +71,6 @@ def test_resolver_swallows_exception() -> None:
         def current(self) -> int:
             raise RuntimeError("oh no")
 
-    rc = RuntimeConstants()
-    engine = _engine_stub(rc=rc, helpers={"adaptive_safety_band": _RaisingBand()})
+    rc = LoopConstants()
+    engine = _engine_stub(rc=rc, band=_RaisingBand())
     assert _resolve_safety_band_value(engine) == 0

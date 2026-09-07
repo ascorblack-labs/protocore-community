@@ -13,7 +13,7 @@ from typing import Any
 import pytest
 
 from protocore.contracts.llm import LLMRequest, LLMStreamEvent
-from protocore.contracts.runtime_constants import RuntimeConstants
+from protocore.contracts.runtime_constants import LoopConstants
 from protocore.contracts.tools import Tool, ToolContext
 from protocore.contracts.types import (
     Message,
@@ -40,7 +40,7 @@ OTHER_TOOL = "lookup"
 
 def _build_engine(
     *,
-    rc: RuntimeConstants,
+    rc: LoopConstants,
     llm: object,
     expected_terminal_tool: str | None = TERMINAL_TOOL,
 ) -> QueryEngine:
@@ -144,7 +144,7 @@ class _RawEnvelopeLLM:
 async def _run_raw_envelope_case(
     *, tool_name: str, expected_terminal_tool: str | None
 ) -> tuple[_RawEnvelopeLLM, _RecordingTool, list[TurnEvent]]:
-    rc = RuntimeConstants(
+    rc = LoopConstants(
         model_context_window=4_096,
         max_output_recovery_rounds=1,
     )

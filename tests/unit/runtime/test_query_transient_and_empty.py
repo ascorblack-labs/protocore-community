@@ -25,7 +25,7 @@ from protocore.contracts.llm import (
     LLMStreamEvent,
     LLMTimeoutError,
 )
-from protocore.contracts.runtime_constants import RuntimeConstants
+from protocore.contracts.runtime_constants import LoopConstants
 from protocore.contracts.types import Message, MessageRole, StopReason, TextBlock
 from protocore.runtime.events import EventType, TurnEvent
 from protocore.runtime.loop_state import LoopState
@@ -261,7 +261,7 @@ def _attach_chain(engine, llm: object, *names: str) -> _FakeProviderChain:
     return chain
 
 
-def _no_backoff_rc(**overrides: object) -> RuntimeConstants:
+def _no_backoff_rc(**overrides: object) -> LoopConstants:
     """RC with zero backoff so retry tests never actually sleep."""
     base: dict[str, object] = {
         "model_context_window": 4096,
@@ -269,7 +269,7 @@ def _no_backoff_rc(**overrides: object) -> RuntimeConstants:
         "llm_transient_error_retry_backoff_max_seconds": 0.0,
     }
     base.update(overrides)
-    return RuntimeConstants(**base)  # type: ignore[arg-type]
+    return LoopConstants(**base)  # type: ignore[arg-type]
 
 
 async def _drive(engine, text: str = "hi") -> list[TurnEvent]:
@@ -487,7 +487,7 @@ async def test_empty_completion_redrive_then_answer_completes(
     engine_factory, in_memory_runtime
 ) -> None:
     """An empty first turn is re-driven; a real answer then completes the run."""
-    rc = RuntimeConstants(model_context_window=4096)  # guard default-on, 1 re-drive
+    rc = LoopConstants(model_context_window=4096)  # guard default-on, 1 re-drive
     engine = engine_factory(rc=rc)
     llm = _EmptyStreamLLM(empty_rounds=1, recovery_text="the real answer text")
     engine.llm = llm  # type: ignore[assignment]
@@ -518,7 +518,7 @@ async def test_empty_completion_exhausted_is_terminal_not_empty_completed(
     engine_factory, in_memory_runtime
 ) -> None:
     """A persistently-empty run fails loudly rather than sealing empty COMPLETED."""
-    rc = RuntimeConstants(model_context_window=4096, empty_completion_guard_max_redrives=1)
+    rc = LoopConstants(model_context_window=4096, empty_completion_guard_max_redrives=1)
     engine = engine_factory(rc=rc)
     llm = _EmptyStreamLLM(empty_rounds=5)  # never produces content
     engine.llm = llm  # type: ignore[assignment]
@@ -543,7 +543,7 @@ async def test_empty_completion_guard_disabled_seals_completed(
     engine_factory, in_memory_runtime
 ) -> None:
     """With the guard disabled the prior behaviour (empty COMPLETED) holds."""
-    rc = RuntimeConstants(model_context_window=4096, empty_completion_guard_enabled=False)
+    rc = LoopConstants(model_context_window=4096, empty_completion_guard_enabled=False)
     engine = engine_factory(rc=rc)
     llm = _EmptyStreamLLM(empty_rounds=5)
     engine.llm = llm  # type: ignore[assignment]
@@ -559,7 +559,7 @@ async def test_empty_guard_does_not_fire_on_healthy_answer(
     engine_factory, in_memory_runtime
 ) -> None:
     """A normal answered turn completes untouched (no empty-guard regression)."""
-    rc = RuntimeConstants(model_context_window=4096)
+    rc = LoopConstants(model_context_window=4096)
     engine = engine_factory(rc=rc)
     llm = _ScriptedFailureLLM(exceptions=[], recovery_text="a perfectly good answer")
     engine.llm = llm  # type: ignore[assignment]

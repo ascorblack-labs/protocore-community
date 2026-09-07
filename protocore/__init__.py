@@ -9,9 +9,10 @@
 Public API:
     - 12 interface contracts in :mod:`protocore.contracts`
     - Core type system (Message, ToolCall, Event, Run, Session, …)
-    - :class:`~protocore.contracts.runtime_constants.RuntimeConstants` frozen snapshot
+    - :class:`~protocore.contracts.runtime_constants.LoopConstants` frozen snapshot
     - :class:`~protocore.events.EventBus` + :class:`~protocore.events.EventName`
-    - :class:`~protocore.hooks.HookManager` (pluggy-based, 8 events)
+    - :class:`~protocore.hooks.HookManager` — the lifecycle registry (see
+      :mod:`protocore.contracts.middleware`)
     - :class:`~protocore.safety.DefaultShellSafetyPolicy`
     - :func:`~protocore.tools.tool` decorator
     - :func:`~protocore.ingress.parse_envelope` + :func:`~protocore.json_utils.parse_complete_json`
@@ -56,6 +57,7 @@ from protocore.contracts import (
     IBlobStore,
     IEventStream,
     IHookManager,
+    ILifecycleRegistry,
     ILLMProvider,
     IRunStore,
     ISearchIndex,
@@ -63,15 +65,21 @@ from protocore.contracts import (
     ISkillStore,
     ITodoStorage,
     IToolRegistry,
+    LifecycleContext,
+    LifecycleDecision,
+    LifecycleDisposer,
+    LifecycleOutcome,
+    LifecycleScope,
+    LifecycleVerdict,
     LLMObservabilityContext,
     LLMRequest,
     LLMResponse,
+    LoopConstants,
     Message,
     MessageRole,
     Run,
     RunState,
     RunStatus,
-    RuntimeConstants,
     RuntimeConstantsProvider,
     Session,
     SkillBundle,
@@ -97,6 +105,7 @@ from protocore.contracts import (
     ToolResult,
     ToolVisibilityPolicy,
 )
+from protocore.contracts.middleware import RegistrationKind
 from protocore.events import EventBus, EventName
 from protocore.hooks import HookManager
 from protocore.ingress import EnvelopeParseError, parse_envelope, serialize_envelope
@@ -150,6 +159,13 @@ __all__ = [  # noqa: RUF022
     "IBlobStore",
     "IEventStream",
     "IHookManager",
+    "ILifecycleRegistry",
+    "LifecycleContext",
+    "LifecycleDecision",
+    "LifecycleDisposer",
+    "LifecycleOutcome",
+    "LifecycleScope",
+    "LifecycleVerdict",
     "ILLMProvider",
     "IRunStore",
     "ISearchIndex",
@@ -178,7 +194,7 @@ __all__ = [  # noqa: RUF022
     "Run",
     "RunState",
     "RunStatus",
-    "RuntimeConstants",
+    "LoopConstants",
     "RuntimeConstantsProvider",
     "Session",
     "SkillBundle",
@@ -208,6 +224,7 @@ __all__ = [  # noqa: RUF022
     "EventBus",
     "EventName",
     "HookManager",
+    "RegistrationKind",
     "JsonOutputParser",
     "LanguageProfile",
     "OutputParserException",

@@ -189,14 +189,28 @@ def _parse_any(
             parsed = ast.literal_eval(candidate)
         except (SyntaxError, ValueError, TypeError, MemoryError, RecursionError) as exc:
             raise OutputParserException("invalid_json_output") from exc
-        if isinstance(parsed, tuple):
-            return list(parsed)
-        if isinstance(parsed, set) or not isinstance(
-            parsed,
-            (dict, list, str, int, float, bool, type(None)),
-        ):
-            raise OutputParserException("invalid_json_output") from None
-        return parsed
+        return _normalise_literal(parsed)
+
+
+_JSON_SCALARS: Final[tuple[type, ...]] = (str, int, float, bool, type(None))
+
+
+def _normalise_literal(value: Any) -> Any:
+    """Coerce an ``ast.literal_eval`` result to JSON-expressible types.
+
+    Tuples become lists; anything else Python-only — a set above all — is
+    refused. The check reaches every level, not just the top one: repairing a
+    truncated object key produces text like ``{"partial"}``, which Python reads
+    as a set literal, and a set nested one list deep used to travel back to the
+    caller of a JSON parser.
+    """
+    if isinstance(value, dict):
+        return {key: _normalise_literal(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_normalise_literal(item) for item in value]
+    if isinstance(value, _JSON_SCALARS):
+        return value
+    raise OutputParserException("invalid_json_output") from None
 
 
 def _extract_json_slice(
@@ -452,19 +466,70 @@ def structured_json_strings(raw_text: str) -> list[str]:
 # Partial / streaming parsers -----------------------------------------------
 
 
+_ATOM_STRING: Final[str] = "string"
+_ATOM_SPACE: Final[str] = "space"
+_ATOM_CHAR: Final[str] = "char"
+
+_JSON_WHITESPACE: Final[str] = " \t\n\r"
+
+
+class _Atom:
+    """One string literal, one whitespace run, or one other character."""
+
+    __slots__ = ("closed", "kind", "text")
+
+    def __init__(self, kind: str, text: str, *, closed: bool = True) -> None:
+        self.kind = kind
+        self.text = text
+        self.closed = closed
+
+
+def _atomise(text: str) -> list[_Atom]:
+    """Split ``text`` into string-aware atoms in a single left-to-right pass.
+
+    Quoted runs become one atom each, so a later scan can tell a structural
+    brace from one that merely sits inside a string without re-deciding that
+    question at every offset.
+    """
+    atoms: list[_Atom] = []
+    index = 0
+    length = len(text)
+    while index < length:
+        char = text[index]
+        if char == '"':
+            cursor = index + 1
+            closed = False
+            while cursor < length:
+                current = text[cursor]
+                if current == "\\":
+                    cursor += 2
+                    continue
+                cursor += 1
+                if current == '"':
+                    closed = True
+                    break
+            cursor = min(cursor, length)
+            atoms.append(_Atom(_ATOM_STRING, text[index:cursor], closed=closed))
+            index = cursor
+            continue
+        if char in _JSON_WHITESPACE:
+            cursor = index
+            while cursor < length and text[cursor] in _JSON_WHITESPACE:
+                cursor += 1
+            atoms.append(_Atom(_ATOM_SPACE, text[index:cursor]))
+            index = cursor
+            continue
+        atoms.append(_Atom(_ATOM_CHAR, char))
+        index += 1
+    return atoms
+
+
 class PartialJSONParser:
     """Best-effort parser for partially generated JSON."""
 
     def __init__(self, *, max_depth: int = MAX_DATA_NESTING_DEPTH) -> None:
         self.max_depth = max_depth
 
-    _dangling_key_before_closer_re: Final[re.Pattern[str]] = re.compile(
-        r'(,\s*)?"[^"\\]*(?:\\.[^"\\]*)*"\s*:\s*(?=[}\]])',
-    )
-    _dangling_key_at_end_re: Final[re.Pattern[str]] = re.compile(
-        r'(,\s*)?"[^"\\]*(?:\\.[^"\\]*)*"\s*:\s*$',
-    )
-    _trailing_comma_re: Final[re.Pattern[str]] = re.compile(r",\s*([}\]])")
 
     def parse(self, text: str) -> Any | None:
         """Parse complete JSON or repair an incomplete JSON prefix.
@@ -559,14 +624,87 @@ class PartialJSONParser:
         return self._cleanup_dangling_tokens(repaired)
 
     def _cleanup_dangling_tokens(self, candidate: str) -> str:
-        cleaned = candidate
-        previous: str | None = None
-        while previous != cleaned:
-            previous = cleaned
-            cleaned = self._trailing_comma_re.sub(r"\1", cleaned)
-            cleaned = self._dangling_key_before_closer_re.sub("", cleaned)
-            cleaned = self._dangling_key_at_end_re.sub("", cleaned).rstrip()
-        return cleaned
+        """Drop trailing commas and value-less keys that precede a closer.
+
+        A single right-to-left pass over string-aware atoms. The obvious
+        spelling — three regexes applied until the text stops changing — is
+        quadratic on exactly the payloads this parser exists for: a pattern
+        that matches a quoted run is retried at every quote in the buffer, and
+        an unterminated string makes each of those attempts walk to the end of
+        the input. A 64 KiB truncated string with escapes took eighteen seconds
+        that way. Scanning once, from the right, costs one pass and cannot
+        mistake a brace inside a string for a structural one.
+
+        A key with no colon yet is dropped as well, not only a key whose colon
+        has no value. That is the ordinary shape of a body cut off by an output
+        limit — ``{"a": 1, "te`` — and leaving the fragment in place produces
+        ``{"a": 1, "te"}``, which is a Python set literal rather than an
+        object, so the whole document is refused and every fact already
+        complete in it is lost. Dropped, it repairs to ``{"a": 1}`` and the
+        complete part survives.
+        """
+        atoms = _atomise(candidate)
+        dropped = [False] * len(atoms)
+
+        def previous_significant(index: int) -> int:
+            cursor = index - 1
+            while cursor >= 0 and (dropped[cursor] or atoms[cursor].kind == _ATOM_SPACE):
+                cursor -= 1
+            return cursor
+
+        def is_value_less_key(index: int) -> bool:
+            """Whether the string atom at ``index`` is a key awaiting a colon.
+
+            Only what stands to its left can tell a key from a value, because
+            the caller has already established that nothing significant stands
+            to its right before the object's closer. A string preceded by
+            ``:`` is that colon's value; one preceded by ``{`` or ``,`` is a
+            key whose colon never arrived.
+            """
+            if atoms[index].kind != _ATOM_STRING or not atoms[index].closed:
+                return False
+            before = previous_significant(index)
+            if before < 0 or atoms[before].kind != _ATOM_CHAR:
+                return False
+            return atoms[before].text in "{,"
+
+        def cascade(boundary: int, *, closer: str | None = None) -> None:
+            """Strip dangling constructs immediately left of ``boundary``."""
+            while True:
+                previous = previous_significant(boundary)
+                if previous < 0:
+                    return
+                atom = atoms[previous]
+                if atom.kind == _ATOM_CHAR and atom.text == ",":
+                    for cursor in range(previous, boundary):
+                        dropped[cursor] = True
+                    boundary = previous
+                    continue
+                if closer == "}" and is_value_less_key(previous):
+                    for cursor in range(previous, boundary):
+                        dropped[cursor] = True
+                    boundary = previous
+                    continue
+                if not (atom.kind == _ATOM_CHAR and atom.text == ":"):
+                    return
+                key = previous_significant(previous)
+                if key < 0 or atoms[key].kind != _ATOM_STRING or not atoms[key].closed:
+                    return
+                for cursor in range(key, boundary):
+                    dropped[cursor] = True
+                boundary = key
+
+        cascade(len(atoms))
+        for index in range(len(atoms) - 1, -1, -1):
+            if dropped[index]:
+                continue
+            atom = atoms[index]
+            if atom.kind == _ATOM_CHAR and atom.text in "}]":
+                cascade(index, closer=atom.text)
+
+        return "".join(
+            atom.text for index, atom in enumerate(atoms) if not dropped[index]
+        ).rstrip()
 
 
 class StreamingJSONParser:
@@ -653,6 +791,427 @@ class StreamingJSONParser:
         return None
 
 
+# Incremental partial view ---------------------------------------------------
+
+# Longest tag prefix ``strip_thinking`` can react to, kept across chunk
+# boundaries so a tag split between two chunks is still noticed.
+_THINK_TAG_LOOKBEHIND: Final[int] = len("<thinking")
+
+_ST_BEFORE: Final[int] = 0
+_ST_VALUE: Final[int] = 1
+_ST_OBJ_KEY: Final[int] = 2
+_ST_OBJ_COLON: Final[int] = 3
+_ST_AFTER: Final[int] = 4
+_ST_STRING: Final[int] = 5
+_ST_TOKEN: Final[int] = 6
+_ST_DONE: Final[int] = 7
+
+_ESC_NONE: Final[int] = 0
+_ESC_BACKSLASH: Final[int] = 1
+_ESC_HEX: Final[int] = 2
+
+_SIMPLE_ESCAPES: Final[dict[str, str]] = {
+    '"': '"',
+    "\\": "\\",
+    "/": "/",
+    "b": "\b",
+    "f": "\f",
+    "n": "\n",
+    "r": "\r",
+    "t": "\t",
+}
+_HEX_DIGITS: Final[frozenset[str]] = frozenset("0123456789abcdefABCDEF")
+_TOKEN_CHARS: Final[frozenset[str]] = frozenset(
+    "+-.0123456789"
+    "abcdefghijklmnopqrstuvwxyz"
+    "ABCDEFGHIJKLMNOPQRSTUVWXYZ",
+)
+_SURROGATE_HIGH_FIRST: Final[int] = 0xD800
+_SURROGATE_HIGH_LAST: Final[int] = 0xDBFF
+_SURROGATE_LOW_FIRST: Final[int] = 0xDC00
+_SURROGATE_LOW_LAST: Final[int] = 0xDFFF
+_SURROGATE_BASE: Final[int] = 0x10000
+_SURROGATE_SHIFT: Final[int] = 10
+_UNICODE_ESCAPE_DIGITS: Final[int] = 4
+_UNSET: Final[Any] = object()
+_AMBIGUOUS: Final[Any] = object()
+
+
+class _Frame:
+    """One open container plus the slot it occupies in its parent."""
+
+    __slots__ = ("container", "is_object", "key", "slot")
+
+    def __init__(self, container: Any, *, is_object: bool, slot: Any) -> None:
+        self.container = container
+        self.is_object = is_object
+        self.key: str | None = None
+        self.slot = slot
+
+
+class _IncrementalPartialView:
+    """Live mirror of :meth:`PartialJSONParser.parse` over a growing buffer.
+
+    Consumes the same characters the accumulator sees and keeps the value tree
+    built so far, so producing a partial snapshot costs the open spine instead
+    of re-parsing and re-repairing the whole buffer on every chunk. That is the
+    difference between a stream whose total cost is linear in its length and
+    one whose cost is cubic.
+
+    The mirror covers the JSON grammar only. Anything outside it — an unknown
+    escape, a raw control character inside a string, a token neither JSON nor a
+    prefix of one, a structural character where the grammar allows none — sets
+    :attr:`supported` to ``False``, and the caller falls back to the text
+    parser, whose leniency (Python-literal rescue, tolerated oddities) is what
+    decides those cases and cannot be mirrored by a grammar alone.
+    """
+
+    def __init__(self) -> None:
+        self.reset()
+
+    def reset(self) -> None:
+        """Drop all state, as after a complete value was emitted."""
+        self.supported = True
+        # ``tree_dirty`` covers changes already folded into the value tree;
+        # ``pending`` vs ``emitted_pending`` covers the scalar still being
+        # typed, whose text can grow without its value changing (``1000.``
+        # and ``1000.0`` are the same number).
+        self.tree_dirty = False
+        self.pending: Any = _UNSET
+        self.emitted_pending: Any = _UNSET
+        self._state = _ST_BEFORE
+        self._root: Any = None
+        self._stack: list[_Frame] = []
+        self._token: list[str] = []
+        self._string: list[str] = []
+        self._string_is_key = False
+        self._escape = _ESC_NONE
+        self._hex = ""
+        self._high_surrogate: int | None = None
+        self._trailing_space = 0
+        self._tail = ""
+
+    # -- consumption --------------------------------------------------------
+
+    def consume(self, chunk: str) -> None:
+        """Feed the same characters the accumulator just took."""
+        if not self.supported:
+            return
+        # ``strip_thinking`` runs ahead of the text parser and would excise a
+        # thinking span wherever it appears, including inside a string. The
+        # mirror does not model that, so its presence hands the buffer back.
+        if "<think" in (self._tail + chunk).lower():
+            self.supported = False
+            return
+        self._tail = (self._tail + chunk)[-_THINK_TAG_LOOKBEHIND:]
+        for char in chunk:
+            self._feed(char)
+            if not self.supported:
+                return
+
+    def _unsupported(self) -> None:
+        self.supported = False
+
+    def _feed(self, char: str) -> None:
+        state = self._state
+        if state == _ST_STRING:
+            self._feed_string(char)
+            return
+        if state == _ST_TOKEN:
+            if char in _TOKEN_CHARS:
+                self._token.append(char)
+                return
+            if not self._close_token():
+                return
+            state = self._state
+        if char in _JSON_WHITESPACE:
+            return
+        if state == _ST_BEFORE:
+            if char == "{":
+                self._open(is_object=True)
+            elif char == "[":
+                self._open(is_object=False)
+            return
+        if state == _ST_VALUE:
+            self._feed_value(char)
+            return
+        if state == _ST_OBJ_KEY:
+            if char == '"':
+                self._open_string(is_key=True)
+            elif char == "}":
+                self._close_container()
+            else:
+                self._unsupported()
+            return
+        if state == _ST_OBJ_COLON:
+            if char == ":":
+                self._state = _ST_VALUE
+            else:
+                self._unsupported()
+            return
+        if state == _ST_AFTER:
+            self._feed_after(char)
+            return
+        self._unsupported()
+
+    def _feed_value(self, char: str) -> None:
+        if char == '"':
+            self._open_string(is_key=False)
+            return
+        if char == "{":
+            self._open(is_object=True)
+            return
+        if char == "[":
+            self._open(is_object=False)
+            return
+        if char in "}]":
+            # A closer where a value was promised: the repair path drops the
+            # value-less key or the trailing comma and closes the container.
+            frame = self._stack[-1] if self._stack else None
+            if frame is None or frame.is_object != (char == "}"):
+                self._unsupported()
+                return
+            frame.key = None
+            self._close_container()
+            return
+        if char in _TOKEN_CHARS:
+            self._token = [char]
+            self._state = _ST_TOKEN
+            return
+        self._unsupported()
+
+    def _feed_after(self, char: str) -> None:
+        frame = self._stack[-1] if self._stack else None
+        if frame is None:
+            self._unsupported()
+            return
+        if char == ",":
+            self._state = _ST_OBJ_KEY if frame.is_object else _ST_VALUE
+            return
+        if char in "}]" and frame.is_object == (char == "}"):
+            self._close_container()
+            return
+        self._unsupported()
+
+    # -- structure ----------------------------------------------------------
+
+    def _attach(self, value: Any) -> Any:
+        """Place a finished value in the open container; return its slot."""
+        if not self._stack:
+            self._root = value
+            return None
+        frame = self._stack[-1]
+        if frame.is_object:
+            key = frame.key
+            frame.key = None
+            if key is None:
+                self._unsupported()
+                return None
+            frame.container[key] = value
+            return key
+        frame.container.append(value)
+        return len(frame.container) - 1
+
+    def _open(self, *, is_object: bool) -> None:
+        container: Any = {} if is_object else []
+        slot = self._attach(container)
+        if not self.supported:
+            return
+        self._stack.append(_Frame(container, is_object=is_object, slot=slot))
+        self._state = _ST_OBJ_KEY if is_object else _ST_VALUE
+        self.tree_dirty = True
+
+    def _close_container(self) -> None:
+        self._stack.pop()
+        self._state = _ST_AFTER if self._stack else _ST_DONE
+
+    def _close_token(self) -> bool:
+        token = "".join(self._token)
+        try:
+            value = json.loads(token)
+        except ValueError:
+            self._unsupported()
+            return False
+        self._attach(value)
+        if not self.supported:
+            return False
+        self._settle(value)
+        self._state = _ST_AFTER
+        return True
+
+    # -- strings ------------------------------------------------------------
+
+    def _open_string(self, *, is_key: bool) -> None:
+        self._state = _ST_STRING
+        self._string = []
+        self._string_is_key = is_key
+        self._escape = _ESC_NONE
+        self._hex = ""
+        self._high_surrogate = None
+        self._trailing_space = 0
+
+    def _emit_char(self, char: str, *, from_escape: bool) -> None:
+        self._flush_high_surrogate()
+        self._string.append(char)
+        if not from_escape and char.isspace():
+            # ``repair`` strips the buffer before closing an open string, so
+            # literal trailing whitespace is not part of the partial value yet.
+            self._trailing_space += 1
+            return
+        self._trailing_space = 0
+
+    def _flush_high_surrogate(self) -> None:
+        if self._high_surrogate is not None:
+            self._string.append(chr(self._high_surrogate))
+            self._high_surrogate = None
+            self._trailing_space = 0
+
+    def _feed_string(self, char: str) -> None:
+        if self._escape == _ESC_BACKSLASH:
+            if char == "u":
+                self._escape = _ESC_HEX
+                self._hex = ""
+                return
+            mapped = _SIMPLE_ESCAPES.get(char)
+            if mapped is None:
+                self._unsupported()
+                return
+            self._escape = _ESC_NONE
+            self._emit_char(mapped, from_escape=True)
+            return
+        if self._escape == _ESC_HEX:
+            if char not in _HEX_DIGITS:
+                self._unsupported()
+                return
+            self._hex += char
+            if len(self._hex) < _UNICODE_ESCAPE_DIGITS:
+                return
+            self._escape = _ESC_NONE
+            code_point = int(self._hex, 16)
+            self._hex = ""
+            self._emit_code_point(code_point)
+            return
+        if char == '"':
+            self._close_string()
+            return
+        if char == "\\":
+            self._escape = _ESC_BACKSLASH
+            return
+        if char < " ":
+            # Raw control characters are rejected by the JSON scanner but
+            # tolerated by the literal-eval rescue behind the text parser.
+            self._unsupported()
+            return
+        self._emit_char(char, from_escape=False)
+
+    def _emit_code_point(self, code_point: int) -> None:
+        if self._high_surrogate is not None and (
+            _SURROGATE_LOW_FIRST <= code_point <= _SURROGATE_LOW_LAST
+        ):
+            high = self._high_surrogate - _SURROGATE_HIGH_FIRST
+            low = code_point - _SURROGATE_LOW_FIRST
+            self._high_surrogate = None
+            self._string.append(
+                chr(_SURROGATE_BASE + ((high << _SURROGATE_SHIFT) | low)),
+            )
+            self._trailing_space = 0
+            return
+        self._flush_high_surrogate()
+        if _SURROGATE_HIGH_FIRST <= code_point <= _SURROGATE_HIGH_LAST:
+            self._high_surrogate = code_point
+            return
+        self._emit_char(chr(code_point), from_escape=True)
+
+    def _close_string(self) -> None:
+        self._flush_high_surrogate()
+        text = "".join(self._string)
+        self._string = []
+        if self._string_is_key:
+            if not self._stack or not self._stack[-1].is_object:
+                self._unsupported()
+                return
+            self._stack[-1].key = text
+            self._state = _ST_OBJ_COLON
+            return
+        self._attach(text)
+        if not self.supported:
+            return
+        self._settle(text)
+        self._state = _ST_AFTER
+        self._trailing_space = 0
+
+    def _settle(self, value: Any) -> None:
+        """Fold a finished scalar into the tree, keeping the dirty flag honest.
+
+        The scalar was already visible in the snapshot as ``pending``; moving
+        it into the tree changes what a caller sees only if its value differs
+        from the one last handed out.
+        """
+        if value != self.emitted_pending:
+            self.tree_dirty = True
+        self.emitted_pending = _UNSET
+
+    # -- snapshot -----------------------------------------------------------
+
+    def snapshot(self) -> Any:
+        """Return the partial value, ``None``, or ``_AMBIGUOUS``.
+
+        ``_AMBIGUOUS`` means the repair path's answer depends on leniency this
+        mirror does not model, and the caller must ask the text parser.
+        """
+        state = self._state
+        self.pending = _UNSET
+        if state == _ST_BEFORE or self._root is None:
+            return None
+        pending: Any = _UNSET
+        if state == _ST_OBJ_COLON:
+            # ``{"a"`` — a key whose colon has not arrived. The repair path
+            # drops the key, so the mirror shows the object without it; the
+            # key becomes visible when its value does.
+            pass
+        elif state == _ST_STRING:
+            if self._escape == _ESC_BACKSLASH:
+                # The repair path closes an open string by appending a quote,
+                # and a lone backslash swallows it: the string stays open, the
+                # closers land inside it and nothing parses. Only the text
+                # parser knows what it makes of that.
+                return None
+            if self._escape != _ESC_NONE and not self._string_is_key:
+                return None
+            if not self._string_is_key:
+                # A key still being typed is dropped by the repair path for
+                # the same reason, and nothing about it is visible yet.
+                pending = "".join(self._string)
+                if self._high_surrogate is not None:
+                    pending += chr(self._high_surrogate)
+                elif self._trailing_space:
+                    pending = pending[: len(pending) - self._trailing_space]
+                self.pending = pending
+        elif state == _ST_TOKEN:
+            try:
+                pending = json.loads("".join(self._token))
+            except ValueError:
+                return _AMBIGUOUS
+            self.pending = pending
+        if not self._stack:
+            return self._root
+        copies: list[Any] = [
+            dict(frame.container) if frame.is_object else list(frame.container)
+            for frame in self._stack
+        ]
+        if pending is not _UNSET:
+            frame = self._stack[-1]
+            if frame.is_object:
+                if frame.key is None:
+                    return _AMBIGUOUS
+                copies[-1][frame.key] = pending
+            else:
+                copies[-1].append(pending)
+        for index in range(len(copies) - 1, 0, -1):
+            copies[index - 1][self._stack[index].slot] = copies[index]
+        return copies[0]
+
+
 class RobustStreamingJSONParser:
     """Streaming parser with partial-repair fallback during generation.
 
@@ -667,36 +1226,57 @@ class RobustStreamingJSONParser:
     def __init__(self, *, max_depth: int = MAX_DATA_NESTING_DEPTH) -> None:
         self.streaming = StreamingJSONParser(max_depth=max_depth)
         self.partial = PartialJSONParser(max_depth=max_depth)
-        self._last_partial_fingerprint: str | None = None
+        self._view = _IncrementalPartialView()
+        self._last_partial: Any = _UNSET
+        self._recheck = False
         self._last_complete: Any | None = None
 
     def consume(self, chunk: str, *, emit_partial: bool = True) -> Any | None:
         """Consume a chunk; return a complete or partial JSON value, or ``None``."""
-        complete = self.streaming.consume(chunk)
+        try:
+            complete = self.streaming.consume(chunk)
+        except JSONNestingDepthExceeded:
+            self._view.reset()
+            raise
         if complete is not None:
             self._last_complete = complete
-            self._last_partial_fingerprint = None
+            self._last_partial = _UNSET
+            self._recheck = False
+            self._view.reset()
             return complete
 
+        self._view.consume(chunk)
         if not emit_partial:
             return None
+        if self._view.supported:
+            snapshot = self._view.snapshot()
+            if snapshot is not _AMBIGUOUS:
+                if snapshot is None:
+                    return None
+                view = self._view
+                if not view.tree_dirty and view.pending == view.emitted_pending:
+                    return None
+                if self._recheck and snapshot == self._last_partial:
+                    self._settle_emission(snapshot)
+                    return None
+                self._settle_emission(snapshot)
+                return snapshot
+        # The mirror declined this buffer: the repair path decides it instead,
+        # and its answer may not be one the mirror can reproduce, so the next
+        # emission is compared against it in full.
         partial = self.partial.parse(self.streaming.buffer_text)
-        if partial is None:
-            return None
-        try:
-            fingerprint = json.dumps(
-                partial,
-                ensure_ascii=True,
-                sort_keys=True,
-                default=str,
-            )
-        except (TypeError, ValueError):
-            # Partial parse may contain non-serializable values; skip dedup.
-            return partial
-        if fingerprint == self._last_partial_fingerprint:
-            return None
-        self._last_partial_fingerprint = fingerprint
-        return partial
+        duplicate = partial is None or partial == self._last_partial
+        self._settle_emission(partial)
+        self._recheck = True
+        return None if duplicate else partial
+
+    def _settle_emission(self, value: Any) -> None:
+        """Record that ``value`` is what a caller has now been shown."""
+        self._view.tree_dirty = False
+        self._view.emitted_pending = self._view.pending
+        self._recheck = False
+        if value is not None:
+            self._last_partial = value
 
     def finalize(self, raw_fallback: str = "") -> Any:
         """Return the last complete value, or attempt one final partial repair."""

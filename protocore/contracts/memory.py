@@ -17,7 +17,7 @@ hints):
   (user/global only) design leaks cross-task context, so the full grammar is
   first-class. The most-isolated default is **session scope only** (no
   cross-session leak); the product supports the full grammar — controlled
-  per-tenant via RuntimeConstants, never hard-coded.
+  per-tenant via LoopConstants, never hard-coded.
 * **Lexical/BM25 retrieval is mandatory in v1** — pure-vector recall misses the
   exact SKUs / order-IDs / table names / filesystem paths that dominate ops and
   data tasks. v1 ranks with Postgres full-text search (``tsvector`` +
@@ -131,7 +131,7 @@ class MemoryScope(StrEnum):
 
 # Default fan-out used by :meth:`IMemory.recall` when the caller does not pin an
 # explicit scope set: the union of the durable + working scopes. The host
-# resolver narrows / widens this per-tenant via RuntimeConstants (the most
+# resolver narrows / widens this per-tenant via LoopConstants (the most
 # isolated configuration collapses it to ``(session,)`` only).
 DEFAULT_RECALL_SCOPES: tuple[MemoryScope, ...] = (
     MemoryScope.session,
@@ -414,14 +414,14 @@ class IMemory(Protocol):
 
         ``similarity_threshold`` defaults (when ``None``) to the value
         the host adapter resolves from
-        :attr:`~protocore.contracts.runtime_constants.RuntimeConstants.memory_write_similarity_threshold`
+        :attr:`~protocore.contracts.runtime_constants.LoopConstants.memory_write_similarity_threshold`
         — core never hard-codes the number. The per-tenant runtime
         (``executor``/dispatcher) passes the RESOLVED value in per call so
         per-tenant overrides take effect on a pod-wide store instance; the
         adapter's own field is only the final static fallback.
 
         ``max_records_per_scope`` is the per-call resolved value of
-        :attr:`~protocore.contracts.runtime_constants.RuntimeConstants.memory_max_records_per_scope`
+        :attr:`~protocore.contracts.runtime_constants.LoopConstants.memory_max_records_per_scope`
         (``0`` = unbounded). Passed in per call for the same per-tenant
         reason as ``similarity_threshold``: a single pod-wide store serves
         every tenant, so the soft cap must travel with the call, not live in
@@ -486,7 +486,7 @@ class IMemory(Protocol):
         ranked by relevance across the requested ``scopes``. This is the method
         the optional auto-recall hook calls before the first LLM turn to inject
         ambient memory (gated by
-        :attr:`~protocore.contracts.runtime_constants.RuntimeConstants.memory_auto_recall_enabled`).
+        :attr:`~protocore.contracts.runtime_constants.LoopConstants.memory_auto_recall_enabled`).
 
         Scope fan-out:
             * ``scopes=None`` → :data:`DEFAULT_RECALL_SCOPES` (the union of

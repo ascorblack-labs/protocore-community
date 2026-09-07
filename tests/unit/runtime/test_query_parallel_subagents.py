@@ -14,7 +14,7 @@ Pins the delegation fan-out branch in
 * ``_is_delegation_parallel_safe`` predicate contract.
 
 Delegation tools are deliberately NOT ``is_concurrent_safe`` (each spawns a full
-nested run); the fake below sets ``is_parallel_delegation=True`` — the generic
+nested run); the fake below implements the delegation contract — the generic
 flag core keys on to identify the delegation tool without hardcoding "Agent".
 """
 from __future__ import annotations
@@ -24,7 +24,7 @@ from typing import Any
 
 import pytest
 
-from protocore.contracts.runtime_constants import RuntimeConstants
+from protocore.contracts.runtime_constants import LoopConstants
 from protocore.contracts.tools import (
     SUBAGENT_TREE_PERMIT_METADATA_KEY,
     ToolContext,
@@ -45,16 +45,13 @@ from protocore.runtime.query import (
     _synthesize_delegation_error_result,
 )
 from protocore.runtime.subagent_budget import SubagentTreeBudget, SubagentTreePermit
-from protocore.runtime.tool_dispatch import (
-    HELPER_SUBAGENT_TREE_BUDGET_KEY,
-    HELPER_SUBAGENT_TREE_PERMIT_KEY,
-)
+from tests._fixtures.delegation import DelegationContract
 
 from ._tool_fixtures import MockTool
 from .test_query_parallel_safe_tools import _queue_multi_tool_stream
 
 
-class _ScriptedDelegationTool(MockTool):
+class _ScriptedDelegationTool(DelegationContract, MockTool):
     """Fake delegation tool: NOT concurrent-safe, but delegation-fan-out eligible.
 
     Per-call behaviour is driven by the ``arguments`` dict so a test can pin
@@ -63,7 +60,6 @@ class _ScriptedDelegationTool(MockTool):
     """
 
     is_concurrent_safe = False
-    is_parallel_delegation = True
 
     async def invoke(
         self, context: ToolContext, arguments: dict[str, Any]
@@ -159,7 +155,7 @@ def test_delegation_predicate_false_when_gate_off(
     engine_factory, in_memory_runtime
 ) -> None:
     engine = engine_factory(
-        rc=RuntimeConstants(model_context_window=4_096, parallel_subagents_enabled=False)
+        rc=LoopConstants(model_context_window=4_096, parallel_subagents_enabled=False)
     )
     _register_delegation_tool(in_memory_runtime)
     call = ToolCall(id="t-1", name="Agent", arguments={})
@@ -268,7 +264,7 @@ async def test_children_windows_stay_disjoint_when_gate_is_off(
     the overlap proof pass while proving nothing.
     """
     engine = engine_factory(
-        rc=RuntimeConstants(
+        rc=LoopConstants(
             model_context_window=4_096, parallel_subagents_enabled=False
         )
     )
@@ -305,7 +301,7 @@ async def test_cap_two_runs_four_subagents_in_waves(
 ) -> None:
     """cap=2 with 4 calls each sleeping 0.1s ⇒ two waves ≈ 0.2s (not 0.1, not 0.4)."""
     engine = engine_factory(
-        rc=RuntimeConstants(model_context_window=4_096, max_concurrent_subagents=2)
+        rc=LoopConstants(model_context_window=4_096, max_concurrent_subagents=2)
     )
     tool = _register_delegation_tool(in_memory_runtime)
 
@@ -381,7 +377,7 @@ async def test_history_order_preserved_when_second_finishes_first(
 async def test_gate_off_dispatches_serially(engine_factory, in_memory_runtime) -> None:
     """parallel_subagents_enabled=False ⇒ three 0.1s calls take ≈ 0.3s (serial)."""
     engine = engine_factory(
-        rc=RuntimeConstants(
+        rc=LoopConstants(
             model_context_window=4_096, parallel_subagents_enabled=False
         )
     )
@@ -413,7 +409,7 @@ async def test_gate_off_dispatches_serially(engine_factory, in_memory_runtime) -
 async def test_cap_one_dispatches_serially(engine_factory, in_memory_runtime) -> None:
     """max_concurrent_subagents=1 ⇒ two 0.1s calls take ≈ 0.2s (exact serial path)."""
     engine = engine_factory(
-        rc=RuntimeConstants(model_context_window=4_096, max_concurrent_subagents=1)
+        rc=LoopConstants(model_context_window=4_096, max_concurrent_subagents=1)
     )
     tool = _register_delegation_tool(in_memory_runtime)
 
@@ -583,12 +579,11 @@ async def test_dispatch_acquires_tree_slot_and_threads_permit(
 
 
 @pytest.mark.asyncio
-async def test_budget_minted_into_helper_bag_and_reused(
+async def test_budget_minted_onto_the_run_state_and_reused(
     engine_factory, in_memory_runtime
 ) -> None:
-    """The leader mints the shared budget into ``engine._helpers`` on fan-out."""
+    """The leader mints the shared budget onto its run state at fan-out."""
     engine = engine_factory()
-    setattr(engine, "_helpers", {})  # noqa: B010 — simulate the executor's bag
     _register_delegation_tool(in_memory_runtime)
 
     _queue_multi_tool_stream(
@@ -604,8 +599,7 @@ async def test_budget_minted_into_helper_bag_and_reused(
     async for _evt in engine.run(user_msg):
         pass
 
-    budget = engine._helpers.get(HELPER_SUBAGENT_TREE_BUDGET_KEY)
-    assert isinstance(budget, SubagentTreeBudget)
+    assert isinstance(engine.run_state.subagent_tree_budget, SubagentTreeBudget)
 
 
 def _slot_is_held(budget: SubagentTreeBudget) -> bool:
@@ -628,14 +622,9 @@ async def test_serial_single_delegation_releases_tree_slot(
     engine = engine_factory()
     budget = SubagentTreeBudget(1)
     permit = await budget.acquire()  # this run holds the single slot (1/1)
-    setattr(  # noqa: B010 — simulate a child engine that holds a tree permit
-        engine,
-        "_helpers",
-        {
-            HELPER_SUBAGENT_TREE_BUDGET_KEY: budget,
-            HELPER_SUBAGENT_TREE_PERMIT_KEY: permit,
-        },
-    )
+    # A child engine that holds a tree permit.
+    engine.run_state.subagent_tree_budget = budget
+    engine.run_state.subagent_tree_permit = permit
 
     observed: dict[str, Any] = {}
 
@@ -683,14 +672,8 @@ async def test_dispatch_tool_releases_tree_slot_for_delegation_child(
     engine = engine_factory()
     budget = SubagentTreeBudget(1)
     permit = await budget.acquire()  # this run holds the only slot
-    setattr(  # noqa: B010
-        engine,
-        "_helpers",
-        {
-            HELPER_SUBAGENT_TREE_BUDGET_KEY: budget,
-            HELPER_SUBAGENT_TREE_PERMIT_KEY: permit,
-        },
-    )
+    engine.run_state.subagent_tree_budget = budget
+    engine.run_state.subagent_tree_permit = permit
 
     observed: dict[str, Any] = {}
 
@@ -720,14 +703,8 @@ async def test_dispatch_tool_keeps_tree_slot_for_non_delegation_tool(
     engine = engine_factory()
     budget = SubagentTreeBudget(1)
     permit = await budget.acquire()
-    setattr(  # noqa: B010
-        engine,
-        "_helpers",
-        {
-            HELPER_SUBAGENT_TREE_BUDGET_KEY: budget,
-            HELPER_SUBAGENT_TREE_PERMIT_KEY: permit,
-        },
-    )
+    engine.run_state.subagent_tree_budget = budget
+    engine.run_state.subagent_tree_permit = permit
 
     observed: dict[str, Any] = {}
 

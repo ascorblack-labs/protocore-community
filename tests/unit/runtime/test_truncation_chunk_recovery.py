@@ -22,7 +22,7 @@ from typing import Any
 import pytest
 
 from protocore.contracts.llm import LLMRequest, LLMStreamEvent
-from protocore.contracts.runtime_constants import RuntimeConstants
+from protocore.contracts.runtime_constants import LoopConstants
 from protocore.contracts.tools import Tool, ToolContext
 from protocore.contracts.types import (
     Message,
@@ -33,6 +33,7 @@ from protocore.contracts.types import (
     ToolParameterSchema,
     ToolResult,
 )
+from protocore.prompts import bundled_prompt_provider
 from protocore.runtime.events import EventType, TurnEvent
 from protocore.runtime.loop_state import LoopState
 from protocore.runtime.query_engine import QueryEngine, QueryEngineConfig
@@ -43,6 +44,7 @@ from protocore.tests_support.adapters import (
     InMemorySkillStore,
     InMemoryToolRegistry,
 )
+from tests._fixtures.tool_roles import CONVENTIONAL_TOOL_ROLES
 
 WRITE = "Write"
 APPEND = "AppendFile"
@@ -50,9 +52,10 @@ FINALIZE = "FinalizeFile"
 TARGET = "novye_lyudi.html"
 
 
-def _build_engine(*, rc: RuntimeConstants, llm: object) -> QueryEngine:
+def _build_engine(*, rc: LoopConstants, llm: object) -> QueryEngine:
     return QueryEngine(
         config=QueryEngineConfig(
+            tool_roles=CONVENTIONAL_TOOL_ROLES,
             run_id="run-chunk",
             tenant_id="tenant-test",
             session_id="sess-chunk",
@@ -177,7 +180,7 @@ async def _run(engine: QueryEngine) -> list[TurnEvent]:
 async def test_truncated_write_under_tool_use_is_not_dispatched() -> None:
     """C2 — the prod symptom: a content-less Write under finish_reason=tool_use
     flagged truncated_by_output_cap must NOT be dispatched (no Field required)."""
-    rc = RuntimeConstants(model_context_window=8_192, max_output_recovery_rounds=3)
+    rc = LoopConstants(model_context_window=8_192, max_output_recovery_rounds=3)
     files: dict[str, str] = {}
     write = _FileTool(WRITE, files, requires_content=True)
     append = _FileTool(APPEND, files, requires_content=True)
@@ -229,7 +232,7 @@ async def test_truncated_write_under_tool_use_is_not_dispatched() -> None:
 async def test_recovery_message_names_path_and_chunk_protocol() -> None:
     """C3 — the recovery context must name the PATH + the chunk protocol
     (Write -> AppendFile -> FinalizeFile) + the per-call chunk budget."""
-    rc = RuntimeConstants(model_context_window=8_192, max_output_recovery_rounds=3)
+    rc = LoopConstants(model_context_window=8_192, max_output_recovery_rounds=3)
     files: dict[str, str] = {}
     write = _FileTool(WRITE, files, requires_content=True)
     append = _FileTool(APPEND, files, requires_content=True)
@@ -286,7 +289,7 @@ async def test_single_write_truncates_then_chunked_completes_file() -> None:
     """C6 — the stand's '0/4 single Write -> 4/4 chunked' in CI form:
     DETECT -> NOT-dispatch -> chunk-recovery drives a COMPLETE file via
     Write(header) + AppendFile(chunk) + FinalizeFile -> loop bounded."""
-    rc = RuntimeConstants(model_context_window=8_192, max_output_recovery_rounds=3)
+    rc = LoopConstants(model_context_window=8_192, max_output_recovery_rounds=3)
     files: dict[str, str] = {}
     write = _FileTool(WRITE, files, requires_content=True)
     append = _FileTool(APPEND, files, requires_content=True)
@@ -357,7 +360,7 @@ async def test_truncation_recovery_is_loop_bounded() -> None:
     """C2/C4 — a model that keeps re-emitting the SAME truncated Write must
     terminate (bounded), not spiral. With max_output_recovery_rounds budget
     the run goes terminal FAILED rather than hitting max_turns_per_run."""
-    rc = RuntimeConstants(
+    rc = LoopConstants(
         model_context_window=8_192,
         max_output_recovery_rounds=2,
         max_turns_per_run=50,
@@ -395,7 +398,7 @@ async def test_non_content_truncation_uses_generic_resume_not_chunk_protocol() -
     """A non-content truncated call (no ``path`` + missing ``content`` shape)
     must get the GENERIC resume message, NOT the file-chunk
     Write->AppendFile->FinalizeFile protocol (which would be irrelevant)."""
-    rc = RuntimeConstants(model_context_window=8_192, max_output_recovery_rounds=3)
+    rc = LoopConstants(model_context_window=8_192, max_output_recovery_rounds=3)
     files: dict[str, str] = {}
     # A generic tool with a required ``query`` field (not a file mutation).
     search = _FileTool("Search", files, requires_content=False)
@@ -468,7 +471,7 @@ async def test_path_only_non_content_tool_uses_generic_resume() -> None:
     """A truncated call to a tool that carries a ``path`` but is NOT a content
     writer (e.g. Read) must get the GENERIC resume, NOT the file-chunk protocol.
     The decision is schema-based: Read declares no ``content`` parameter."""
-    rc = RuntimeConstants(model_context_window=8_192, max_output_recovery_rounds=3)
+    rc = LoopConstants(model_context_window=8_192, max_output_recovery_rounds=3)
 
     class _ReadTool(Tool):
         @property
@@ -599,7 +602,7 @@ async def test_dynamic_content_required_tool_uses_generic_resume_not_chunk() -> 
     GENERIC tool-call resume — NOT the Write->AppendFile->Finalize file-chunk
     protocol (telling it to AppendFile a non-existent file is wrong).
     The old shape-only predicate (``content`` declared) wrongly matched it."""
-    rc = RuntimeConstants(model_context_window=8_192, max_output_recovery_rounds=3)
+    rc = LoopConstants(model_context_window=8_192, max_output_recovery_rounds=3)
     tool = _DynamicContentTool(name="PostComment", chunkable=None)
     llm = _ScriptedLLM(_generic_resume_scripts(tool_name="PostComment"))
     engine = _build_engine(rc=rc, llm=llm)
@@ -622,7 +625,7 @@ async def test_dynamic_content_tool_opt_in_flag_gets_chunk_protocol() -> None:
     """The explicit ``chunkable_content_mutation=True`` opt-in routes a
     per-tenant content-mutation tool INTO chunk-recovery (so the flag is a
     real, universal opt-in, not a no-op)."""
-    rc = RuntimeConstants(model_context_window=8_192, max_output_recovery_rounds=3)
+    rc = LoopConstants(model_context_window=8_192, max_output_recovery_rounds=3)
     tool = _DynamicContentTool(name="TenantDoc", chunkable=True)
     llm = _ScriptedLLM(_generic_resume_scripts(tool_name="TenantDoc"))
     engine = _build_engine(rc=rc, llm=llm)
@@ -645,7 +648,7 @@ async def test_repeat_truncation_before_any_write_keeps_write_header() -> None:
     SUCCESSFULLY been written, the recovery message must STILL instruct
     ``Write(header)`` (NOT 'continue with AppendFile' — there is no file to
     append to). It must also LOWER the header budget vs the first prompt."""
-    rc = RuntimeConstants(
+    rc = LoopConstants(
         model_context_window=8_192,
         max_output_recovery_rounds=4,
         write_chunk_token_budget=1600,
@@ -709,7 +712,7 @@ async def test_truncation_after_successful_write_steers_to_appendfile() -> None:
     """Once a chunk has ACTUALLY been written (a successful Write/AppendFile),
     a later truncation of the SAME path DOES get the stronger 'you already
     started chunking; continue with AppendFile' directive."""
-    rc = RuntimeConstants(model_context_window=8_192, max_output_recovery_rounds=4)
+    rc = LoopConstants(model_context_window=8_192, max_output_recovery_rounds=4)
     files: dict[str, str] = {}
     write = _FileTool(WRITE, files, requires_content=True)
     append = _FileTool(APPEND, files, requires_content=True)
@@ -854,14 +857,14 @@ async def test_complete_sibling_call_dispatched_when_one_call_truncates() -> Non
     request forward-filled the opaque pairing placeholder and the legitimately
     completed Read was dropped.
     """
-    rc = RuntimeConstants(model_context_window=8_192, max_output_recovery_rounds=3)
+    rc = LoopConstants(model_context_window=8_192, max_output_recovery_rounds=3)
     files: dict[str, str] = {}
     read = _ReadTool()
     write = _FileTool(WRITE, files, requires_content=True)
     append = _FileTool(APPEND, files, requires_content=True)
     finalize = _FileTool(FINALIZE, files, requires_content=False)
 
-    placeholder = rc.tool_result_pairing_repair_placeholder
+    placeholder = bundled_prompt_provider().render("tool_result_pairing_repair")
 
     scripts = [
         # 1) One assistant turn: complete Read(doc.md) THEN truncated Write
@@ -983,7 +986,7 @@ async def test_run_output_token_budget_terminates_runaway() -> None:
     """C4 — a runaway-output spiral is bounded by the cumulative output-token
     budget (terminates FAILED) BEFORE it can reach the context-length ceiling,
     independently of max_turns_per_run."""
-    rc = RuntimeConstants(
+    rc = LoopConstants(
         model_context_window=8_192,
         max_turns_per_run=500,  # high turn cap — the TOKEN budget must bound it
         run_max_output_tokens_budget=10_000,

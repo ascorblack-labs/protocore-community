@@ -9,7 +9,7 @@ import json
 from dataclasses import dataclass
 from typing import Any, Literal
 
-from protocore.contracts.runtime_constants import RuntimeConstants
+from protocore.contracts.runtime_constants import LoopConstants
 
 GuardKind = Literal["stream_repeat", "identical_tool"]
 
@@ -74,7 +74,7 @@ def repeating_tail_cut(
 def inspect_stream_repeat(
     text_buffer: str,
     reasoning_buffer: str,
-    rc: RuntimeConstants,
+    rc: LoopConstants,
 ) -> tuple[str, str, LoopGuardHit | None]:
     """Cut a repeating tail from text and/or thinking.
 
@@ -131,7 +131,7 @@ def canonical_tool_fingerprint(name: str, arguments: Any) -> str:
 def identical_tool_should_block(
     fingerprint: str,
     prior_counts: dict[str, int],
-    rc: RuntimeConstants,
+    rc: LoopConstants,
 ) -> bool:
     """Return True when this fingerprint has already hit the execute limit."""
     if not rc.loop_guard_enabled:

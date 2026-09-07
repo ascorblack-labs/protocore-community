@@ -1,12 +1,13 @@
 """Tests for :mod:`protocore.runtime.context.compaction`."""
 from __future__ import annotations
 
+import hashlib
 import json
 
 import pytest
 
 from protocore.contracts.llm import LLMObservabilityContext
-from protocore.contracts.runtime_constants import RuntimeConstants
+from protocore.contracts.runtime_constants import LoopConstants
 from protocore.contracts.types import (
     ImageRefBlock,
     Message,
@@ -27,7 +28,10 @@ from protocore.runtime.context.compaction import (
     run_tier1_truncation,
     run_tier2_summarisation,
 )
-from protocore.runtime.wire_format import is_compacted_placeholder
+from protocore.runtime.wire_format import (
+    is_compacted_placeholder,
+    parse_compacted_placeholder,
+)
 from protocore.tests_support.adapters import (
     InMemoryBlobStore,
     InMemoryLLMProvider,
@@ -52,7 +56,7 @@ def big_tool_result_history() -> list[Message]:
 async def test_tier1_truncates_big_tool_result(
     big_tool_result_history: list[Message],
 ) -> None:
-    rc = RuntimeConstants(model_context_window=4_096)
+    rc = LoopConstants(model_context_window=4_096)
     blobs = InMemoryBlobStore()
 
     # truncation threshold from budgets
@@ -84,7 +88,7 @@ async def test_tier1_truncates_big_tool_result(
 
 @pytest.mark.asyncio
 async def test_tier1_skips_small_tool_results() -> None:
-    rc = RuntimeConstants(model_context_window=4_096)
+    rc = LoopConstants(model_context_window=4_096)
     blobs = InMemoryBlobStore()
     history = [
         Message(role=MessageRole.tool, content_blocks=[
@@ -108,7 +112,7 @@ async def test_tier1_skips_small_tool_results() -> None:
 
 @pytest.mark.asyncio
 async def test_tier1_respects_recent_turn_anchor() -> None:
-    rc = RuntimeConstants(model_context_window=4_096)
+    rc = LoopConstants(model_context_window=4_096)
     blobs = InMemoryBlobStore()
     big = "Y" * 6000
     history = [
@@ -135,7 +139,7 @@ async def test_tier1_respects_recent_turn_anchor() -> None:
 @pytest.mark.asyncio
 async def test_tier1_idempotent_on_already_compacted() -> None:
     """Re-running Tier 1 on already-compacted history is a no-op."""
-    rc = RuntimeConstants(model_context_window=4_096)
+    rc = LoopConstants(model_context_window=4_096)
     blobs = InMemoryBlobStore()
     big = "Z" * 6000
     history = [
@@ -183,7 +187,7 @@ def test_strip_injection_preserves_safe_text() -> None:
 
 @pytest.mark.asyncio
 async def test_tier2_summarisation_replaces_old_turn() -> None:
-    rc = RuntimeConstants(
+    rc = LoopConstants(
         model_context_window=4_096,
         compaction_keep_recent_turns=1,
     )
@@ -215,7 +219,7 @@ async def test_tier2_summarisation_replaces_old_turn() -> None:
 
 @pytest.mark.asyncio
 async def test_tier2_summarisation_propagates_observability_context() -> None:
-    rc = RuntimeConstants(
+    rc = LoopConstants(
         model_context_window=4_096,
         compaction_keep_recent_turns=1,
         # This fixture's only eligible turn is the first user turn; disable the
@@ -256,7 +260,7 @@ async def test_tier2_summarisation_propagates_observability_context() -> None:
 
 @pytest.mark.asyncio
 async def test_tier2_skips_when_no_eligible_turns() -> None:
-    rc = RuntimeConstants(
+    rc = LoopConstants(
         model_context_window=4_096,
         compaction_keep_recent_turns=10,  # nothing is "old"
     )
@@ -288,7 +292,7 @@ def test_message_text_for_estimation_includes_tool_use() -> None:
             ToolUseBlock(tool_call_id="t1", name="write_file", arguments_json='{"x": "' + "Z" * 5000 + '"}'),
         ],
     )
-    text = _message_text_for_estimation(msg, RuntimeConstants())
+    text = _message_text_for_estimation(msg, LoopConstants())
     assert "write_file" in text
     assert "Z" * 5000 in text
 
@@ -300,7 +304,7 @@ def test_message_text_for_estimation_includes_reasoning_content() -> None:
         content_blocks=[TextBlock(text="ok")],
         reasoning_content="R" * 4000,
     )
-    text = _message_text_for_estimation(msg, RuntimeConstants())
+    text = _message_text_for_estimation(msg, LoopConstants())
     assert "R" * 4000 in text
 
 
@@ -310,7 +314,7 @@ def test_message_text_for_estimation_includes_thinking_block() -> None:
         role=MessageRole.assistant,
         content_blocks=[ThinkingBlock(text="T" * 1000)],
     )
-    text = _message_text_for_estimation(msg, RuntimeConstants())
+    text = _message_text_for_estimation(msg, LoopConstants())
     assert "T" * 1000 in text
 
 
@@ -319,7 +323,7 @@ def test_message_text_for_estimation_image_ref_is_nonzero() -> None:
     image-token constant (it carries no text/content)."""
     from protocore.runtime.token_counting import estimate_tokens
 
-    rc = RuntimeConstants()
+    rc = LoopConstants()
     msg = Message(
         role=MessageRole.assistant,
         content_blocks=[ImageRefBlock(blob_ref="blob://x")],
@@ -400,7 +404,7 @@ async def test_tier2_does_not_orphan_tool_use_when_result_summarised() -> None:
     result must be treated atomically. The old code SKIPPED the empty-text
     assistant turn but REPLACED the tool result, orphaning the ToolUseBlock.
     """
-    rc = RuntimeConstants(
+    rc = LoopConstants(
         model_context_window=4_096,
         compaction_keep_recent_turns=1,
     )
@@ -430,7 +434,7 @@ async def test_tier2_does_not_orphan_tool_use_when_result_summarised() -> None:
 async def test_tier2_does_not_orphan_result_when_text_tool_use_summarised() -> None:
     """mode (b): an assistant text+tool_use turn that gets summarised
     must NOT drop the ToolUseBlock while leaving its tool_result behind."""
-    rc = RuntimeConstants(
+    rc = LoopConstants(
         model_context_window=4_096,
         compaction_keep_recent_turns=1,
     )
@@ -460,7 +464,7 @@ async def test_tier2_pair_split_across_keep_boundary_is_skipped_atomically() -> 
     """if a tool_use turn is eligible but its tool_result sits in the
     kept-recent (anchored) region, the pair must be SKIPPED as a unit (never
     replace the assistant tool_use, which would orphan the anchored result)."""
-    rc = RuntimeConstants(
+    rc = LoopConstants(
         model_context_window=4_096,
         compaction_keep_recent_turns=1,  # only the LAST message anchored
     )
@@ -494,7 +498,7 @@ async def test_tier2_duplicate_tool_result_for_same_call_id_no_orphan() -> None:
     """A tool_call_id answered by MORE THAN ONE tool-role result message must
     group ALL of them atomically; the old setdefault grouped only the first,
     orphaning the second."""
-    rc = RuntimeConstants(
+    rc = LoopConstants(
         model_context_window=4_096,
         compaction_keep_recent_turns=1,
     )
@@ -524,7 +528,7 @@ async def test_tier2_shared_tool_message_two_tool_uses_atomic() -> None:
     """A single tool-role message that answers TWO different assistant tool_use
     turns must link both turns into ONE component, so dropping the shared result
     never leaves either tool_use orphaned."""
-    rc = RuntimeConstants(
+    rc = LoopConstants(
         model_context_window=4_096,
         compaction_keep_recent_turns=1,
     )
@@ -561,7 +565,7 @@ async def test_tier2_shared_result_skipped_when_one_tool_use_anchored() -> None:
     """if a shared tool message links an eligible tool_use to a
     tool_use that sits in the anchored tail, the WHOLE component is skipped
     (cannot drop the shared result while the anchored tool_use survives)."""
-    rc = RuntimeConstants(
+    rc = LoopConstants(
         model_context_window=4_096,
         compaction_keep_recent_turns=1,  # only the LAST message anchored
     )
@@ -594,7 +598,7 @@ async def test_tier2_shared_result_skipped_when_one_tool_use_anchored() -> None:
 async def test_tier2_still_summarises_plain_text_turns() -> None:
     """regression guard — plain text turns (no tool blocks) still get
     summarised; the atomic-pairing logic must not freeze normal compaction."""
-    rc = RuntimeConstants(
+    rc = LoopConstants(
         model_context_window=4_096,
         compaction_keep_recent_turns=1,
     )
@@ -633,7 +637,7 @@ async def test_tier2_skips_tiny_turns_no_inflation_no_llm_calls() -> None:
     ``max(0, ...)`` freed clamp hid the growth. After the fix such turns are
     skipped before any LLM call: zero calls, zero growth.
     """
-    rc = RuntimeConstants(
+    rc = LoopConstants(
         model_context_window=4_096,
         compaction_keep_recent_turns=1,
         compaction_protect_first_user_turn=False,
@@ -683,7 +687,7 @@ async def test_tier2_bounded_by_free_target_tokens() -> None:
     LLM call per turn in a single COMPACTING pass. With a small freed budget the
     loop must stop early.
     """
-    rc = RuntimeConstants(
+    rc = LoopConstants(
         model_context_window=4_096,
         compaction_keep_recent_turns=1,
         compaction_protect_first_user_turn=False,
@@ -735,7 +739,7 @@ async def test_tier2_extracts_summary_from_json_envelope() -> None:
     ``<compacted-turn>`` body must carry the extracted ``summary`` ONLY — never
     the envelope, and never a key the schema never asked for.
     """
-    rc = RuntimeConstants(
+    rc = LoopConstants(
         model_context_window=4_096,
         compaction_keep_recent_turns=1,
         compaction_protect_first_user_turn=False,
@@ -780,7 +784,7 @@ def test_summary_schema_declares_only_the_field_that_is_read() -> None:
     """A declared field is paid for in the output budget whether or not it is
     read, so the schema must not carry one that nothing extracts. Tier 2 reads
     ``summary`` and only ``summary``."""
-    schema = build_summary_schema(RuntimeConstants())
+    schema = build_summary_schema(LoopConstants())
 
     assert set(schema["properties"]) == {"summary"}
     assert schema["required"] == ["summary"]
@@ -794,7 +798,7 @@ async def test_tier2_skips_malformed_json_envelope() -> None:
     must not crash; the unit is skipped with a warning so the next pass can
     retry it.
     """
-    rc = RuntimeConstants(
+    rc = LoopConstants(
         model_context_window=4_096,
         compaction_keep_recent_turns=1,
         compaction_protect_first_user_turn=False,
@@ -826,7 +830,7 @@ async def test_tier2_skips_json_envelope_without_summary_field() -> None:
     string field is a schema contract violation; skip the unit (don't wrap
     the whole envelope verbatim as a summary).
     """
-    rc = RuntimeConstants(
+    rc = LoopConstants(
         model_context_window=4_096,
         compaction_keep_recent_turns=1,
         compaction_protect_first_user_turn=False,
@@ -874,7 +878,7 @@ async def test_tier1_truncates_every_over_threshold_tool_result_block() -> None:
     """
     from protocore.runtime.context.budgets import derive_budgets
 
-    rc = RuntimeConstants(model_context_window=4_096)
+    rc = LoopConstants(model_context_window=4_096)
     blobs = InMemoryBlobStore()
     threshold = derive_budgets(rc).tool_result_truncation_threshold
 
@@ -929,7 +933,7 @@ async def test_tier1_truncates_all_over_threshold_blocks_when_all_are_big() -> N
     """
     from protocore.runtime.context.budgets import derive_budgets
 
-    rc = RuntimeConstants(model_context_window=4_096)
+    rc = LoopConstants(model_context_window=4_096)
     blobs = InMemoryBlobStore()
     threshold = derive_budgets(rc).tool_result_truncation_threshold
 
@@ -977,7 +981,7 @@ async def test_tier1_preserves_non_tool_result_siblings_in_multi_block_message()
     """
     from protocore.runtime.context.budgets import derive_budgets
 
-    rc = RuntimeConstants(model_context_window=4_096)
+    rc = LoopConstants(model_context_window=4_096)
     blobs = InMemoryBlobStore()
     threshold = derive_budgets(rc).tool_result_truncation_threshold
 
@@ -1011,3 +1015,82 @@ async def test_tier1_preserves_non_tool_result_siblings_in_multi_block_message()
     assert sibling.text == "sibling note that must NOT be dropped"
     assert isinstance(result_block, ToolResultBlock)
     assert is_compacted_placeholder(result_block.content)
+
+
+@pytest.mark.asyncio
+async def test_tier1_stores_the_value_the_projection_came_from() -> None:
+    """The reference a placeholder calls canonical must address the whole value."""
+    rc = LoopConstants(model_context_window=4_096)
+    blobs = InMemoryBlobStore()
+    canonical = "X" * 6000 + "TAIL"
+    history = [
+        Message(
+            role=MessageRole.tool,
+            content_blocks=[
+                ToolResultBlock(
+                    tool_call_id="t1",
+                    content="X" * 6000,
+                    canonical_content=canonical,
+                )
+            ],
+        ),
+    ]
+    from protocore.runtime.context.budgets import derive_budgets
+
+    result = await run_tier1_truncation(
+        history=history,
+        blob_store=blobs,
+        tenant_id="t1",
+        rc=rc,
+        truncation_threshold_tokens=derive_budgets(rc).tool_result_truncation_threshold,
+        keep_recent_turns=0,
+    )
+
+    assert len(result.blob_refs_created) == 1
+    stored = await blobs.get(tenant_id="t1", ref=result.blob_refs_created[0])
+    assert stored.decode("utf-8") == canonical
+
+    block = history[0].content_blocks[0]
+    assert isinstance(block, ToolResultBlock)
+    parsed = parse_compacted_placeholder(block.content)
+    assert parsed is not None
+    ref, _variant = parsed
+    assert ref.sha256 == hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
+@pytest.mark.asyncio
+async def test_tier1_states_no_digest_for_a_reference_it_did_not_mint() -> None:
+    """A digest of what is on the block would describe different bytes."""
+    rc = LoopConstants(model_context_window=4_096)
+    blobs = InMemoryBlobStore()
+    history = [
+        Message(
+            role=MessageRole.tool,
+            content_blocks=[
+                ToolResultBlock(
+                    tool_call_id="t1",
+                    content="X" * 6000,
+                    canonical_ref="t1/elsewhere",
+                )
+            ],
+        ),
+    ]
+    from protocore.runtime.context.budgets import derive_budgets
+
+    result = await run_tier1_truncation(
+        history=history,
+        blob_store=blobs,
+        tenant_id="t1",
+        rc=rc,
+        truncation_threshold_tokens=derive_budgets(rc).tool_result_truncation_threshold,
+        keep_recent_turns=0,
+    )
+
+    assert result.blob_refs_created == ()
+    block = history[0].content_blocks[0]
+    assert isinstance(block, ToolResultBlock)
+    parsed = parse_compacted_placeholder(block.content)
+    assert parsed is not None
+    ref, _variant = parsed
+    assert ref.blob_ref == "t1/elsewhere"
+    assert ref.sha256 == ""

@@ -18,14 +18,54 @@ alphabetised, so related concepts read together.
   and optional `provider_chain`). See
   [ReAct loop / orchestrator / query engine / loop state](architecture.md#react-loop--orchestrator--query-engine--loop-state).
 
-**`query()`** (`runtime/query.py`)
-: The ReAct turn driver: `def query(engine) -> AsyncIterator[TurnEvent]`, a
-  **sync** function that resets per-turn state and **returns** an async
-  iterator. It is not an async generator and it does not persist turn-start
-  or turn-end snapshots (`QueryEngine.run()` does). Each inner `yield` from
-  `_query_raw` is a stop-check checkpoint. Not re-exported at the top level —
-  import it from `protocore.runtime.query`. See
+**`resume()`** (`runtime/query.py`)
+: The one public entry that picks a stored run back up:
+  `resume(engine, snapshot, *, approved_tool_call=None, message=None,
+  abandon_approval=False, resolutions=None, allow_partial_resolution=False)`,
+  an async iterator of `TurnEvent`. It restores the
+  snapshot strictly — schema, delivery mode and identity binding are settled
+  before the first mutation, so a snapshot from another run is refused and
+  nothing is driven — then selects the drive the caller's arguments describe:
+  the resolution map, the approved tool call, the message that has arrived, or
+  a plain re-drive of the interrupted turn. A run with anything parked refuses
+  a plain re-drive, naming the call: it is not a decision on it, and walking
+  past one would leave it unanswered and report it to the model as a
+  failure. `abandon_approval=True` is how a caller says the decision will
+  never come; every parked call is closed with a result saying it was never
+  approved and never ran.
+  Import it from `protocore.runtime`. See
   [ReAct loop / orchestrator / query engine / loop state](architecture.md#react-loop--orchestrator--query-engine--loop-state).
+
+**`resume_interrupts()`** (`runtime/query.py`)
+: Answers everything a run is waiting on, in one drive — the general form, and
+  the only one that can express a batch. Three dangerous calls in one assistant
+  message park three interrupts and stop the run once; this answers all three
+  (approve the first with corrected arguments, deny the second, abandon the
+  third) and the results land in history in the order the model asked for them.
+  The map is checked in full BEFORE anything executes, because a resume that
+  ran two resolutions and then found the third incoherent would already have
+  dispatched tools on the strength of a decision set that turned out to be
+  nonsense. `allow_partial=True` relaxes what the map must cover and nothing
+  else. Reached through `resume(resolutions=...)` in the usual case.
+
+**`PendingInterrupt`** (`contracts/interrupt.py`)
+: What a paused run is waiting for, as a value rather than a latch:
+  `interrupt_id`, `kind`, the parked call, what the person is being shown, and
+  when the wait started and stops being answerable. `InterruptKind` is
+  `approval` (a gate parked the call; nothing ran), `question` (the tool ran far
+  enough to ask, and the answer is its result) or `external_call` (the result
+  arrives by another route), and the kind decides which `InterruptResolution` is
+  legal. A run holds however many are open at once; `LoopState.AWAITING` with
+  none recorded is refused at the transition, because that is a run that stops
+  with nothing that could resume it.
+
+**`resume_approved_tool()`** (`runtime/query.py`)
+: Executes one call that was held for approval, verified against the durable
+  pending call and idempotent on replay. Reached through `resume()` in the
+  usual case; exported from `protocore.runtime` for a caller that has already
+  restored its engine. The ReAct turn body itself (`_query_raw`) is private —
+  every drive of it binds the driving task and persists a closing snapshot, and
+  each inner `yield` is a stop-check checkpoint.
 
 ## The three run-state concepts (do not conflate)
 
@@ -55,13 +95,13 @@ common error.
 
 ## Configuration & constants
 
-**`RuntimeConstants`** (`contracts/runtime_constants.py`)
+**`LoopConstants`** (`contracts/runtime_constants.py`)
 : The single mechanism for tunable values — **no inline magic numbers**. A frozen
   Pydantic snapshot (`ConfigDict(frozen=True, extra="forbid")`); every tunable is
   a default-safe field, served per-tenant by a `RuntimeConstantsProvider`.
   `extra="forbid"` means an unknown key is a validation error (rejected), not
   silently dropped, so **core and the host must deploy paired**. See
-  [RuntimeConstants system](architecture.md#runtimeconstants-system) and
+  [LoopConstants system](architecture.md#loopconstants-system) and
   [`runtime-constants.md`](runtime-constants.md).
 
 ## Extension protocols
@@ -71,27 +111,28 @@ common error.
   agent learns and re-uses (distinct from session transcripts, blobs, the search
   index, and todos). A record is addressed by `(tenant_id, scope, scope_key)`;
   the most-isolated default scope is `session`. Core never imports the
-  implementation; the host provides `PgMemoryStore`. Default-off
+  implementation; the host provides a durable store with lexical recall.
+  Default-off
   (`memory_enabled = False`). See
-  [IMemory](architecture.md#imemory-scoped-ftsbm25-idempotent-drift-guard-injection-scan-seam).
+  [IMemory](architecture.md#technology-inventory).
 
 **`IWorkspace`** (`contracts/workspace.py`, `Protocol`)
 : The contract for a **session/task-scoped, searchable, atomic scratch
   workspace** — the agent dumps intermediate data once and re-reads/searches it
   many times (a dump-once / re-read-many stability lever). Backs the
-  `read`/`write`/`find`/`search` verbs. Host-wired; the availability
-  flag defaults on (`workspace_enabled = True`). See
-  [IWorkspace + read-dedup cache](architecture.md#iworkspace--read-dedup-cache).
+  `read`/`write`/`find`/`search` verbs. Host-wired, and the host owns the
+  availability flag. See
+  [IWorkspace + read-dedup cache](architecture.md#technology-inventory).
 
 ## Resilience & finalization
 
-**`AdaptiveSafetyBand`** (`runtime/adaptive_safety_band.py`)
+**Adaptive safety band** (host-owned)
 : A per-`(provider, model)` band that **learns from token-estimator drift** and
   subtracts a calibrated margin from the per-call output budget, so
   `prompt + max_tokens` stays under the provider window even when the local
   estimator misjudges (e.g. Cyrillic-in-JSON-escape inflation). When no band is
   wired, behaviour is identical to pre-band. See
-  [Attempt ledger + adaptive safety band](architecture.md#attempt-ledger--adaptive-safety-band).
+  [Attempt ledger + adaptive safety band](architecture.md#technology-inventory).
 
 **`AttemptLedger`** (`contracts/attempt_ledger.py`)
 : A record of what a (sub)agent **declared** it would produce
@@ -100,43 +141,43 @@ common error.
   `LedgerOutcome` is a neutral literal (`completed | partial | failed | unknown`),
   not a backend enum; the agent's `SelfReportedStatus` is kept but not trusted
   blindly. See
-  [Attempt ledger + adaptive safety band](architecture.md#attempt-ledger--adaptive-safety-band).
+  [Attempt ledger + adaptive safety band](architecture.md#technology-inventory).
 
-Finalization gate (`runtime/finalization_gate.py`,
-`runtime/finalization_contract.py`)
+Finalization gate (host-owned)
 : The terminal-path guard that closes a finalization gap: a (sub)agent that wrote
   the user-visible artifact but ran out of iterations without calling its
   terminal tool would otherwise be scored "failed". The gate **verifies**
-  declared deliverables — `verify_declared_deliverables(...)` stats each one via
-  the injected `WorkspaceStatProtocol` — and **decides** a `FinalizationDecision`
-  via `decide_finalization(ledger)` (success / partial / failed template) that the
-  leader's final turn uses. All toggles default `False`. See
-  [Finalization gate + contract](architecture.md#finalization-gate--contract).
+  declared deliverables — it stats each one through the workspace shape the host
+  injects — and **decides** the outcome the leader's final turn reports
+  (success / partial / failed). All toggles default `False`. See
+  [Finalization gate + contract](architecture.md#technology-inventory).
 
 ## Grounding & terminal answers
 
 **Grounding / references**
 : The deterministic, rubric-blind discipline that the terminal `answer`'s
   citations must be a **subset of what was actually `read`**. A grounding-tracked
-  `read` records its path as observed evidence; `GROUNDING_TRACKED_TOOLS`
-  (`contracts/lean_tool_surface.py`) is the frozenset `{read}` — `read_silent`
-  returns identical content but is not recorded. `normalize_ref(...)`
-  (`contracts/references.py`) is a pure, idempotent comparison projection that
-  compares refs on a canonical form, so a flat-vs-branded path mismatch is not a
-  false veto; it can only remove a false veto, never add one. See
-  [Terminal-answer validation + references / grounding + payload normalize](architecture.md#terminal-answer-validation--references--grounding--payload-normalize).
+  `read` records its path as observed evidence; which tools record is the
+  host's binding, not a core constant — a tool carrying the `reads_path` role
+  is what the core recognises, never a tool name. Reference normalisation is
+  host-owned: a pure, idempotent projection that compares refs on a canonical
+  form, so a flat-vs-branded path mismatch is not a false veto; it can only
+  remove a false veto, never add one. See
+  [Terminal-answer validation + references / grounding + payload normalize](architecture.md#technology-inventory).
 
 ## Context, caching & compaction
 
 **Prompt-cache breakpoints** (`runtime/prompt_caching.py`)
 : Placement **hints only** for provider prefix-caching. `apply_system_and_3(...)`
-  computes the `system_and_3` strategy: at most four `CacheBreakpoint`s — system
-  at index 0 plus the last three non-system messages. The core always emits the
+  computes the system-and-three strategy: at most `MAX_BREAKPOINTS`
+  `CacheBreakpoint`s — system at index 0 plus the last three non-system
+  messages. The core always emits the
   hints on `LLMRequest.extra["cache_breakpoints"]`; the host adapter
-  translates them to `cache_control` markers (kill-switch
-  `prompt_cache_wire_enabled`, default `True`), and adapters that don't recognise
+  translates them into whatever cache markers its provider's wire uses (behind
+  a host kill-switch),
+  and adapters that don't recognise
   the key ignore it. See
-  [Context management and two-tier compaction](architecture.md#context-management--two-tier-compaction--session-memory--budgets--token-counting--prompt-caching--strip-thinking).
+  [Context management and two-tier compaction](architecture.md#technology-inventory).
 
 **Compaction tiers / layers** (`runtime/context/compaction.py`)
 : The **two-tier** cascade that keeps the prompt under the provider context
@@ -151,7 +192,7 @@ Finalization gate (`runtime/finalization_gate.py`,
   `False`). Cross-run fold lives in `runtime/context/session_memory.py`
   (`fold_run`). Triggers and ratios are RC-driven and derived in
   `runtime/context/budgets.py`. See
-  [Context management and two-tier compaction](architecture.md#context-management--two-tier-compaction--session-memory--budgets--token-counting--prompt-caching--strip-thinking).
+  [Context management and two-tier compaction](architecture.md#technology-inventory).
 
 ## Intent, usage ledger, session tree, lanes, typed hooks, telemetry
 
@@ -159,14 +200,20 @@ These six surfaces are **default-off**. Read the live `Field(...)` default; do
 not infer that shipping the code turns them on.
 
 **`IntentRecord`** (`runtime/intent.py`)
-: Per-tool-call settlement record (`operation_id`, reserved result ids,
-  `replay` `never|safe`, `status` `open|settled|interrupted`). When
-  `intent_settlement_enabled` is on, **every** dispatched tool commits one
-  before `ToolDispatcher.dispatch` — not only mutating tools.
-  `replay_policy_for` marks names in `intent_never_replay_tools` (default
-  `Write,Edit,Bash,Finalize,AppendFile`) as `never`; others are `safe`. A
-  crash mid-never becomes `interrupted` and is not replayed. Persisted on
-  `QueryEngine.open_intents`. See
+: Per-tool-call durability record (`operation_id`, reserved result ids,
+  `replay` `never|safe`, and a lifecycle `state`
+  `RESERVED|PENDING_APPROVAL|DISPATCHED|PAUSED_ASK_USER|SETTLED`). Written
+  before the call is made, unconditionally — not behind a flag, and not only
+  for mutating tools. The state is what a resumed run reads: only `DISPATCHED`
+  with no result anywhere in history becomes an honest "outcome never
+  recorded"; a call parked at a gate, one waiting on a user's answer and one
+  merely reserved are none of them unknown outcomes and none of them are
+  executed by a resume. `intent_repeat_safe_tools` (default
+  `Read,Grep,Glob,ToolSearch`) decides which calls skip the durability write
+  and get the milder recovery text; `intent_never_replay_tools` (default
+  `Write,Edit,Bash,Finalize,AppendFile`) sets `replay`.
+  `intent_settlement_enabled` now gates only the recovery events and the
+  ledger row, not the record. Persisted on `QueryEngine.open_intents`. See
   [Intent, usage ledger, session tree, lanes](architecture.md#intent-usage-ledger-session-tree-lanes-typed-hooks-telemetry-live-control-run-work-budget).
 
 **`UsageRow`** (`runtime/usage_ledger.py`)
@@ -177,11 +224,11 @@ not infer that shipping the code turns them on.
   intent-settlement dispatch path. A failed attempt plus its retry is two
   rows. Persisted on `QueryEngine.usage_rows`.
 
-**`SessionBranch`** (`runtime/session_tree.py`)
-: A forked or cloned copy of a history path (`fork_session` / `clone_session`)
-  that does **not** mutate the source. Gated by `session_tree_enabled`; clone
-  requires a settled source; `session_tree_max_copy_messages` (default 500)
-  caps the copy. **Host-invoked** — the loop does not call these helpers.
+**Session branch** (host-owned)
+: A forked or cloned copy of a history path that does **not** mutate the
+  source. Gated by a host knob; a clone requires a settled source, and a second
+  host knob caps the number of copied messages. **Host-owned** — the loop does
+  not branch a session.
 
 **`Lane`** (`runtime/lanes.py`)
 : A named cursor over shared history. `main` always exists; extras take
@@ -189,13 +236,16 @@ not infer that shipping the code turns them on.
   `lanes_enabled`; `lanes_max_per_session` (default 4) includes main.
   **Host-invoked**; `QueryEngine.lanes` is snapshot-persisted.
 
-**`PUBLISHED_HOOKS`** (`runtime/typed_hooks.py`)
-: The production typed hook names: `before_run`, `before_tool`, `after_tool`,
-  `transform_context`, `before_compact`, `after_compact`. Dispatched through
-  `HookRegistry` when `typed_hooks_enabled` is on. Distinct from the 8 pluggy
-  hookspecs and from `IHookManager`. `before_tool` / `after_tool` also require
-  `intent_settlement_enabled` (they live in that dispatch branch).
-  `transform_context` is fired but its `rewrite` is not applied to history.
+**Lifecycle coordinates** (`contracts/types.py::HookEvent`)
+: The coordinates the loop dispatches on the lifecycle seam, named by
+  `HookEvent`: `run_start`, `turn_start`, `context_transform`,
+  `request_prepare`, `response_received`, `request_error`, `turn_end`,
+  `pre_tool_use`, `tool_execute`, `post_tool_use`, `pre_compact`,
+  `compaction_commit`,
+  `compaction_rollback`, `post_compact`, `run_finalize`. Registrations run
+  through `HookManager` when `typed_hooks_enabled` is on — that flag is the
+  only switch over the seam. A `transform` at `context_transform` is applied to
+  the turn's context.
 
 **`Span`** (`runtime/telemetry.py`)
 : A low-cardinality telemetry span. Allowed names: `run` / `turn` / `step` /
@@ -221,16 +271,3 @@ not infer that shipping the code turns them on.
   `Skill(skill="{name}")` call shapes, not file paths. Store reads key on
   `QueryEngineConfig.account_id`, not `tenant_id`. See
   [Skills routing / surfacing](architecture.md#skills-routing--surfacing).
-
-## Tool surface
-
-**Lean tool surface (7 verbs)** (`contracts/lean_tool_surface.py`)
-: A small, universal agent-facing tool pool so a capable model hand-composes
-  operations instead of filling a dozen bespoke schemas. Exactly **seven
-  canonical verbs** (`LEAN_TOOL_NAMES`): `exec`, `read`, `read_silent`, `write`,
-  `find`, `search`, `answer`. `exec` is a registered-binary runner
-  (`{path, args, stdin}`), explicitly **not** a `/bin/sh`. Core owns only the
-  contracts and names; the host binds each name to a concrete backend. Profile
-  selection is RC-driven (`tool_surface_profile`, default `"legacy"`). See
-  [Lean tool surface](architecture.md#lean-tool-surface) and
-  [`tools.md`](tools.md).

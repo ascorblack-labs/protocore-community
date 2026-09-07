@@ -35,7 +35,7 @@ import json
 import pytest
 from pydantic import ValidationError
 
-from protocore.contracts.runtime_constants import RuntimeConstants
+from protocore.contracts.tool_roles import ToolRole
 from protocore.contracts.tools import ToolContext
 from protocore.tools.ask_user import (
     ASK_USER_HEADER_MAX_LENGTH,
@@ -443,6 +443,14 @@ def test_tool_name_property() -> None:
     assert tool.name == ASK_USER_TOOL_NAME
 
 
+def test_tool_declares_the_human_in_the_loop_role() -> None:
+    """A caller that decides by what a tool DOES — an unattended runner
+    excluding human-in-the-loop tools, a surface colouring a pause — must be
+    able to reach that decision without matching the name ``AskUser``, which a
+    deployment is free to change."""
+    assert ToolRole.asks_user in AskUserTool.tool_roles
+
+
 def test_tool_definition_regenerates_rich_schema() -> None:
     """The model-facing JSON schema MUST carry ``questions[]`` with the
     nested option/multiSelect/allow_custom shape and contain NO dangling
@@ -550,33 +558,3 @@ async def test_invoke_validation_error_passes_through() -> None:
     with pytest.raises(ValidationError):
         # question with neither options nor allow_custom is unanswerable.
         await tool.invoke(ctx, {"questions": [{"question": "dangling?"}]})
-
-
-# ---------------------------------------------------------------------------
-# RC fields (unchanged by the contract upgrade)
-# ---------------------------------------------------------------------------
-
-
-def test_rc_max_ask_user_calls_per_run_default() -> None:
-    rc = RuntimeConstants()
-    assert rc.max_ask_user_calls_per_run == 10
-
-
-def test_rc_max_ask_user_calls_per_run_can_be_zero() -> None:
-    rc = RuntimeConstants(max_ask_user_calls_per_run=0)
-    assert rc.max_ask_user_calls_per_run == 0
-
-
-def test_rc_max_ask_user_calls_per_run_rejects_negative() -> None:
-    with pytest.raises(ValidationError):
-        RuntimeConstants(max_ask_user_calls_per_run=-1)
-
-
-def test_rc_ask_user_resume_timeout_seconds_default() -> None:
-    rc = RuntimeConstants()
-    assert rc.ask_user_resume_timeout_seconds == 300.0
-
-
-def test_rc_ask_user_resume_timeout_seconds_rejects_zero() -> None:
-    with pytest.raises(ValidationError):
-        RuntimeConstants(ask_user_resume_timeout_seconds=0.0)

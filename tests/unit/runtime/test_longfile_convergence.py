@@ -21,7 +21,8 @@ import json
 
 import pytest
 
-from protocore.contracts.runtime_constants import RuntimeConstants
+from protocore.contracts.runtime_constants import LoopConstants
+from protocore.contracts.tool_roles import ToolRole
 from protocore.contracts.types import (
     Message,
     MessageRole,
@@ -32,7 +33,7 @@ from protocore.runtime import longfile_convergence as lfc
 
 
 # ── helpers ────────────────────────────────────────────────────────────────
-def _rc(**overrides: object) -> RuntimeConstants:
+def _rc(**overrides: object) -> LoopConstants:
     base: dict[str, object] = {
         "model_context_window": 4_096,
         "longfile_convergence_enabled": True,
@@ -46,7 +47,7 @@ def _rc(**overrides: object) -> RuntimeConstants:
         "longfile_tail_anchor_chars": 200,
     }
     base.update(overrides)
-    return RuntimeConstants(**base)
+    return LoopConstants(**base)
 
 
 def _write_call(path: str, content: str = "x") -> ToolCall:
@@ -269,7 +270,7 @@ def test_driver_engages_only_after_truncation_seen_on_active_path(engine_factory
     # Record a truncation on the active path → the driver may now engage.
     lfc.note_truncated_mutation(engine, "/workspace/big.py")
     assert lfc.active_path_truncation_seen(engine) is True
-    assert lfc.decide_next_forced_tool(engine) == "AppendFile"
+    assert lfc.decide_next_forced_tool(engine) is ToolRole.appends_path
 
 
 # ── forced AppendFile on stall + cap ─────────────────────────────────────
@@ -290,7 +291,7 @@ def _drive_to_stall_below_floor(engine) -> None:
 def test_stall_below_floor_forces_appendfile(engine_factory) -> None:
     engine = engine_factory(rc=_rc(longfile_stall_turns=2))
     _drive_to_stall_below_floor(engine)
-    assert lfc.decide_next_forced_tool(engine) == "AppendFile"
+    assert lfc.decide_next_forced_tool(engine) is ToolRole.appends_path
 
 
 def test_no_force_before_stall_threshold(engine_factory) -> None:
@@ -314,7 +315,7 @@ def test_forced_appendfile_respects_cap(engine_factory) -> None:
     lfc.register_turn_byte_production(engine, added_bytes=True)
     for _ in range(3):
         lfc.register_turn_byte_production(engine, added_bytes=False)
-        assert lfc.decide_next_forced_tool(engine) == "AppendFile"
+        assert lfc.decide_next_forced_tool(engine) is ToolRole.appends_path
         lfc.commit_forced_append(engine)
     # Budget exhausted, file still below floor → no further append; finalize is
     # blocked by the empty-finalize guard → no action at all.
@@ -346,7 +347,7 @@ def test_plateau_forces_finalize(engine_factory) -> None:
     )
     lfc.register_turn_byte_production(engine, added_bytes=True)
     assert lfc.plausibly_complete(engine) is True
-    assert lfc.decide_next_forced_tool(engine) == "FinalizeFile"
+    assert lfc.decide_next_forced_tool(engine) is ToolRole.finalizes_path
 
 
 def test_stall_at_floor_forces_finalize(engine_factory) -> None:
@@ -370,7 +371,7 @@ def test_stall_at_floor_forces_finalize(engine_factory) -> None:
         lfc.register_turn_byte_production(engine, added_bytes=False)
     assert lfc.plausibly_complete(engine) is True
     assert lfc.active_path_truncation_seen(engine) is True
-    assert lfc.decide_next_forced_tool(engine) == "FinalizeFile"
+    assert lfc.decide_next_forced_tool(engine) is ToolRole.finalizes_path
 
 
 def test_terminal_seal_after_forced_appends_when_truncating(engine_factory) -> None:
@@ -390,7 +391,7 @@ def test_terminal_seal_after_forced_appends_when_truncating(engine_factory) -> N
     # not plausibly complete → terminal seal.
     assert lfc.plausibly_complete(engine) is False
     assert lfc.finalize_permitted(engine) is True
-    assert lfc.decide_next_forced_tool(engine) == "FinalizeFile"
+    assert lfc.decide_next_forced_tool(engine) is ToolRole.finalizes_path
 
 
 def test_forced_finalize_respects_cap(engine_factory) -> None:
@@ -409,7 +410,7 @@ def test_forced_finalize_respects_cap(engine_factory) -> None:
     lfc.register_turn_byte_production(engine, added_bytes=True)
     for _ in range(2):
         lfc.register_turn_byte_production(engine, added_bytes=False)
-    assert lfc.decide_next_forced_tool(engine) == "FinalizeFile"
+    assert lfc.decide_next_forced_tool(engine) is ToolRole.finalizes_path
     lfc.commit_forced_finalize(engine)
     # Budget of 1 exhausted → no further finalize.
     lfc.register_turn_byte_production(engine, added_bytes=False)
@@ -441,7 +442,7 @@ def test_never_force_finalize_below_floor(engine_factory) -> None:
     # ONLY action available is to drive more content via AppendFile (never a
     # premature seal of an under-floor file).
     assert lfc.finalize_permitted(engine) is False
-    assert lfc.decide_next_forced_tool(engine) == "AppendFile"
+    assert lfc.decide_next_forced_tool(engine) is ToolRole.appends_path
 
 
 def test_never_force_finalize_below_floor_when_append_exhausted(engine_factory) -> None:
@@ -660,7 +661,7 @@ def test_per_path_append_breaker(engine_factory) -> None:
     total = 1000
     for i in range(3):
         lfc.register_turn_byte_production(engine, added_bytes=False)
-        assert lfc.decide_next_forced_tool(engine) == "AppendFile", f"append {i}"
+        assert lfc.decide_next_forced_tool(engine) is ToolRole.appends_path, f"append {i}"
         total += 500
         lfc.observe_tool_result(
             engine, _append_call("/workspace/big.py"), _append_result(500, total),
@@ -702,7 +703,7 @@ def test_append_breaker_seals_when_past_floor(engine_factory) -> None:
     assert lfc.append_breaker_tripped(engine) is True
     lfc.register_turn_byte_production(engine, added_bytes=False)
     # Breaker tripped + past floor + finalize permitted → seal.
-    assert lfc.decide_next_forced_tool(engine) == "FinalizeFile"
+    assert lfc.decide_next_forced_tool(engine) is ToolRole.finalizes_path
 
 
 def test_append_breaker_round_trips_through_snapshot(engine_factory) -> None:
@@ -909,7 +910,7 @@ def test_side_file_finalize_does_not_seal_active_artifact(engine_factory) -> Non
     # the driver must still engage (force AppendFile), NOT stay inert.
     for _ in range(2):
         lfc.register_turn_byte_production(engine, added_bytes=False)
-    assert lfc.decide_next_forced_tool(engine) == "AppendFile"
+    assert lfc.decide_next_forced_tool(engine) is ToolRole.appends_path
 
     # And had report.md been driven past floor + self-continued, the run-end
     # terminal seal would still be eligible (the latch was never falsely flipped).

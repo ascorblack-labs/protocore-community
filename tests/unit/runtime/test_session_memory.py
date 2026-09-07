@@ -14,7 +14,7 @@ from __future__ import annotations
 
 import json
 
-from protocore.contracts.runtime_constants import RuntimeConstants
+from protocore.contracts.runtime_constants import LoopConstants
 from protocore.contracts.types import (
     COMPACTION_REFERENCE_METADATA_KEY,
     SESSION_HISTORY_SEED_METADATA_KEY,
@@ -24,6 +24,7 @@ from protocore.contracts.types import (
     ToolResultBlock,
     ToolUseBlock,
 )
+from protocore.runtime.context.compaction import estimate_history_tokens
 from protocore.runtime.context.session_memory import (
     END_OF_SUMMARY_MARKER,
     SUMMARY_SYSTEM,
@@ -32,15 +33,15 @@ from protocore.runtime.context.session_memory import (
     bound_catchup_source,
     build_seed,
     build_summary_user_message,
-    estimate_messages_tokens,
     extract_artifacts,
     fold_run,
     render_ledger,
     running_summary_needed,
     summary_fold_threshold_tokens,
 )
+from tests._fixtures.tool_roles import CONVENTIONAL_TOOL_ROLES
 
-RC = RuntimeConstants()
+RC = LoopConstants()
 
 
 # --- helpers ---------------------------------------------------------------
@@ -78,7 +79,7 @@ def _tool_result(text: str, *, call_id: str = "tc1") -> Message:
 
 
 def test_extract_file_path_from_write_tool_call() -> None:
-    led = extract_artifacts([_write_call("src/app.py", "def main():\n    pass\n")])
+    led = extract_artifacts([_write_call("src/app.py", "def main():\n    pass\n")], roles=CONVENTIONAL_TOOL_ROLES)
     assert led.files == ["src/app.py"]
     assert led.content["src/app.py"] == "def main():\n    pass\n"
 
@@ -87,7 +88,7 @@ def test_extract_is_language_agnostic_cyrillic_path() -> None:
     # A cyrillic path is read verbatim from the structured ``path`` arg — no text
     # scanning, no language assumption.
     content = "Документация процедуры отката. Версия 3.12."
-    led = extract_artifacts([_write_call("docs/откат.md", content)])
+    led = extract_artifacts([_write_call("docs/откат.md", content)], roles=CONVENTIONAL_TOOL_ROLES)
     assert led.files == ["docs/откат.md"]
     assert led.content["docs/откат.md"] == content
 
@@ -105,7 +106,7 @@ def test_extract_edit_tool_file_path_key() -> None:
             )
         ],
     )
-    led = extract_artifacts([edit])
+    led = extract_artifacts([edit], roles=CONVENTIONAL_TOOL_ROLES)
     assert led.files == ["main.py"]
     assert led.content["main.py"] == "def fixed():\n    pass"
 
@@ -122,27 +123,27 @@ def test_extract_ignores_non_file_tools() -> None:
             )
         ],
     )
-    led = extract_artifacts([bash])
+    led = extract_artifacts([bash], roles=CONVENTIONAL_TOOL_ROLES)
     assert led.files == []
 
 
 def test_extract_dedup_keeps_latest_content() -> None:
     base = ArtifactLedger(files=["a.py"], content={"a.py": "old"})
-    led = extract_artifacts([_write_call("a.py", "new")], base=base)
+    led = extract_artifacts([_write_call("a.py", "new")], base=base, roles=CONVENTIONAL_TOOL_ROLES)
     assert led.files == ["a.py"]  # not duplicated, order preserved
     assert led.content["a.py"] == "new"  # latest write wins
 
 
 def test_extract_no_files_from_plain_prose() -> None:
     # No tool call → nothing in the registry (text is never scanned for facts).
-    led = extract_artifacts([_user("Please write notes about https://x.com v3.12 `BUILD::`")])
+    led = extract_artifacts([_user("Please write notes about https://x.com v3.12 `BUILD::`")], roles=CONVENTIONAL_TOOL_ROLES)
     assert led.files == []
     assert led.content == {}
 
 
 def test_extract_content_snapshot_capped() -> None:
     huge = "x" * 100_000
-    led = extract_artifacts([_write_call("big.txt", huge)])
+    led = extract_artifacts([_write_call("big.txt", huge)], roles=CONVENTIONAL_TOOL_ROLES)
     assert len(led.content["big.txt"]) <= 4000
 
 
@@ -248,7 +249,7 @@ def test_bound_catchup_source_caps_and_keeps_oldest_head_and_newest_tail() -> No
         _assistant("middle three " + big),
         _user("NEWEST delta this run " + big),
     ]
-    full = estimate_messages_tokens(msgs, RC)
+    full = estimate_history_tokens(msgs, RC)
     budget = full // 2  # force a cap that cannot hold every turn
     out = bound_catchup_source(msgs, budget, RC)
 
@@ -259,7 +260,7 @@ def test_bound_catchup_source_caps_and_keeps_oldest_head_and_newest_tail() -> No
     # The bounded source genuinely shrank and is at most ~the budget (the head's
     # last whole message can edge slightly over its half, but never the full size).
     assert len(out) < len(msgs)
-    assert estimate_messages_tokens(out, RC) <= full
+    assert estimate_history_tokens(out, RC) <= full
 
 
 def test_bound_catchup_source_always_keeps_oldest_and_newest_under_tiny_budget() -> None:
@@ -282,7 +283,7 @@ def test_bound_catchup_source_always_keeps_oldest_and_newest_under_tiny_budget()
 
 def test_fold_sets_new_summary_and_advances_turn() -> None:
     mem = SessionMemory(running_summary="PRIOR", turn_index=1)
-    res = fold_run(mem, [_user("new question"), _assistant("answer")], "M1", RC)
+    res = fold_run(mem, [_user("new question"), _assistant("answer")], "M1", RC, roles=CONVENTIONAL_TOOL_ROLES)
     assert res.memory.running_summary == "M1"
     assert res.summary_updated is True
     assert res.memory.turn_index == 2
@@ -293,7 +294,7 @@ def test_fold_none_summary_keeps_prior_but_updates_ledger() -> None:
     # — keep the prior summary, but the deterministic registry still updates and
     # the turn still advances (no LLM needed for the ledger).
     mem = SessionMemory(running_summary="KEEP-ME", turn_index=2)
-    res = fold_run(mem, [_write_call("x.py", "y = 1")], None, RC)
+    res = fold_run(mem, [_write_call("x.py", "y = 1")], None, RC, roles=CONVENTIONAL_TOOL_ROLES)
     assert res.summary_updated is False
     assert res.memory.running_summary == "KEEP-ME"  # prior preserved
     assert "x.py" in res.memory.ledger.files
@@ -302,32 +303,32 @@ def test_fold_none_summary_keeps_prior_but_updates_ledger() -> None:
 
 def test_fold_blank_summary_keeps_prior() -> None:
     mem = SessionMemory(running_summary="PRIOR", turn_index=1)
-    res = fold_run(mem, [_user("q")], "   ", RC)
+    res = fold_run(mem, [_user("q")], "   ", RC, roles=CONVENTIONAL_TOOL_ROLES)
     assert res.memory.running_summary == "PRIOR"
     assert res.summary_updated is False
 
 
 def test_fold_drift_cap_truncates_oversized_summary() -> None:
-    rc = RuntimeConstants(session_memory_running_summary_token_cap=10)
+    rc = LoopConstants(session_memory_running_summary_token_cap=10)
     huge = "word " * 500
     # default (large) cap → kept whole (modulo the strip()).
-    res = fold_run(SessionMemory(), [_user("q")], huge, RC)
+    res = fold_run(SessionMemory(), [_user("q")], huge, RC, roles=CONVENTIONAL_TOOL_ROLES)
     assert res.memory.running_summary == huge.strip()
     # tiny cap → truncated well below the original length.
-    res2 = fold_run(SessionMemory(), [_user("q")], huge, rc)
+    res2 = fold_run(SessionMemory(), [_user("q")], huge, rc, roles=CONVENTIONAL_TOOL_ROLES)
     assert len(res2.memory.running_summary) < len(huge.strip())
 
 
 def test_fold_drift_cap_disabled_when_zero() -> None:
-    rc = RuntimeConstants(session_memory_running_summary_token_cap=0)
+    rc = LoopConstants(session_memory_running_summary_token_cap=0)
     huge = "word " * 500
-    res = fold_run(SessionMemory(), [_user("q")], huge, rc)
+    res = fold_run(SessionMemory(), [_user("q")], huge, rc, roles=CONVENTIONAL_TOOL_ROLES)
     assert res.memory.running_summary == huge.strip()
 
 
 def test_fold_does_not_mutate_input_memory() -> None:
     mem = SessionMemory(running_summary="OLD", turn_index=1)
-    fold_run(mem, [_user("q")], "NEW", RC)
+    fold_run(mem, [_user("q")], "NEW", RC, roles=CONVENTIONAL_TOOL_ROLES)
     assert mem.running_summary == "OLD"
     assert mem.turn_index == 1
 
@@ -336,7 +337,7 @@ def test_fold_does_not_mutate_input_memory() -> None:
 
 
 def test_lazy_fold_threshold_derived_from_tail_budget() -> None:
-    rc = RuntimeConstants(
+    rc = LoopConstants(
         session_memory_fold_min_tokens=0, session_memory_tail_budget_fraction=0.5
     )
     # derived: budget * tail_fraction.
@@ -344,13 +345,13 @@ def test_lazy_fold_threshold_derived_from_tail_budget() -> None:
 
 
 def test_lazy_fold_threshold_explicit_override() -> None:
-    rc = RuntimeConstants(session_memory_fold_min_tokens=123)
+    rc = LoopConstants(session_memory_fold_min_tokens=123)
     # a positive RC overrides the derived value verbatim.
     assert summary_fold_threshold_tokens(1000, rc) == 123
 
 
 def test_running_summary_needed_skips_short_session() -> None:
-    rc = RuntimeConstants(session_memory_fold_min_tokens=0, session_memory_tail_budget_fraction=0.5)
+    rc = LoopConstants(session_memory_fold_min_tokens=0, session_memory_tail_budget_fraction=0.5)
     # below the derived threshold (500) → not needed (tail covers the history).
     assert running_summary_needed(100, 1000, rc) is False
     # above it → needed (the raw tail can no longer hold everything).
@@ -364,12 +365,12 @@ def test_fold_accumulates_cumulative_raw_tokens() -> None:
     mem = SessionMemory()
     assert mem.cumulative_raw_tokens == 0
     run1 = [_user("word " * 100), _assistant("ok " * 100)]
-    r1 = fold_run(mem, run1, "small summary", RC)
+    r1 = fold_run(mem, run1, "small summary", RC, roles=CONVENTIONAL_TOOL_ROLES)
     t1 = r1.memory.cumulative_raw_tokens
     assert t1 > 0
     # A second run accumulates ON TOP of the first (monotonic raw total).
     run2 = [_user("more " * 100), _assistant("done " * 100)]
-    r2 = fold_run(r1.memory, run2, "small summary", RC)
+    r2 = fold_run(r1.memory, run2, "small summary", RC, roles=CONVENTIONAL_TOOL_ROLES)
     assert r2.memory.cumulative_raw_tokens > t1
 
 
@@ -382,7 +383,7 @@ def test_lazy_gate_does_not_under_summarize_via_cumulative_raw_tokens() -> None:
     small summary + small run and skipped FOREVER; the cumulative-raw tracking
     crosses the threshold and forces the fold, so runs 2..N are never lost.
     """
-    rc = RuntimeConstants(
+    rc = LoopConstants(
         session_memory_fold_min_tokens=0, session_memory_tail_budget_fraction=0.30
     )
     seed_budget = 1000  # → derived threshold = 300 tokens
@@ -397,7 +398,7 @@ def test_lazy_gate_does_not_under_summarize_via_cumulative_raw_tokens() -> None:
         cumulative_raw_tokens=5000,  # >> threshold (300)
     )
     short_run = [_user("ok"), _assistant("done")]  # tiny new run
-    run_tokens = estimate_messages_tokens(short_run, rc)
+    run_tokens = estimate_history_tokens(short_run, rc)
     assert run_tokens < threshold  # this run alone would NOT trip the old proxy
 
     # The gate uses the ACTUAL cumulative-after-this-run, which is >> threshold:
@@ -405,7 +406,7 @@ def test_lazy_gate_does_not_under_summarize_via_cumulative_raw_tokens() -> None:
     assert running_summary_needed(cumulative_after, seed_budget, rc) is True
 
     # And the fold keeps accumulating so it never silently stops summarising.
-    res = fold_run(mem, short_run, "updated summary with ok/done", rc)
+    res = fold_run(mem, short_run, "updated summary with ok/done", rc, roles=CONVENTIONAL_TOOL_ROLES)
     assert res.summary_updated is True
     assert res.memory.running_summary  # non-empty → early content represented
     assert res.memory.cumulative_raw_tokens == 5000 + run_tokens
@@ -493,7 +494,7 @@ def test_build_seed_dual_tags_summary_and_ledger_only() -> None:
 
 
 def test_build_seed_head_protect_count_respected() -> None:
-    rc = RuntimeConstants(session_memory_head_protect_messages=2)
+    rc = LoopConstants(session_memory_head_protect_messages=2)
     head = [_user("a"), _assistant("b"), _user("c"), _assistant("d")]
     mem = SessionMemory(running_summary="s", turn_index=1)
     seed = build_seed(mem, [], head, 40_000, rc)
@@ -502,7 +503,7 @@ def test_build_seed_head_protect_count_respected() -> None:
 
 
 def test_build_seed_tail_does_not_open_on_orphan_tool_result() -> None:
-    rc = RuntimeConstants(session_memory_tail_budget_fraction=1.0)
+    rc = LoopConstants(session_memory_tail_budget_fraction=1.0)
     big = "x" * 4000
     tail = [_assistant("call"), _write_call("a.py", "y=1", call_id="z"), _tool_result(big, call_id="z")]
     mem = SessionMemory(running_summary="s", turn_index=1)

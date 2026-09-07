@@ -20,7 +20,8 @@ from typing import Any
 
 import pytest
 
-from protocore.contracts.runtime_constants import RuntimeConstants
+from protocore.contracts.run_state import RunScopedState
+from protocore.contracts.runtime_constants import LoopConstants
 from protocore.contracts.tool_registry import ToolVisibilityPolicy
 from protocore.contracts.tools import ToolContext
 from protocore.contracts.types import ToolCall
@@ -32,6 +33,7 @@ from protocore.runtime.tool_dispatch import (
 )
 from protocore.runtime.tool_permission import ToolPermissionGate
 from protocore.runtime.tool_registry import ToolRegistry
+from tests._fixtures.tool_roles import CONVENTIONAL_TOOL_ROLES
 
 from ._tool_fixtures import MockTool
 
@@ -39,19 +41,16 @@ from ._tool_fixtures import MockTool
 def _build_dispatcher(tools: list[MockTool]) -> ToolDispatcher:
     return ToolDispatcher(
         registry=ToolRegistry(tools),
-        permission_gate=ToolPermissionGate(),
+        permission_gate=ToolPermissionGate(roles=CONVENTIONAL_TOOL_ROLES),
     )
 
 
-def _make_helpers_ctx(
-    *, helpers: dict[str, Any] | None = None
-) -> ToolContext:
-    bag: dict[str, Any] = dict(helpers) if helpers else {}
+def _make_run_ctx(*, rc: Any | None = None) -> ToolContext:
     return ToolContext(
         tenant_id="tenant-miss",
         run_id="run-miss",
         session_id="sess-miss",
-        metadata={"protocore.helpers": bag},
+        run_state=RunScopedState(rc=rc),
     )
 
 
@@ -89,13 +88,13 @@ async def test_repeated_missing_field_error_trips_terminal_cap() -> None:
     (a structural intervention), not an endless vague-error loop."""
     from protocore.contracts.tools import ToolInvocationError
 
-    rc = RuntimeConstants()  # defaults: generic=4, schema-terminal cap=3
+    rc = LoopConstants()  # defaults: generic=4, schema-terminal cap=3
     tool = MockTool(
         tool_name="Write",
         raise_exception=ToolInvocationError(_MISSING_FIELD_ERROR_MSG),
     )
     dispatcher = _build_dispatcher([tool])
-    ctx = _make_helpers_ctx(helpers={"rc": rc})
+    ctx = _make_run_ctx(rc=rc)
 
     last: DispatchOutcome | None = None
     for _ in range(3):
@@ -119,13 +118,13 @@ async def test_first_two_missing_field_errors_stay_original_kind() -> None:
     (the cap is a backstop, not a first-error reject)."""
     from protocore.contracts.tools import ToolInvocationError
 
-    rc = RuntimeConstants()
+    rc = LoopConstants()
     tool = MockTool(
         tool_name="Write",
         raise_exception=ToolInvocationError(_MISSING_FIELD_ERROR_MSG),
     )
     dispatcher = _build_dispatcher([tool])
-    ctx = _make_helpers_ctx(helpers={"rc": rc})
+    ctx = _make_run_ctx(rc=rc)
 
     for attempt in range(2):
         outcome = await _drain(

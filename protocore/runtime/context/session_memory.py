@@ -57,6 +57,28 @@ LAZY FOLD: :func:`running_summary_needed` lets the host SKIP the LLM call
 entirely when the whole prior session still fits in ``build_seed``'s raw tail
 (the running summary would never be used) — short sessions do a ledger-only,
 ZERO-LLM update.
+
+TOKEN SCALE — every gate in this module is denominated in the ONE shared
+estimate, :func:`~protocore.runtime.context.compaction.estimate_message_tokens`.
+This module used to carry its own, narrower estimate: it joined the text of
+text / tool_use / tool_result blocks plus ``reasoning_content`` and costed the
+join once, so thinking blocks, image refs and unknown block kinds contributed
+ZERO. The shared estimate costs every block, prices an
+:class:`~protocore.contracts.types.ImageRefBlock` at
+:attr:`LoopConstants.token_count_image_tokens`, and counts thinking and
+unknown blocks. For the same transcript it therefore reads at least as high as
+the old one, and MATERIALLY higher on a transcript carrying images or
+re-emitted reasoning.
+
+That shift is deliberate — an estimate that silently prices part of a
+transcript at zero is what let a session overrun the window it was measured
+against — but it MOVED THE SCALE these thresholds are read on:
+``session_memory_fold_min_tokens``, ``summary_fold_threshold_tokens`` and
+``session_memory_tail_budget_fraction`` all mean slightly less transcript than
+they did, so a fold fires marginally earlier and the seed tail is clipped
+marginally sooner on such a transcript. The defaults are unchanged and remain
+per-tenant overridable; the scale itself is pinned by
+``tests/unit/runtime/test_session_memory_token_scale.py``.
 """
 from __future__ import annotations
 
@@ -65,7 +87,13 @@ from collections.abc import Sequence
 from dataclasses import dataclass, field
 from typing import Any
 
-from protocore.contracts.runtime_constants import RuntimeConstants
+from protocore.contracts.runtime_constants import LoopConstants
+from protocore.contracts.tool_roles import (
+    EMPTY_TOOL_ROLE_MAP,
+    WORKSPACE_MUTATION_ROLES,
+    ToolArgumentSlot,
+    ToolRoleMap,
+)
 from protocore.contracts.types import (
     COMPACTION_REFERENCE_METADATA_KEY,
     SESSION_HISTORY_SEED_METADATA_KEY,
@@ -75,14 +103,19 @@ from protocore.contracts.types import (
     ToolResultBlock,
     ToolUseBlock,
 )
+from protocore.runtime.context.compaction import (
+    estimate_history_tokens,
+    estimate_message_tokens,
+)
 from protocore.runtime.token_counting import estimate_tokens
+from protocore.runtime.tool_arguments import string_argument
 
 # ---------------------------------------------------------------------------
 # Structural constants (NOT tunable thresholds → not RC fields): the
 # END-OF-SUMMARY marker, render labels, the verbatim-preservation system prompt,
 # and the named tool-call field keys read by the structured artifact registry.
-# All numeric BUDGET thresholds live in RuntimeConstants (no inline magic
-# numbers per ).
+# All numeric BUDGET thresholds live in LoopConstants (no inline magic
+# numbers).
 # ---------------------------------------------------------------------------
 
 END_OF_SUMMARY_MARKER = (
@@ -91,18 +124,6 @@ END_OF_SUMMARY_MARKER = (
 )
 """Sentinel after the running-summary block so a local model treats the summary
 as reference DATA, not a chat turn to continue (proven on the stand)."""
-
-#: Tool names whose call records a written/edited artifact. Compared via a
-#: normalised set membership on the structured ``tool_call.name`` field (not a
-#: text scan of message content): a file-writing tool, in any language, is
-#: identified by its registered name, which is a fixed runtime identifier.
-_FILE_WRITE_TOOLS: frozenset[str] = frozenset(
-    {"write", "edit", "appendfile", "createfile", "writefile", "finalizefile", "multiedit"}
-)
-#: Argument keys (by NAME) that carry a written/edited file path in a tool call.
-_PATH_ARG_KEYS: tuple[str, ...] = ("path", "file_path", "filename", "file", "target_path")
-#: Argument keys (by NAME) that carry written file CONTENT in a tool call.
-_CONTENT_ARG_KEYS: tuple[str, ...] = ("content", "new_str", "new_string", "text", "body")
 
 #: Cap on how many files are pinned + how many chars of each content snapshot is
 #: kept, so the registry block stays compact even on a huge session. These are
@@ -285,24 +306,6 @@ class SessionMemory:
 # ---------------------------------------------------------------------------
 
 
-def _message_tokens(message: Message, rc: RuntimeConstants) -> int:
-    """Estimate the token cost of one message (text + tool blocks + reasoning).
-
-    Uses only the tokenizer (allowed deterministic op) — no content matching.
-    """
-    parts: list[str] = []
-    for block in message.content_blocks:
-        if isinstance(block, TextBlock):
-            parts.append(block.text)
-        elif isinstance(block, ToolUseBlock):
-            parts.append(f"{block.name}({block.arguments_json})")
-        elif isinstance(block, ToolResultBlock):
-            parts.append(block.content)
-    if message.reasoning_content:
-        parts.append(message.reasoning_content)
-    return estimate_tokens("\n".join(parts), rc)
-
-
 def _serialize_message(message: Message) -> str:
     """Render a message as ``[ROLE] text [calls Tool(args)] [tool result …]`` for
     summary INPUT, so the model treats it as source material, not a chat to
@@ -383,28 +386,23 @@ def _parse_args(block: ToolUseBlock) -> dict[str, Any]:
     return parsed if isinstance(parsed, dict) else {}
 
 
-def _arg_by_keys(args: dict[str, Any], keys: tuple[str, ...]) -> str:
-    """Return the first named-key value present as a non-empty string.
+def _is_file_write_tool(name: str, roles: ToolRoleMap) -> bool:
+    """Identify a tool whose call records a written or edited artifact.
 
-    Pure dict lookup by key — NOT a substring/keyword scan of any text."""
-    for key in keys:
-        val = args.get(key)
-        if isinstance(val, str) and val:
-            return val
-    return ""
-
-
-def _is_file_write_tool(name: str) -> bool:
-    """Identify a file-writing tool by its registered NAME (a fixed runtime
-    identifier), via normalised set membership — not a content text scan."""
-    normalised = name.replace("-", "").replace("_", "").lower()
-    return normalised in {t.replace("-", "").replace("_", "") for t in _FILE_WRITE_TOOLS}
+    By ROLE, from the host's own registration — not by recognising a spelling.
+    The set of near-spellings this used to normalise against ("writefile",
+    "multiedit", and so on) was a guess at what somebody's tool might be
+    called; it matched an unrelated tool as readily as it missed a renamed
+    one.
+    """
+    return bool(roles.roles_of(name) & WORKSPACE_MUTATION_ROLES)
 
 
 def extract_artifacts(
     messages: Sequence[Message],
     *,
     base: ArtifactLedger | None = None,
+    roles: ToolRoleMap = EMPTY_TOOL_ROLE_MAP,
 ) -> ArtifactLedger:
     """Build the file registry from a run's messages, folding into ``base``.
 
@@ -426,17 +424,19 @@ def extract_artifacts(
         for block in message.content_blocks:
             if not isinstance(block, ToolUseBlock):
                 continue
-            if not _is_file_write_tool(block.name):
+            if not _is_file_write_tool(block.name, roles):
                 continue
             args = _parse_args(block)
-            path_value = _arg_by_keys(args, _PATH_ARG_KEYS)
+            path_value = string_argument(args, ToolArgumentSlot.path, roles=roles) or ""
             if not path_value:
                 continue
             if path_value not in seen and len(ledger.files) < _MAX_FILES:
                 seen.add(path_value)
                 ledger.files.append(path_value)
             if path_value in seen:
-                content_value = _arg_by_keys(args, _CONTENT_ARG_KEYS)
+                content_value = string_argument(
+                    args, ToolArgumentSlot.content, roles=roles
+                )
                 if content_value:
                     ledger.content[path_value] = content_value[:_CONTENT_SNAPSHOT_MAX_CHARS]
 
@@ -478,7 +478,7 @@ class FoldResult:
     notes: dict[str, Any] = field(default_factory=dict)
 
 
-def _cap_running_summary(summary: str, rc: RuntimeConstants) -> str:
+def _cap_running_summary(summary: str, rc: LoopConstants) -> str:
     """Drift control: truncate the carried summary if it grew past the RC cap.
 
     The NEXT fold is still delta-only (summary passed as PREVIOUS SUMMARY) — we
@@ -501,7 +501,8 @@ def fold_run(
     memory: SessionMemory,
     run_messages: Sequence[Message],
     new_summary_text: str | None,
-    rc: RuntimeConstants,
+    rc: LoopConstants,
+    roles: ToolRoleMap = EMPTY_TOOL_ROLE_MAP,
 ) -> FoldResult:
     """Fold ONE finished run's messages into ``memory`` (the UPDATE step) — PURE.
 
@@ -525,7 +526,7 @@ def fold_run(
 
     Returns a NEW :class:`SessionMemory` (the input is not mutated).
     """
-    new_ledger = extract_artifacts(run_messages, base=memory.ledger)
+    new_ledger = extract_artifacts(run_messages, base=memory.ledger, roles=roles)
 
     running = memory.running_summary
     summary_updated = False
@@ -536,7 +537,7 @@ def fold_run(
     # else: no new summary (skipped/timed-out/failed/empty) — keep the prior
     # summary intact (no drift; the registry update + turn advance still land).
 
-    run_tokens = estimate_messages_tokens(run_messages, rc)
+    run_tokens = estimate_history_tokens(run_messages, rc)
     new_memory = SessionMemory(
         running_summary=running,
         ledger=new_ledger,
@@ -560,7 +561,7 @@ def fold_run(
 # ---------------------------------------------------------------------------
 
 
-def summary_fold_threshold_tokens(seed_budget: int, rc: RuntimeConstants) -> int:
+def summary_fold_threshold_tokens(seed_budget: int, rc: LoopConstants) -> int:
     """Token threshold above which a session needs the LLM running summary.
 
     Below this, the whole prior history still fits in :func:`build_seed`'s raw
@@ -581,7 +582,7 @@ def summary_fold_threshold_tokens(seed_budget: int, rc: RuntimeConstants) -> int
 def running_summary_needed(
     cumulative_session_tokens: int,
     seed_budget: int,
-    rc: RuntimeConstants,
+    rc: LoopConstants,
 ) -> bool:
     """Whether the running-summary LLM fold is needed for this session.
 
@@ -603,18 +604,10 @@ def running_summary_needed(
     return cumulative_session_tokens > summary_fold_threshold_tokens(seed_budget, rc)
 
 
-def estimate_messages_tokens(messages: Sequence[Message], rc: RuntimeConstants) -> int:
-    """Sum the estimated token cost of a message sequence (pure; tokenizer only).
-
-    Exposed so the host can size the cumulative prior session for the lazy-fold
-    gate without re-implementing the per-message estimator."""
-    return sum(_message_tokens(m, rc) for m in messages)
-
-
 def bound_catchup_source(
     messages: Sequence[Message],
     budget_tokens: int,
-    rc: RuntimeConstants,
+    rc: LoopConstants,
 ) -> list[Message]:
     """Bound the ONE-TIME catch-up fold's SOURCE MATERIAL to a token budget — PURE.
 
@@ -644,7 +637,7 @@ def bound_catchup_source(
     msgs = list(messages)
     if budget_tokens <= 0:
         return msgs
-    if estimate_messages_tokens(msgs, rc) <= budget_tokens:
+    if estimate_history_tokens(msgs, rc) <= budget_tokens:
         return msgs
 
     half = max(1, budget_tokens // 2)
@@ -652,7 +645,7 @@ def bound_catchup_source(
     head: list[Message] = []
     used = 0
     for message in msgs:
-        t = _message_tokens(message, rc)
+        t = estimate_message_tokens(message, rc)
         if used + t > half and head:
             break
         head.append(message)
@@ -686,7 +679,7 @@ def bound_catchup_source(
 def _tail_by_budget(
     messages: Sequence[Message],
     budget_tokens: int,
-    rc: RuntimeConstants,
+    rc: LoopConstants,
 ) -> list[Message]:
     """Keep the newest messages until ``budget_tokens`` is reached, then repair
     the tool-pair boundary so the tail never opens on an orphan tool-result
@@ -695,7 +688,7 @@ def _tail_by_budget(
     tail: list[Message] = []
     used = 0
     for message in reversed(messages):
-        t = _message_tokens(message, rc)
+        t = estimate_message_tokens(message, rc)
         if used + t > budget_tokens and tail:
             break
         tail.append(message)
@@ -778,7 +771,7 @@ def build_seed(
     recent_tail: Sequence[Message],
     head: Sequence[Message],
     budget: int,
-    rc: RuntimeConstants,
+    rc: LoopConstants,
 ) -> list[Message]:
     """Assemble the structured-memory seed to PREPEND before the new task.
 
@@ -816,9 +809,9 @@ def build_seed(
     if ledger_text:
         ledger_block = [_ledger_message(ledger_text)]
 
-    head_tokens = sum(_message_tokens(m, rc) for m in head_messages)
-    summary_tokens = sum(_message_tokens(m, rc) for m in summary_block)
-    ledger_tokens = sum(_message_tokens(m, rc) for m in ledger_block)
+    head_tokens = sum(estimate_message_tokens(m, rc) for m in head_messages)
+    summary_tokens = sum(estimate_message_tokens(m, rc) for m in summary_block)
+    ledger_tokens = sum(estimate_message_tokens(m, rc) for m in ledger_block)
 
     tail_budget = int(budget * rc.session_memory_tail_budget_fraction)
     # Never let the fixed blocks + tail exceed the total budget: clamp the tail
@@ -839,7 +832,6 @@ __all__ = [
     "bound_catchup_source",
     "build_seed",
     "build_summary_user_message",
-    "estimate_messages_tokens",
     "extract_artifacts",
     "fold_run",
     "render_ledger",

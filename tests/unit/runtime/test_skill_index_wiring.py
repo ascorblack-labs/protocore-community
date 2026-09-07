@@ -11,7 +11,7 @@ from collections.abc import Sequence
 
 import pytest
 
-from protocore.contracts.runtime_constants import RuntimeConstants
+from protocore.contracts.runtime_constants import LoopConstants
 from protocore.contracts.skills import SkillIndexEntry, SkillUpsertInput
 from protocore.contracts.types import (
     Message,
@@ -44,7 +44,7 @@ async def test_full_catalog_rendered_into_system_prefix(
 ) -> None:
     """Every enabled skill renders into the ``<system-reminder>`` catalog
     block in the LLM request's system_prompt_sections, alphabetical."""
-    rc = RuntimeConstants(
+    rc = LoopConstants(
         model_context_window=100_000,
         skill_index_budget_ratio=0.05,
     )
@@ -93,7 +93,7 @@ async def test_disabled_skill_absent_from_catalog(
     in_memory_runtime,
 ) -> None:
     """A skill the operator disabled is dropped from the catalog block."""
-    rc = RuntimeConstants(
+    rc = LoopConstants(
         model_context_window=100_000,
         skill_index_budget_ratio=0.05,
     )
@@ -166,7 +166,7 @@ async def test_catalog_budget_degrades_to_names_only(
     in_memory_runtime,
 ) -> None:
     """When the catalog overflows the budget, it degrades to names only."""
-    rc = RuntimeConstants(
+    rc = LoopConstants(
         model_context_window=4_000,
         skill_index_budget_ratio=0.01,
     )
@@ -237,7 +237,7 @@ async def test_project_pinned_skill_surfaces_in_catalog(
     in_memory_runtime,
 ) -> None:
     """A project-pinned (bare-name) enabled skill is present in the catalog."""
-    rc = RuntimeConstants(
+    rc = LoopConstants(
         model_context_window=100_000,
         skill_index_budget_ratio=0.05,
     )
@@ -280,7 +280,7 @@ async def test_disabled_pinned_skill_not_surfaced(
     catalog drops disabled skills and the MISSING-pin fetch uses
     ``list_enabled_subset`` so a disabled skill stays off the catalog even
     with a stale pin (disable gates beat pins)."""
-    rc = RuntimeConstants(
+    rc = LoopConstants(
         model_context_window=100_000,
         skill_index_budget_ratio=0.05,
     )
@@ -320,14 +320,13 @@ async def test_catalog_keys_on_account_not_scope(
 ) -> None:
     """The catalog resolves the ACCOUNT's skills, not the scope's.
 
-    The skill bank is account-wide (keyed on ``skills.account_id``) while the
-    run's ``tenant_id`` is the scope id — which may differ from the account id
-    (the default seed: scope ``…001`` owned by account ``…010``). The catalog
-    build + pin merge MUST key on ``config.account_id``: a skill OWNED by the
-    account surfaces, and a row keyed on the scope id does NOT (proving the
-    lookup is not silently keying on the wrong id).
+    The bank is addressed by its own key while the run's ``tenant_id`` is its
+    scope, and the two differ wherever one bank serves several scopes. The
+    catalog build and the pin merge MUST key on ``config.account_id``: a skill
+    the bank holds surfaces, and one filed under the scope id does NOT — which
+    is what proves the lookup is not silently keying on the wrong id.
     """
-    rc = RuntimeConstants(
+    rc = LoopConstants(
         model_context_window=100_000,
         skill_index_budget_ratio=0.05,
     )
@@ -482,7 +481,7 @@ async def test_catalog_built_once_per_run_across_rounds(
     in_memory_runtime["skills"] = counting
     in_memory_runtime["tools"].register(MockTool(tool_name="Probe"))
 
-    rc = RuntimeConstants(
+    rc = LoopConstants(
         model_context_window=100_000,
         skill_index_budget_ratio=0.05,
     )

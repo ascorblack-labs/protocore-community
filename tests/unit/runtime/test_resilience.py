@@ -22,7 +22,7 @@ from protocore.contracts.resilience import (
     ToolTransportTimeout,
     TransportCallSpec,
 )
-from protocore.contracts.runtime_constants import RuntimeConstants
+from protocore.contracts.runtime_constants import LoopConstants
 from protocore.runtime.resilience import (
     ResiliencePolicy,
     TokenBucketRetryBudget,
@@ -403,7 +403,7 @@ class TestTokenBucketRetryBudget:
 
 
 def _policy(**overrides: Any) -> ResiliencePolicy:
-    rc = RuntimeConstants(**overrides)
+    rc = LoopConstants(**overrides)
     return ResiliencePolicy(rc=rc)
 
 

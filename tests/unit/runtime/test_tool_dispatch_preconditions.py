@@ -7,10 +7,10 @@ Verifies the :class:`~protocore.runtime.tool_dispatch.ToolDispatcher` wiring:
   precondition returns a ``[PRECONDITION NOT MET: ...]`` envelope without
   invoking the tool.
 * When the precondition IS satisfied (a prior tool was recorded on the
-  helper bag), dispatch proceeds normally.
-* ``RuntimeConstants.tool_preconditions_enabled=False`` bypasses the
+  run state), dispatch proceeds normally.
+* ``LoopConstants.tool_preconditions_enabled=False`` bypasses the
   check entirely.
-* Successful dispatches record satisfaction on the helper bag so future
+* Successful dispatches record satisfaction on the run state so future
   dispatches can see the prior call.
 """
 
@@ -21,7 +21,8 @@ from typing import Any
 
 import pytest
 
-from protocore.contracts.runtime_constants import RuntimeConstants
+from protocore.contracts.run_state import RunScopedState
+from protocore.contracts.runtime_constants import LoopConstants
 from protocore.contracts.tool_registry import ToolVisibilityPolicy
 from protocore.contracts.tools import Tool, ToolContext
 from protocore.contracts.types import (
@@ -37,11 +38,8 @@ from protocore.runtime.tool_dispatch import (
     ToolDispatcher,
 )
 from protocore.runtime.tool_permission import ToolPermissionGate
-from protocore.runtime.tool_preconditions import (
-    SATISFIED_PRECONDITIONS_KEY,
-    load_satisfied_set,
-)
 from protocore.runtime.tool_registry import ToolRegistry
+from tests._fixtures.tool_roles import CONVENTIONAL_TOOL_ROLES
 
 
 @dataclass
@@ -81,22 +79,19 @@ class PreconditionedTool(Tool):
         )
 
 
-def _build_ctx(helpers: dict[str, Any] | None = None) -> ToolContext:
-    metadata: dict[str, Any] = {}
-    if helpers is not None:
-        metadata["protocore.helpers"] = helpers
+def _build_ctx(state: RunScopedState | None = None) -> ToolContext:
     return ToolContext(
         tenant_id="tenant-1",
         run_id="run-1",
         session_id="sess-1",
-        metadata=metadata,
+        run_state=state,
     )
 
 
 def _build_dispatcher(tools: list[Tool]) -> ToolDispatcher:
     return ToolDispatcher(
         registry=ToolRegistry(tools),
-        permission_gate=ToolPermissionGate(),
+        permission_gate=ToolPermissionGate(roles=CONVENTIONAL_TOOL_ROLES),
     )
 
 
@@ -135,8 +130,8 @@ async def test_unsatisfied_bare_precondition_returns_error() -> None:
         preconditions=["AppendFile"],
     )
     dispatcher = _build_dispatcher([tool])
-    helpers: dict[str, Any] = {"rc": RuntimeConstants(tool_preconditions_enabled=True)}
-    ctx = _build_ctx(helpers)
+    state = RunScopedState(rc=LoopConstants(tool_preconditions_enabled=True))
+    ctx = _build_ctx(state)
     call = ToolCall(name="FinalizeFile", arguments={"path": "x.py"})
 
     _events, outcome = await _drain(dispatcher, tool_call=call, ctx=ctx)
@@ -151,17 +146,14 @@ async def test_unsatisfied_bare_precondition_returns_error() -> None:
 
 @pytest.mark.asyncio
 async def test_satisfied_bare_precondition_dispatches() -> None:
-    """Pre-seeded ``AppendFile`` in helper bag → FinalizeFile succeeds."""
+    """Pre-seeded ``AppendFile`` on the run state → FinalizeFile succeeds."""
     tool = PreconditionedTool(
         tool_name="FinalizeFile",
         preconditions=["AppendFile"],
     )
     dispatcher = _build_dispatcher([tool])
-    helpers: dict[str, Any] = {
-        "rc": RuntimeConstants(tool_preconditions_enabled=True),
-        SATISFIED_PRECONDITIONS_KEY: ["AppendFile"],
-    }
-    ctx = _build_ctx(helpers)
+    state = RunScopedState(rc=LoopConstants(tool_preconditions_enabled=True), satisfied_preconditions=set(["AppendFile"]))
+    ctx = _build_ctx(state)
     call = ToolCall(name="FinalizeFile", arguments={"path": "x.py"})
 
     _events, outcome = await _drain(dispatcher, tool_call=call, ctx=ctx)
@@ -183,11 +175,8 @@ async def test_unsatisfied_parameterised_precondition_returns_error() -> None:
         preconditions=["AppendFile:{path}"],
     )
     dispatcher = _build_dispatcher([tool])
-    helpers: dict[str, Any] = {
-        "rc": RuntimeConstants(tool_preconditions_enabled=True),
-        SATISFIED_PRECONDITIONS_KEY: ["AppendFile", "AppendFile:other.py"],
-    }
-    ctx = _build_ctx(helpers)
+    state = RunScopedState(rc=LoopConstants(tool_preconditions_enabled=True), satisfied_preconditions=set(["AppendFile", "AppendFile:other.py"]))
+    ctx = _build_ctx(state)
     call = ToolCall(name="FinalizeFile", arguments={"path": "wanted.py"})
 
     _events, outcome = await _drain(dispatcher, tool_call=call, ctx=ctx)
@@ -200,17 +189,14 @@ async def test_unsatisfied_parameterised_precondition_returns_error() -> None:
 
 @pytest.mark.asyncio
 async def test_satisfied_parameterised_precondition_dispatches() -> None:
-    """``AppendFile:wanted.py`` in helper bag → FinalizeFile succeeds."""
+    """``AppendFile:wanted.py`` already satisfied → FinalizeFile succeeds."""
     tool = PreconditionedTool(
         tool_name="FinalizeFile",
         preconditions=["AppendFile:{path}"],
     )
     dispatcher = _build_dispatcher([tool])
-    helpers: dict[str, Any] = {
-        "rc": RuntimeConstants(tool_preconditions_enabled=True),
-        SATISFIED_PRECONDITIONS_KEY: ["AppendFile", "AppendFile:wanted.py"],
-    }
-    ctx = _build_ctx(helpers)
+    state = RunScopedState(rc=LoopConstants(tool_preconditions_enabled=True), satisfied_preconditions=set(["AppendFile", "AppendFile:wanted.py"]))
+    ctx = _build_ctx(state)
     call = ToolCall(name="FinalizeFile", arguments={"path": "wanted.py"})
 
     _events, outcome = await _drain(dispatcher, tool_call=call, ctx=ctx)
@@ -220,26 +206,26 @@ async def test_satisfied_parameterised_precondition_dispatches() -> None:
 
 
 # ----------------------------------------------------------------------
-# Success path records satisfaction on the helper bag
+# Success path records satisfaction on the run state
 # ----------------------------------------------------------------------
 
 
 @pytest.mark.asyncio
 async def test_successful_dispatch_records_satisfaction() -> None:
-    """A successful call must store its (tool, path) on the helper bag."""
+    """A successful call must store its (tool, path) on the run state."""
     tool = PreconditionedTool(
         tool_name="AppendFile",
         preconditions=None,  # no preconditions for AppendFile itself
     )
     dispatcher = _build_dispatcher([tool])
-    helpers: dict[str, Any] = {"rc": RuntimeConstants(tool_preconditions_enabled=True)}
-    ctx = _build_ctx(helpers)
+    state = RunScopedState(rc=LoopConstants(tool_preconditions_enabled=True))
+    ctx = _build_ctx(state)
     call = ToolCall(name="AppendFile", arguments={"path": "doc.md"})
 
     _events, outcome = await _drain(dispatcher, tool_call=call, ctx=ctx)
 
     assert outcome.success
-    satisfied = load_satisfied_set(helpers)
+    satisfied = state.satisfied_preconditions
     assert "AppendFile" in satisfied
     assert "AppendFile:doc.md" in satisfied
 
@@ -256,8 +242,8 @@ async def test_record_then_check_sequence_works_end_to_end() -> None:
         preconditions=["AppendFile:{path}"],
     )
     dispatcher = _build_dispatcher([append, finalize])
-    helpers: dict[str, Any] = {"rc": RuntimeConstants(tool_preconditions_enabled=True)}
-    ctx = _build_ctx(helpers)
+    state = RunScopedState(rc=LoopConstants(tool_preconditions_enabled=True))
+    ctx = _build_ctx(state)
 
     # First: AppendFile records satisfaction.
     _evts1, outcome1 = await _drain(
@@ -286,8 +272,8 @@ async def test_record_then_check_different_path_blocks() -> None:
         preconditions=["AppendFile:{path}"],
     )
     dispatcher = _build_dispatcher([append, finalize])
-    helpers: dict[str, Any] = {"rc": RuntimeConstants(tool_preconditions_enabled=True)}
-    ctx = _build_ctx(helpers)
+    state = RunScopedState(rc=LoopConstants(tool_preconditions_enabled=True))
+    ctx = _build_ctx(state)
 
     await _drain(
         dispatcher,
@@ -319,10 +305,8 @@ async def test_disabled_via_runtime_constant_bypasses_check() -> None:
         preconditions=["AppendFile"],  # would fail with enforcement on
     )
     dispatcher = _build_dispatcher([tool])
-    helpers: dict[str, Any] = {
-        "rc": RuntimeConstants(tool_preconditions_enabled=False),
-    }
-    ctx = _build_ctx(helpers)
+    state = RunScopedState(rc=LoopConstants(tool_preconditions_enabled=False))
+    ctx = _build_ctx(state)
     call = ToolCall(name="FinalizeFile", arguments={"path": "x.py"})
 
     _events, outcome = await _drain(dispatcher, tool_call=call, ctx=ctx)
@@ -333,23 +317,21 @@ async def test_disabled_via_runtime_constant_bypasses_check() -> None:
 
 @pytest.mark.asyncio
 async def test_disabled_does_not_record_satisfaction() -> None:
-    """When disabled, the helper bag is NOT mutated on success."""
+    """When disabled, the run's satisfied set is NOT mutated on success."""
     tool = PreconditionedTool(
         tool_name="AppendFile",
         preconditions=None,
     )
     dispatcher = _build_dispatcher([tool])
-    helpers: dict[str, Any] = {
-        "rc": RuntimeConstants(tool_preconditions_enabled=False),
-    }
-    ctx = _build_ctx(helpers)
+    state = RunScopedState(rc=LoopConstants(tool_preconditions_enabled=False))
+    ctx = _build_ctx(state)
     call = ToolCall(name="AppendFile", arguments={"path": "x.py"})
 
     _events, outcome = await _drain(dispatcher, tool_call=call, ctx=ctx)
 
     assert outcome.success
-    # With enforcement off, no satisfied set should be persisted.
-    assert SATISFIED_PRECONDITIONS_KEY not in helpers
+    # With enforcement off, no satisfaction should be recorded.
+    assert state.satisfied_preconditions == set()
 
 
 # ----------------------------------------------------------------------
@@ -362,8 +344,8 @@ async def test_tool_without_preconditions_dispatches_normally() -> None:
     """Default tools (no preconditions field) must not be gated."""
     tool = PreconditionedTool(tool_name="Write", preconditions=None)
     dispatcher = _build_dispatcher([tool])
-    helpers: dict[str, Any] = {"rc": RuntimeConstants()}
-    ctx = _build_ctx(helpers)
+    state = RunScopedState(rc=LoopConstants())
+    ctx = _build_ctx(state)
     call = ToolCall(name="Write", arguments={"path": "x.py"})
 
     _events, outcome = await _drain(dispatcher, tool_call=call, ctx=ctx)
@@ -372,11 +354,11 @@ async def test_tool_without_preconditions_dispatches_normally() -> None:
 
 
 @pytest.mark.asyncio
-async def test_missing_helper_bag_does_not_break_dispatch() -> None:
-    """Legacy contexts without a helper bag still dispatch (no RC = enabled)."""
+async def test_a_context_without_run_state_does_not_break_dispatch() -> None:
+    """A context carrying no run state still dispatches (no RC = enabled)."""
     tool = PreconditionedTool(tool_name="Write", preconditions=None)
     dispatcher = _build_dispatcher([tool])
-    ctx = _build_ctx(helpers=None)
+    ctx = _build_ctx(state=None)
     call = ToolCall(name="Write", arguments={"path": "x.py"})
 
     _events, outcome = await _drain(dispatcher, tool_call=call, ctx=ctx)
@@ -397,8 +379,8 @@ async def test_precondition_failure_emits_tool_result_event() -> None:
         preconditions=["AppendFile"],
     )
     dispatcher = _build_dispatcher([tool])
-    helpers: dict[str, Any] = {"rc": RuntimeConstants(tool_preconditions_enabled=True)}
-    ctx = _build_ctx(helpers)
+    state = RunScopedState(rc=LoopConstants(tool_preconditions_enabled=True))
+    ctx = _build_ctx(state)
     call = ToolCall(name="FinalizeFile", arguments={"path": "x.py"})
 
     events, outcome = await _drain(dispatcher, tool_call=call, ctx=ctx)

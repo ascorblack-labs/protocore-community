@@ -22,10 +22,10 @@ It is, by design, a **universal product core**, not a benchmark harness:
   `tests/test_core_import_boundary.py`.
 - **Universal / multi-tenant.** No per-task, per-tenant-id, per-prompt, or
   scorer/rubric-shaped logic in any executable path. Every method is
-  tenant-scoped; tenant policy is injected (via `RuntimeConstants` and
+  tenant-scoped; tenant policy is injected (via `LoopConstants` and
   `ToolContext.metadata`), never hard-coded.
-- **Everything `RuntimeConstants`-configurable and default-safe.** Tunable
-  values flow through `RuntimeConstants` (a frozen Pydantic snapshot) or
+- **Everything `LoopConstants`-configurable and default-safe.** Tunable
+  values flow through `LoopConstants` (a frozen Pydantic snapshot) or
   `constants.py` (memory-safety caps). New capabilities default **off** or to a
   value that reproduces prior behaviour, so a tenant opts in deliberately.
 - **Horizontal-scale-safe.** No module-level dicts, no `asyncio` locks held as
@@ -48,22 +48,31 @@ layers above it.
 
 ### Public API (`protocore/__init__.py`)
 
-The public surface is **contract-first**: the re-exports are the 11 store /
-service interface `Protocol`s plus the `Tool` ABC — `IAgentDispatch`,
-`IBlobStore`, `IEventStream`, `IHookManager`, `ILLMProvider`, `IRunStore`,
-`ISearchIndex`, `ISessionStore`, `ISkillStore`, `IToolRegistry`, `ITodoStorage`,
-and `Tool`. (`IMemory`, `IWorkspace`, `IToolTransport`, and
-`IPromptTemplateProvider` live in their contract modules — `contracts/memory.py`,
-`contracts/workspace.py`, `contracts/resilience.py`, `contracts/prompts.py` — but
-are **not** top-level re-exports.) The surface also re-exports the core type
-system (`Message`, `ToolCall`, `ToolResult`, `Event`, `Run`, `Session`, the
-`ContentBlock` union, …), `RuntimeConstants` + `RuntimeConstantsProvider`,
-`EventBus`/`EventName`, the pluggy `HookManager`, `DefaultShellSafetyPolicy`, the
-`@tool` decorator, the envelope/JSON utilities, and the token-counting helpers
-(`LanguageProfile`, `chars_per_token`, `detect_profile`, `estimate_tokens`). It
-does **not** re-export `derive_budgets`, `retrieve_tools`, or `bm25_score` — those
-are imported directly from their runtime modules
-(`runtime/context/budgets.py`, `runtime/tool_retrieval.py`).
+The public surface is **contract-first**: the re-exports are the store /
+service interface `Protocol`s the host reaches for most, plus the `Tool` ABC —
+`IAgentDispatch`, `IBlobStore`, `IEventStream`, `IHookManager`,
+`ILifecycleRegistry`, `ILLMProvider`, `IRunStore`, `ISearchIndex`,
+`ISessionStore`, `ISkillStore`, `IToolRegistry`, `ITodoStorage`, and `Tool`.
+The rest of the 32 `Protocol`s are imported from their own contract module and
+are **not** top-level re-exports: `IMemory` (`contracts/memory.py`),
+`IWorkspace` (`contracts/workspace.py`), `IToolTransport` and
+`IResilienceClassifier` (`contracts/resilience.py`), `IPromptTemplateProvider`
+(`contracts/prompts.py`), `IWorkPool` (`contracts/background.py`),
+`IConstantsRegistry` and `ICoreConstantsProvider` (`contracts/config.py`),
+`IRequestManifestSink` (`contracts/observability.py`), `IProviderChain`
+(`contracts/llm.py`) and `ITurnPolicy` (`contracts/turn_policy.py`).
+The surface also re-exports the core type system (`Message`, `ToolCall`,
+`ToolResult`, `Event`, `Run`, `Session`, `SubagentDef`, the `ContentBlock`
+union, …), `LoopConstants` + `RuntimeConstantsProvider`, the lifecycle
+vocabulary (`RegistrationKind`, `LifecycleVerdict`, `LifecycleContext`,
+`LifecycleDecision`, `LifecycleOutcome`, `LifecycleScope`,
+`LifecycleDisposer`), `EventBus`/`EventName`, the lifecycle `HookManager`,
+`DefaultShellSafetyPolicy`, the `@tool` decorator, the envelope/JSON
+utilities, and the token-counting helpers (`LanguageProfile`,
+`chars_per_token`, `detect_profile`, `estimate_tokens`). It does **not**
+re-export `derive_budgets`, `retrieve_tools`, or `bm25_score` — those are
+imported directly from their runtime modules (`runtime/context/budgets.py`,
+`runtime/tool_retrieval.py`).
 
 The loop machinery (`runtime/query.py` + `runtime/query_engine.py`) is the heart
 of the runtime. The loop entry points are imported directly from
@@ -78,20 +87,28 @@ re-exported at the top level.
 
 ```
 ┌──────────────────────────────────────────────────────────────────────────────┐
-│ CONTRACTS / PROTOCOLS  (protocore/contracts/)                                   │
+│ CONTRACTS / PROTOCOLS  (protocore/contracts/ — 30 modules, 32 Protocols)        │
 │   types.py  (Message, ToolCall, ToolResult, ContentBlock union, Run, Session,   │
-│              ExecutionReport, StopReason, AgentEnvelope, …)                      │
-│   16 interface Protocols: llm.py ILLMProvider + IProviderChain · run.py          │
-│     IRunStore · session.py ISessionStore · blob.py IBlobStore ·                  │
-│     search.py ISearchIndex · todo.py ITodoStorage ·                              │
+│              ExecutionReport, StopReason, SubagentDef, AgentEnvelope, …)         │
+│   the host's adapters: llm.py ILLMProvider + IProviderChain · run.py             │
+│     IRunStore + IRunToolErrorCounter · session.py ISessionStore ·                │
+│     blob.py IBlobStore · search.py ISearchIndex · todo.py ITodoStorage ·         │
 │     tool_registry.py IToolRegistry · skills.py ISkillStore ·                     │
-│     agent_dispatch.py IAgentDispatch · events.py IEventStream ·                  │
-│     hooks.py IHookManager · memory.py IMemory · workspace.py IWorkspace ·        │
-│     resilience.py IToolTransport · prompts.py IPromptTemplateProvider            │
-│   runtime_constants.py  RuntimeConstants (frozen, extra="forbid") + Provider     │
-│   lean_tool_surface.py · references.py · terminal_answer_validation.py ·         │
-│   attempt_ledger.py · tool_action_preconditions.py · observability.py ·          │
-│   verification.py · tool_chunking.py                                             │
+│     agent_dispatch.py IAgentDispatch + IDelegationTool ·                         │
+│     background.py IWorkPool + IBackgroundTaskPool + WorkHandle ·                 │
+│     events.py IEventStream · hooks.py IHookManager ·                             │
+│     memory.py IMemory + IMemoryContentScanner · workspace.py IWorkspace ·        │
+│     resilience.py IToolTransport + IResilienceClassifier ·                       │
+│     prompts.py IPromptTemplateProvider · middleware.py ILifecycleRegistry ·      │
+│     observability.py CacheObserverProtocol + IRequestManifestSink ·              │
+│     config.py IConstantsRegistry + ICoreConstantsProvider                        │
+│   runtime_constants.py  LoopConstants (frozen, extra="forbid") + Provider        │
+│   config.py  ConstantSpec · ConstantGroup · group_from_model                     │
+│   turn_policy.py ITurnPolicy · ITurnState · TurnFlags · TurnCoordinate           │
+│   interrupt.py PendingInterrupt · InterruptResolution                            │
+│   run_state.py RunScopedState · tool_roles.py ToolRole + ToolRoleMap             │
+│   snapshot.py schema version + upcaster chain · attempt_ledger.py ·              │
+│   evidence.py · tool_chunking.py · tools.py Tool + ToolContext                   │
 └──────────────────────────────────────────────────────────────────────────────┘
                                      ▲ implemented by the host / consumed by runtime
 ┌──────────────────────────────────────────────────────────────────────────────┐
@@ -102,12 +119,16 @@ re-exported at the top level.
 │        open_intents · usage_rows · lanes · live_* · steer/follow-up queues ·    │
 │        verification · recovery latches ·                                        │
 │        snapshot()/resume_from_snapshot()  (any pod can resume)                  │
-│   query(engine)  (query.py) ── sync entry: _reset_per_turn_state() then          │
-│        returns an async iterator of TurnEvent (no turn-start/end snapshot)      │
-│   run() ── appends, snapshots, iterates _query_raw (not query())                │
+│   run(message) ── appends, snapshots, drives one turn of TurnEvent              │
+│   resume(engine, snapshot, ...) (query.py) ── restore + pick the drive:          │
+│        resolution map | approved tool call | arrived message | re-drive        │
+│   resume_approved_tool(engine, call) ── run one call held for approval          │
+│   resume_interrupts(engine, resolutions) ── answer every wait, in one drive     │
+│   build_llm_request(...) ── the one assembler every provider call goes through  │
+│   turn_policies/ ── the product decisions of a turn, in TURN_POLICY_ORDER       │
 │   loop_strategies.py ── DirectStrategy | DeepStrategy (run_mode)                │
-│   intent.py · usage_ledger.py · session_tree.py · lanes.py ·                    │
-│   typed_hooks.py · telemetry.py · correctness_bind.py ·                         │
+│   intent.py · usage_ledger.py · lanes.py · error_kinds.py ·                      │
+│   telemetry.py · correctness_bind.py · child_capabilities.py ·                   │
 │   compact_checkpoint.py · live_control.py · run_work_budget.py                  │
 │        LoopState (loop_state.py): PENDING→RUNNING→{AWAITING|COMPACTING}→         │
 │                                   {COMPLETED|FAILED|CANCELLED}                   │
@@ -117,12 +138,13 @@ re-exported at the top level.
 ┌───────────────┐ ┌────────────────┐ ┌──────────────────────┐ ┌────────────────┐
 │ TOOL SURFACE  │ │ TOOL DISPATCH  │ │ CONTEXT / COMPACTION  │ │ FINALIZATION   │
 │ + RETRIEVAL   │ │ + GATING       │ │ context/manager.py    │ │ + GROUNDING    │
-│ tool_registry │ │ tool_dispatch  │ │ context/budgets.py    │ │ finalization_  │
-│ tool_retrieval│ │ ToolDispatcher │ │ context/compaction.py │ │   gate.py      │
-│ tool_pool     │ │ tool_permission│ │ context/session_      │ │ finalization_  │
-│ lean surface  │ │   Gate (4 stg) │ │   memory.py           │ │   contract.py  │
-│ @tool decorat.│ │ tool_precondi- │ │ compact_checkpoint.py │ │ terminal_      │
-│               │ │   tions (DAG)  │ │ token_counting.py     │ │   payload_norm │
+│ tool_registry │ │ tool_dispatch  │ │ context/budgets.py    │ │ host-owned:    │
+│ tool_retrieval│ │ ToolDispatcher │ │ context/compaction.py │ │  the gate and  │
+│ @tool decorat.│ │ tool_permission│ │ context/session_      │ │  the contract  │
+│ tool_roles    │ │   Gate (4 stg) │ │   memory.py           │ │ core-owned:    │
+│  ToolRoleMap  │ │ tool_precondi- │ │ compact_checkpoint.py │ │  evidence.py · │
+│               │ │   tions (DAG)  │ │ token_counting.py     │ │  attempt_      │
+│               │ │                │ │                       │ │  ledger.py     │
 │               │ │ run_tool_pre-  │ │ prompt_caching.py     │ │                │
 │               │ │   conditions   │ │ json_utils strip-     │ │                │
 │               │ │   (run forcer) │ │   thinking            │ │                │
@@ -133,15 +155,17 @@ re-exported at the top level.
 │ MEMORY       │ │ WORKSPACE    │ │ RESILIENCE   │ │ SKILLS       │ │ HOOKS/EVENTS │
 │ contracts/   │ │ contracts/   │ │ contracts/   │ │ skill_index  │ │ events.py    │
 │   memory.py  │ │  workspace.py│ │  resilience  │ │ contracts/   │ │ runtime/     │
-│ tools/       │ │ read_dedup_  │ │ runtime/     │ │  skills.py   │ │  events/*    │
-│   memory.py  │ │  cache.py    │ │  resilience  │ │  list_files/ │ │ runtime/llm/ │
-│ (IMemory)    │ │ (IWorkspace) │ │ attempt_     │ │  load_file   │ │  delta_bridge│
-│              │ │              │ │  ledger ·    │ │  (host API)  │ │ hooks/       │
-│              │ │              │ │ adaptive_    │ │              │ │  manager,    │
-│              │ │              │ │  safety_band │ │              │ │  specs +     │
-│              │ │              │ │ run_work_    │ │              │ │ typed_hooks  │
-│              │ │              │ │  budget      │ │              │ │  PUBLISHED_  │
-│              │ │              │ │              │ │              │ │  HOOKS       │
+│ tools/       │ │ (IWorkspace) │ │  IToolTrans- │ │  skills.py   │ │  events/*    │
+│   memory.py  │ │ host-owned:  │ │  port +      │ │  list_files/ │ │ runtime/llm/ │
+│ (IMemory)    │ │  the store   │ │  IResilience-│ │  load_file   │ │  delta_bridge│
+│              │ │  and the     │ │  Classifier  │ │  (host API)  │ │ hooks/       │
+│              │ │  read-dedup  │ │ runtime/     │ │              │ │  manager +   │
+│              │ │  cache       │ │  resilience  │ │              │ │ middleware   │
+│              │ │              │ │ attempt_     │ │              │ │  contract    │
+│              │ │              │ │  ledger ·    │ │              │ │              │
+│              │ │              │ │ run_work_    │ │              │ │              │
+│              │ │              │ │  budget      │ │              │ │              │
+│              │ │              │ │              │ │              │ │              │
 └──────────────┘ └──────────────┘ └──────────────┘ └──────────────┘ └──────────────┘
         │                 │                 │                 │                 │
         ▼                 ▼                 ▼                 ▼                 ▼
@@ -149,33 +173,38 @@ re-exported at the top level.
 │ SAFETY  (protocore/safety/)  shell.py DefaultShellSafetyPolicy + deny patterns │
 │         + chain_parser.py (segment/substitution grammar)                       │
 ├──────────────────────────────────────────────────────────────────────────────┤
+│ CONFORMANCE  (protocore/conformance/, installed with protocore[testing])       │
+│   SUITES — one suite per contract, bound by the host to its own adapter        │
+├──────────────────────────────────────────────────────────────────────────────┤
 │ HOST-ADAPTER BOUNDARY  (lives in the host distribution — NOT core)            │
-│   LiteLLM/OpenAI-compat ILLMProvider · PgMemoryStore · IWorkspace store ·      │
-│   PostgresStateManager · sandbox-backed exec/file tools · ConnectRPC transport │
-│   · IHookManager adapter · RuntimeConstantsProvider (Postgres + Redis cache)   │
+│   an OpenAI-compatible ILLMProvider · a durable IMemory · an IWorkspace store  │
+│   · run/session persistence · sandbox-backed exec/file tools · a tool          │
+│   transport · an IHookManager adapter · a constants registry that declares     │
+│   the host's own groups and serves the loop snapshot                           │
 └──────────────────────────────────────────────────────────────────────────────┘
 ```
 
 ### Data flow of one agent turn
 
-`query(engine)` is a **sync** function: it calls `_reset_per_turn_state()` and
-returns an async iterator. Each inner `yield` from `_query_raw` is a stop-check
-checkpoint; the executor streams the emitted `TurnEvent`s out over SSE
-(Redis pub/sub at the host layer). `query()` does **not** persist
-turn-start or turn-end snapshots — `QueryEngine.run()` appends the user
-message, snapshots, then iterates `_query_raw` (not `query()`).
+`QueryEngine.run(message)` appends the user message, stamps the run clock,
+persists a turn-start snapshot and drives one turn; `resume(engine, snapshot)`
+restores a stored run first and then drives whichever continuation the caller
+described. Both bind the driving task so `stop()` can hard-cancel, and both
+persist a closing snapshot however they exit. Each inner `yield` from the
+private `_query_raw` generator is a stop-check checkpoint; the executor streams
+the emitted `TurnEvent`s out over SSE (Redis pub/sub at the host layer).
 
 ```
                        ┌─────────────────────────────────────────────┐
- caller: async for evt │  query(engine)  — sync reset, then iterator  │
-   in query(engine):   │  of TurnEvent (one already-prepared turn)    │
+ caller: async for evt │  run(message) / resume(engine, snapshot)     │
+   in engine.run(msg): │  — an async iterator of TurnEvent, one turn  │
                        └─────────────────────────────────────────────┘
                                           │
    (1) STOP CHECK ──────────────────────►│  stop_requested? → synthesize missing
                                           │   tool_results → CANCELLED
-        INTENT RECOVERY ─────────────────►│  resume_open_intents +
+        INTENT RECOVERY ─────────────────►│  settle interrupted tool intents +
                                           │   mark_intent_recovery (correctness_bind)
-        TYPED before_run ───────────────►│  fire_typed_hook → deny? → stop
+        LIFECYCLE run_start ────────────►│  fire_lifecycle → deny? → stop 
         MANUAL /compact ────────────────►│  CompactCheckpoint (RC-gated, default off)
    (2) COMPACTION CHECK ─────────────────►│  needs_compaction()?  ── yes ──┐
                                           │                                 ▼
@@ -228,7 +257,7 @@ message, snapshots, then iterates `_query_raw` (not `query()`).
    │   │ 4. preconditions DAG→masked? (post-gate) │ │    verify deliverables (stat) ·
    │   │ 5. execute tool.invoke(ctx)              │ │    terminal_answer_validation
    │   │ 6. post_tool_use hook                    │ │      (refs ⊆ reads, canonical)
-   │   │ → DispatchOutcome (success/err/approval) │ │    terminal_payload_normalize
+   │   │ → DispatchOutcome (success/err/approval) │ │
    │   │     ◄── read records grounding ref       │ │            │
    │   │     ◄── WORKSPACE read-dedup cache       │ │            ▼
    │   └─────────────────────────────────────────┘ │      MESSAGE_STOP → COMPLETED
@@ -236,8 +265,9 @@ message, snapshots, then iterates `_query_raw` (not `query()`).
    │  snapshot after every tool_result append       │ │
    │  loop back to (5): next assistant message       │ │
    └────────────────────┬───────────────────────────┘ │
-                        │  approval_required? → AWAITING (resume_approved_tool later)
-                        ▼  ask_user? → AWAITING (resume on user answer)
+                        │  approval_required? → PendingInterrupt(approval) → AWAITING
+                        ▼  ask_user? → PendingInterrupt(question) → AWAITING
+                           (resume(resolutions={id: InterruptResolution(...)}))
                   (recurse) stream next assistant message
 ```
 
@@ -254,16 +284,18 @@ Where the subsystems hook in:
 - **Resilience** wraps the outbound LLM call budget (AdaptiveSafetyBand) and is
   available as the universal `IToolTransport` wrapper for tool/VM calls
   (the host binds it).
-- **Hooks/events** fire at every lifecycle point (UserPromptSubmit, pre/post
-  tool, pre/post compact) and every provider delta becomes a `TurnEvent`.
-  When `typed_hooks_enabled` is on, `correctness_bind.fire_typed_hook` runs
-  `before_run` / `transform_context` / `before_compact` / `after_compact`.
-  `before_tool` / `after_tool` also require `intent_settlement_enabled`.
-  `transform_context` is fired but its `rewrite` is not applied to history.
-- **Intent settlement + usage ledger** (both default-off): when
-  `intent_settlement_enabled` is on, **every** dispatched tool commits an
-  `IntentRecord` (never-replay vs safe by `intent_never_replay_tools`);
-  interrupted never-replay intents are marked on turn start. Usage rows for
+- **The lifecycle seam and events** fire at every coordinate of a run (the
+  provider exchange, pre/post tool, the compaction transaction, run start and
+  finalization) and every provider delta becomes a `TurnEvent`.
+  When `typed_hooks_enabled` is on, `correctness_bind.fire_lifecycle`
+  dispatches every coordinate the loop passes through, and a `transform` at
+  `context_transform` is applied to the turn's context. One flag governs the
+  whole seam; no coordinate is hidden behind a second, unrelated one.
+- **Intent settlement + usage ledger**: **every** dispatched tool commits an
+  `IntentRecord` before the call, unconditionally, and a turn opens by closing
+  out any record a stopped run left in flight. `intent_settlement_enabled`
+  (default-off) gates only the recovery events and the ledger row on top of
+  that. Usage rows for
   `inference` / `retry` / `compaction` / `abort` / `fail` go through
   `commit_usage` when `usage_ledger_enabled` is on; a **tool**-kind row is
   written only on the intent-settlement dispatch path.
@@ -278,32 +310,40 @@ Where the subsystems hook in:
 One row per core technology. **Wired into loop?** = referenced by the core
 runtime loop (`query.py` / `query_engine.py`); subsystems wired only by 
 the host adapter are marked accordingly. **RC toggle(s) + default** records the
-governing `RuntimeConstants` field(s) and their safe/off default.
+governing `LoopConstants` field(s) and their safe/off default.
 
 | Technology | Core files | RC toggle(s) + default | Wired into loop? | Tested? |
 |---|---|---|---|---|
-| ReAct loop / orchestrator / query engine | `runtime/query.py`, `runtime/query_engine.py`, `runtime/loop_state.py`, `runtime/loop_strategies.py` | n/a (always on); `run_mode` = `"direct"`; recovery branches RC-gated | Yes | Yes |
-| Lean tool surface | `contracts/lean_tool_surface.py`, `tools/decorator.py` | `tool_surface_profile` = `"legacy"` | Yes | Yes |
+| ReAct loop / orchestrator / query engine | `runtime/query.py`, `runtime/query_engine.py`, `runtime/loop_state.py`, `runtime/loop_strategies.py` | n/a (always on); recovery branches RC-gated | Yes | Yes |
 | Tool dispatch + gating | `runtime/tool_dispatch.py`, `runtime/tool_permission.py` | gate always on; consecutive-error cap RC | Yes | Yes |
-| Tool retrieval / pool / registry | `runtime/tool_registry.py`, `runtime/tool_retrieval.py`, `runtime/tool_pool.py` | `tool_retrieval_top_k` (clip threshold) | Yes (registry/retrieval); `tool_pool` **no** | Yes |
-| Tool preconditions (three systems) | `runtime/tool_preconditions.py`, `contracts/tool_action_preconditions.py`, `runtime/run_tool_preconditions.py` | `tool_preconditions_enabled` = `False`; `tool_action_preconditions_mode` = `"off"`; run-level `QueryEngineConfig.tool_preconditions` empty | DAG + run-level forcer: Yes; action **spec**: host-only | Yes |
-| Universal resilience layer | `contracts/resilience.py`, `runtime/resilience.py` | `resilience_enabled` = `False`; `resilience_transport_max_attempts` = `1` | Ledger/band: Yes; transport wrapper: host-only | Yes |
+| Tool retrieval / registry | `runtime/tool_registry.py`, `runtime/tool_retrieval.py` | `tool_retrieval_top_k` (clip threshold) | Yes | Yes |
+| Tool preconditions | `runtime/tool_preconditions.py`, `runtime/run_tool_preconditions.py` | `tool_preconditions_enabled` = `False`; run-level `QueryEngineConfig.tool_preconditions` empty | DAG + run-level forcer: Yes | Yes |
+| Turn policies | `contracts/turn_policy.py`, `runtime/turn_policies/*` | each policy reads its own RC fields; the ORDER is core-owned (`TURN_POLICY_ORDER`) | Yes — the driver consults the registry at 14 coordinates | Yes |
+| Tool roles + argument spellings | `contracts/tool_roles.py`, `runtime/child_capabilities.py` | none — the map is `QueryEngineConfig.tool_roles`, declared by the host at registration | Yes | Yes |
+| Constants registry | `contracts/config.py` | the system itself (`ConstantSpec` / `ConstantGroup` / `IConstantsRegistry`) | Declaration + resolution: host-side; the loop reads the snapshot | Yes |
+| Snapshot schema + upcasters | `contracts/snapshot.py` | none — a schema is not a knob | Yes (every `snapshot()` / `resume_from_snapshot()`) | Yes |
+| Interrupts (approval / question / external call) | `contracts/interrupt.py`, `runtime/query.py::resume_interrupts` | none — a parked call is not opt-in | Yes | Yes |
+| Session work pool (background commands + child runs) | `contracts/background.py` | none in core; the pool is injected | Yes (`ensure_session_attached`, `drain_wakes`) | Yes |
+| Request manifest | `contracts/observability.py`, `runtime/query.py::build_llm_request` | none — a run records when `QueryEngineConfig.request_manifest_sink` is bound | Yes when a sink is bound | Yes |
+| Conformance suites | `protocore/conformance/*` | n/a (a test-time package, `protocore[testing]`) | No — the host runs them against its own adapters | Yes |
+| Universal resilience layer | `contracts/resilience.py`, `runtime/resilience.py` | `resilience_enabled` = `False`; the transport attempt count is a host knob | Ledger/band: Yes; transport wrapper: host-only | Yes |
+| Failure classification | `contracts/resilience.py::IResilienceClassifier`, `runtime/error_kinds.py` | none — the classifier is `QueryEngineConfig.resilience_classifier`; unbound means no wording is recognised | Yes | Yes |
 | Run wind-down (soft stop) | `runtime/soft_stop.py` | `soft_stop_enabled` = `True`, `soft_stop_max_turns` = `3` | Yes | Yes |
-| Attempt ledger + adaptive safety band | `contracts/attempt_ledger.py`, `runtime/adaptive_safety_band.py` | band wired via per-call output budget | Yes | Yes |
-| Finalization gate + contract | `runtime/finalization_gate.py`, `runtime/finalization_contract.py` | `terminal_tool_nudge_enabled` (`False`), `finalize_prose_gate_enabled` | Yes | Yes |
-| Terminal-answer validation + references/grounding | `contracts/terminal_answer_validation.py`, `contracts/references.py`, `runtime/terminal_payload_normalize.py` | `terminal_answer_validation_enabled`, `observed_ref_normalize_enabled`, normalize toggles (all `False`) | Yes | Yes |
-| IMemory subsystem | `contracts/memory.py`, `tools/memory.py` | `memory_enabled` = `False`, `memory_auto_recall_enabled` = `False` | Host-wired (tools held by core contract) | Yes |
-| IWorkspace + read-dedup cache | `contracts/workspace.py`, `runtime/read_dedup_cache.py` | `workspace_enabled` = `True` | **No** (host-wired) | Yes |
+| Attempt ledger + adaptive safety band | `contracts/attempt_ledger.py`, host-owned band | band wired via per-call output budget | Yes | Yes |
+| Finalization gate + contract | host-owned | `terminal_tool_nudge_enabled` (`False`), `finalize_prose_gate_enabled` | Yes | Yes |
+| Terminal-answer validation + references/grounding | host-owned (the core carries the evidence a run collects, `contracts/evidence.py`) | host knobs (validation and reference normalisation are both driven from the host's own model) | Yes | Yes |
+| IMemory subsystem | `contracts/memory.py`, `tools/memory.py` | `memory_enabled` = `False`; auto-recall is a host knob | Host-wired (tools held by core contract) | Yes |
+| Token counting | `runtime/token_counting.py` (+ the optional `protocore-native` estimator) | `chars_per_token_*` ratios in RC; `PROTOCORE_DISABLE_NATIVE` forces the pure-Python path | Yes | Yes |
+| IWorkspace + read-dedup cache | `contracts/workspace.py`, host-owned cache | n/a (no snapshot toggle; the host owns the surface) | **No** (host-wired) | Yes |
 | Context management / two-tier compaction / session memory | `runtime/context/manager.py`, `runtime/context/compaction.py`, `runtime/context/budgets.py`, `runtime/context/session_memory.py`, `runtime/compact_checkpoint.py` | ratios in RC; `compaction_manual_enabled` = `False` | Compaction + `/compact`: Yes; session-memory fold: host-wired | Yes |
-| Token counting / language profiles | `runtime/token_counting.py` | `chars_per_token_*` ratios in RC | Yes | Yes |
-| Prompt caching | `runtime/prompt_caching.py` | `prompt_cache_wire_enabled` = `True` (kill-switch) | Yes (hints in core; wire translation the host) | Yes |
+| Prompt caching | `runtime/prompt_caching.py` | wire translation gated by a host kill-switch | Yes (hints in core; wire translation the host) | Yes |
 | Skills routing / surfacing | `runtime/skill_index.py`, `contracts/skills.py` | data-driven (empty store = no block); `skills_hot_reload_enabled` = `False` | Yes (`_ensure_run_skill_catalog`); `list_files`/`load_file` host-only | Yes |
-| Hooks (pluggy) + typed hooks + injection / context_bootstrap | `hooks/manager.py`, `hooks/specs.py`, `runtime/typed_hooks.py`, `runtime/correctness_bind.py` | `judge_failure_mode`, `context_bootstrap_enabled` = `False`, `typed_hooks_enabled` = `False` | Core pluggy manager: exported but **the host `IHookManager` drives the loop**; typed `PUBLISHED_HOOKS` default-off; `before_tool`/`after_tool` also need `intent_settlement_enabled` | Yes |
+| The lifecycle seam + injection / context_bootstrap | `contracts/middleware.py`, `hooks/manager.py`, `runtime/correctness_bind.py` | `typed_hooks_enabled` = `False`; judge failure mode and context bootstrap are host knobs | One seam, five registration kinds, one coordinate list (`HookEvent`); `decide`/`transform`/`around` fail closed, `observe`/`notify` are isolated | Yes |
 | Events / observability / streaming | `events.py`, `runtime/events/*`, `runtime/llm/delta_bridge.py`, `runtime/telemetry.py` | `telemetry_spans_enabled` = `False` | Yes | Yes |
-| Intent / usage ledger / session tree / lanes | `runtime/intent.py`, `runtime/usage_ledger.py`, `runtime/session_tree.py`, `runtime/lanes.py` | `intent_settlement_enabled`, `usage_ledger_enabled`, `session_tree_enabled`, `lanes_enabled` (all `False`) | Intent + ledger: Yes when on; tree/lanes: host-invoked | Yes |
+| Intent / usage ledger / session tree / lanes | `runtime/intent.py`, `runtime/usage_ledger.py`, host-owned session tree, `runtime/lanes.py` | `intent_settlement_enabled`, `usage_ledger_enabled`, `lanes_enabled` (all `False`); the session tree is a host knob | Intent + ledger: Yes when on; tree/lanes: host-invoked | Yes |
 | Live control + run work budget | `runtime/live_control.py`, `runtime/run_work_budget.py` | `steer_follow_up_enabled` = `False`; tree token/run caps | Yes | Yes |
 | Safety (shell policy + chain parser) | `safety/shell.py`, `runtime/chain_parser.py` | policy stack via `register_policy` | Yes | Yes |
-| RuntimeConstants system | `contracts/runtime_constants.py`, `runtime/runtime_constants.py`, `constants.py` | the system itself | Yes | Yes |
+| LoopConstants system | `contracts/runtime_constants.py`, `runtime/runtime_constants.py`, `constants.py` | the system itself | Yes | Yes |
 
 A cross-cutting fact: **most new capabilities are default-off** and have no
 exercise on the default tenant, so their *enabled* paths are covered by unit
@@ -314,13 +354,12 @@ capabilities.
 
 ## Per-technology sections
 
-The per-subsystem tour below is the deep reference for each inventory row.
-The ReAct loop, lean surface, dispatch, retrieval, preconditions, resilience,
-attempt ledger, finalization, grounding, memory, workspace, compaction,
-pairing repair, and RuntimeConstants sections are unchanged in behaviour
-from the code they name; the next sections correct the skill-catalog
-wiring and the default-off intent / ledger / tree / lanes / typed-hooks /
-telemetry surfaces a new engineer would otherwise miss.
+The tour below is the deep reference for the inventory rows that need more
+than a row. Rows it does not expand — retrieval, the precondition DAG, the
+resilience wrapper, the attempt ledger, memory, workspace, two-tier
+compaction, token counting and prompt caching — behave as the files the table
+names, and repeating them here is how a second description comes to disagree
+with the first.
 
 ### ReAct loop / orchestrator / query engine / loop state
 
@@ -367,31 +406,77 @@ crashes. The shared assistant loop is **not** a single immutable path:
     appends the user message (or continues against an existing user-final
     history), increments `turn_count`, resets per-turn state, stamps the run
     clock, persists a turn-start snapshot, binds `_current_turn_task`, then
-    iterates `_query_raw` (not `query()`). A turn-end snapshot lands in
-    `finally`.
-- `runtime/query.py` (11517 lines) — `query(engine)` is a **sync** function.
-  It is deliberately not an async generator: it calls
-  `_reset_per_turn_state()` at the call site and **returns**
-  `_projected_turn_events`, which iterates `_query_raw` and applies the public
-  delivery boundary. A turn driven through `query()` has no cross-pod resume
-  point and does not bind `_current_turn_task`. `_query_raw` implements the
-  turn lifecycle: stop check → resume interrupted intents → typed
-  `before_run` → optional `/compact` via `CompactCheckpoint` → compaction
+    iterates `_query_raw`. A turn-end snapshot lands in `finally`. Both the
+    handle binding and that closing snapshot come from `driving_turn()`, the
+    scope every public drive runs inside, so the two obligations that make a
+    drive interruptible and resumable are owned in one place.
+- `contracts/interrupt.py` — what a paused run is waiting for, as a value
+  rather than a latch. `PendingInterrupt(interrupt_id, kind, tool_call_id,
+  tool_name, payload, created_at_ms, expires_at_ms)` carries one wait;
+  `InterruptKind` says which of three it is (`approval` — a call parked at a
+  gate that has NOT run; `question` — a call that ran far enough to ask and
+  whose answer is its result; `external_call` — a result arriving by another
+  route), and the kind decides which decisions are legal. The engine holds
+  however many are open at once, in park order, and writes them to the
+  snapshot; `LoopState.AWAITING` with none of them recorded is refused at the
+  transition (`loop_state.assert_awaiting_is_witnessed`), because it is a run
+  that stops with nothing that could resume it. `InterruptResolution` is one
+  decision — `approve` (optionally with `updated_input`, the corrected
+  arguments the call is then really run and recorded with), `deny`, `answer`,
+  `abandon` — and `plan_resolution` refuses a map that names a wait that is not
+  open, answers a kind that does not take that decision, or leaves an open
+  interrupt undecided without saying so.
+- **Idempotency of the code before an interrupt.** A parked call resumes
+  exactly where it stopped: nothing before the interrupt is re-executed, so
+  no work between the turn's start and the park is repeated. What a resumed
+  run must not do is re-issue the parked call itself, and that is what the
+  durable intent record (`runtime/intent.py`) prevents — a record in
+  `PENDING_APPROVAL` is a call that never ran, one in `PAUSED_ASK_USER` is a
+  call whose answer is still owed, and `intent_never_replay_tools` names the
+  tools whose repeat is unacceptable whatever the record says. The two are one
+  guarantee read from two sides: the interrupt says what is being waited for,
+  the intent says what may be done about it.
+- `runtime/query.py` — `resume(engine, snapshot, *, approved_tool_call=None,
+  message=None, abandon_approval=False, resolutions=None,
+  allow_partial_resolution=False)` is the public resume entry: it
+  restores the snapshot strictly (schema, delivery mode and identity binding
+  settled before the first mutation), then drives the resolution map, the
+  approved call, the arrived message, or a plain re-drive of the interrupted
+  turn — whichever the caller's arguments describe. `resolutions` is the
+  general form and the only one that can answer a batch: several calls parked
+  together are answered in ONE drive, each with its own decision, and their
+  results land in the order the model asked for them. A run with anything
+  parked refuses a plain re-drive; `abandon_approval=True` closes every parked
+  call as never answered.
+  `resume_interrupts` is that drive on its own, for a caller that has already
+  restored the run. `resume_approved_tool` executes one call held for
+  approval, verified against the durable pending call and idempotent on
+  replay; both run inside `driving_turn()` too. `_query_raw` implements the
+  turn lifecycle: stop check → resume interrupted intents → the
+  `run_start` coordinate → optional `/compact` via `CompactCheckpoint` → compaction
   check → UserPromptSubmit hook → build context → `select_strategy(run_mode).prepare_turn`
   → `_stream_one_assistant_message` (recursive on tool_use) → dispatch →
   finalize. Recovery is broader than the 413 / max-output / thinking-trap /
   empty-nudge / idle-watchdog set: the turn also resumes interrupted intents,
-  fires typed `before_run`, handles `/compact` via `CompactCheckpoint`, and
+  fires the `run_start` coordinate, handles `/compact` via `CompactCheckpoint`, and
   binds usage/hooks through `runtime/correctness_bind.py`
-  (`commit_usage`, `fire_typed_hook`, `mark_intent_recovery`,
+  (`commit_usage`, `fire_lifecycle`, `mark_intent_recovery`,
   `persist_correctness`). Those older recovery branches remain model-agnostic
   and RC-gated.
 - `runtime/loop_strategies.py` — `select_strategy(run_mode)` is the single
   branch point. `DirectStrategy` contributes no pre-action step (the
-  auto-tool loop). `DeepStrategy` runs a forced `Plan` tool (native
-  `tool_choice` + CoT bounded by `reasoning_effort`), emits exactly one
+  auto-tool loop). `DeepStrategy` runs a forced planning tool
+  (`extra["forced_tool_choice"]` on the request, CoT bounded by
+  `reasoning_effort`), emits exactly one
   `REASONING_STEP` event, then the shared assistant loop drives the real
   action with the full surface.
+- `runtime/query.py::build_llm_request` — the one assembler every provider
+  call passes through: the action stream, the deep loop's plan call, its
+  prompted-JSON fallback and the Tier-2 compaction summariser. It fixes the
+  three things those four used to settle separately — the model in force (the
+  live override when one is set), the forced tool (one slot,
+  `extra["forced_tool_choice"]`, carrying the tool NAME for an adapter to
+  render onto its own wire) and the temperature (stated on every request).
 - `runtime/loop_state.py` — `LoopState` is a pure 7-state machine:
   `PENDING → RUNNING → {AWAITING | COMPACTING} → {COMPLETED | FAILED |
   CANCELLED}`. `assert_transition()` enforces the legal-edge table;
@@ -401,22 +486,26 @@ crashes. The shared assistant loop is **not** a single immutable path:
 
 **How invoked/wired.** The host executor constructs a `QueryEngine` on
 run admission, then typically `async for evt in engine.run(message)` per turn
-(or `async for evt in query(engine)` after the caller has already seeded
-history). Each `TurnEvent` is forwarded to the SSE bridge. The loop is the
+(or `async for evt in resume(engine, snapshot)` when it is picking a run back
+up). Each `TurnEvent` is forwarded to the SSE bridge. The loop is the
 single consumer of every other subsystem.
 
 **RC configurability.** `max_turns_per_run`, `agent_max_seconds` (wall-clock
 deadline; `<= 0` = inert), the idle/stall watchdog timeouts, and every recovery
-toggle are RC fields. `model_name` is required (no baked-in default).
-`agent_loop_default_mode` is the tenant default for `run_mode`.
+toggle are RC fields. `model_name` is required (no baked-in default). The run's
+mode is not a snapshot field: `QueryEngineConfig.run_mode` carries it per run
+and defaults to `"direct"`, so a host that wants a tenant-wide default declares
+that knob in its own constant group and passes the resolved value in.
 
 **Extension protocol.** Do **not** edit the loop structure. Customise via (a)
-hooks (including typed `PUBLISHED_HOOKS`), (b) `QueryEngineConfig` injected
-callables/observers/`run_mode`/`tool_preconditions`/`provider_chain`, (c) RC
-toggles, (d) `system_prompt_sections`.
+lifecycle registrations, (b) a turn policy substituted into
+`QueryEngine.turn_policies` by name, (c) `QueryEngineConfig` injected
+callables/observers — `run_mode`, `tool_preconditions`, `provider_chain`,
+`tool_roles`, `resilience_classifier`, `request_manifest_sink`, (d) RC toggles,
+(e) `system_prompt_sections`.
 
 **Terminal-classification notes.** Three terminal-classification behaviours are
-worth calling out: (1) `query()` re-checks `stop_requested` after streaming and
+worth calling out: (1) the loop re-checks `stop_requested` after streaming and
 routes a cancelled run to CANCELLED (not a clean end-turn); (2)
 `_synthesize_missing_tool_results` is called at every teardown checkpoint so a
 persisted snapshot is always pairing-valid (see
@@ -426,17 +515,167 @@ is classified as a resource-**exhaustion** terminal — it keeps
 `stop_reason=max_turns` on the wire and is treated as an error/non-success class,
 not a clean `COMPLETED`.
 
-### Lean tool surface through pairing repair
+### Turn policies — where a product decision about a turn lives
 
-The lean 7-verb surface, dispatch + 4-stage permission gate, 3-layer
-registry/retrieval, three non-interacting precondition systems, resilience
-transport wrapper, attempt ledger + adaptive safety band, finalization gate,
-terminal-answer validation / `normalize_ref`, IMemory, IWorkspace + read-dedup,
-two-tier compaction + `CompactCheckpoint` + session-memory fold, token
-counting, prompt-cache `system_and_3` hints, and `_repair_outbound_tool_pairing`
-/ `_synthesize_missing_tool_results` are documented in the inventory table
-above and implemented in the files that table names. They are not repeated
-here. Continue at [Skills routing / surfacing](#skills-routing--surfacing).
+**What & why.** The driver of one assistant turn does two jobs. One is
+**mechanics**: open a stream, translate deltas into events, dispatch the calls
+the model asked for, close the round. The other is **policy**: decide that this
+run has spent its budget, that an empty answer earns one more try, that a file
+left half-written must be sealed before the run may finish. Mechanics is the
+same for every run; policy is a product opinion, and every opinion ever added
+to the loop was added by growing a branch inside it. The turn-policy seam is
+what stops that: a policy is an object, it declares the coordinates it wants to
+be consulted at, and it answers with events to forward plus one directive.
+
+**Key classes/files.**
+
+- `contracts/turn_policy.py` — `ITurnPolicy` (a `name`, the `coordinates` it
+  registers at, and one `apply(turn)` that yields the events the loop forwards
+  and writes what happens next to `turn.outcome`), `TurnContext`, `ITurnState` (a deliberately small
+  structural view of the run a policy may read and change — a policy that needs
+  something not named there is reaching into the loop's insides, and the review
+  that adds the name is where that gets noticed), `TurnFlags` (the turn-local
+  state policies share with the loop, which used to be bare locals of one very
+  long function), `TurnCoordinate` (`turn_start`, `turn_budget`,
+  `empty_model_turn`, `output_truncated`, `stream_failed`, `turn_end`,
+  `stream_settled`, `tool_calls_ready`, `finish_nudge`, `answer_floor`,
+  `voluntary_finish`, `terminal_tool_finish`, `iteration_end`,
+  `cancel_checkpoint`), `TurnDirective` (`proceed` / `restart_turn` /
+  `end_turn`) and `TurnPolicyOutcome`.
+- `runtime/turn_policies/` — one module per decision: `longfile.py`,
+  `run_ceilings.py`, `empty_model_turn.py`, `truncated_tool_call.py`,
+  `output_cap.py`, `terminal_nudge.py`, `answer_floor.py`,
+  `empty_completion.py`, `terminal_tool_finish.py`, `compaction.py`,
+  `repeat_guard.py`, `sibling_walk.py`, `provider_failure.py`,
+  `cancellation.py`.
+- `runtime/turn_policies/__init__.py` — `TurnPolicyRegistry` and
+  `TURN_POLICY_ORDER`.
+
+**The order is the core's.** `TURN_POLICY_ORDER` declares it once, and a name
+absent from that tuple is refused at construction (`UnknownTurnPolicyError`)
+rather than silently running last. The order matters where two policies meet —
+an unsealed file is sealed *before* the guard that asks whether the turn
+produced an answer, because sealing produces one — and an order taken from
+whichever list a host happened to build would make that a coincidence. A
+registry consults, in order, every policy registered at the coordinate and
+stops at the first that answers anything but `proceed`; a policy that has taken
+the turn elsewhere is never followed by one assuming it did not. A seam that
+cannot obey a directive says so (`UnsupportedTurnDirectiveError`) instead of
+dropping it.
+
+**How wired.** `QueryEngine.turn_policies` is `None` for the core's own set.
+A host or a test that installs its own set assigns one there, per run, and it
+is **merged by name** rather than put in place: a policy replaces the core
+policy answering to the same name, and every bound nobody named stays where it
+is. `runtime/error_kinds.py::INTERNAL_ERROR_KIND` is read from both sides of
+this seam, which is why it is a module of its own — "the loop crashed" must not
+have a second spelling on the policy's side.
+
+### The run snapshot: schema version and upcasters
+
+**What & why.** A snapshot is written by one process and read by another, and
+the two are not guaranteed to be the same build. A reader that quietly accepts
+a payload it does not understand does not fail — it resumes with fields
+missing, latches unset and budgets refilled, and nothing downstream can tell
+that apart from a run that legitimately had none of those things. The failure
+surfaces much later, as an agent repeating work it already did or spending an
+allowance it already spent.
+
+**Key names (`contracts/snapshot.py`).** `SNAPSHOT_SCHEMA_KEY` is where the
+version lives in the payload; `SNAPSHOT_SCHEMA_VERSION` is what this build
+writes. A payload with no version field at all is read as version 1 — version 1
+is exactly the shape the field was added on top of. Anything the build cannot
+recognise is refused with `SnapshotSchemaError`, and refusing is the
+recoverable outcome: the run stays where it was and an operator sees why.
+
+**Upcasters.** An older payload is not refused where it can be brought forward
+instead: one registered `SnapshotUpcaster` per version, each reading the shape
+one below it and filling in what that version introduced. A version with no
+step is a refusal, because skipping one leaves its fields unset — the same
+silent half-restore. Two payload keys are named by the module rather than
+spelled at each reader: `RUN_SCOPED_STATE_SNAPSHOT_KEY` (the tree's cumulative
+work ledger and its concurrency capacity — the two allowances a resumed run
+must not be handed twice) and `PENDING_INTERRUPTS_SNAPSHOT_KEY`.
+
+**RunScopedState.** `contracts/run_state.py` holds the cross-call allowances a
+run carries — the streaks the dispatcher counts, the tree work ledger, the
+cancel event, the locks, the satisfied preconditions — as one typed object
+instead of an untyped dictionary threaded through `ToolContext.metadata` under
+an agreed string. A field that moves is a type error at the reader; a host
+wiring its own slots keeps them in `RunScopedState.host`, one opaque
+compartment, so core never has to know what a host puts there.
+`RunScopedState.to_snapshot()` states exactly the two durable allowances and
+`apply_snapshot()` puts them back — live objects (an `asyncio.Event`, a
+semaphore, a lock) are per-process by nature and are rebuilt by whoever wires
+the resumed run. `ToolContext` was narrowed to match: `tenant_id`, `run_id`,
+`session_id`, `work_scope`, optional `evidence`, optional `run_state`, and
+`metadata` for whatever is left.
+
+### Dispatch: roles, the canonical result, and pairing repair
+
+**What & why.** Dispatch turns one `ToolCall` into one `ToolResult` and puts
+it in history. Three things about it are worth stating on their own, because
+each replaced a rule the core used to keep in its own head.
+
+**Roles, not names.** The runtime has to know the KIND of a call — did it
+produce bytes on disk, does it discharge a read-back obligation, does the
+permission gate owe it a shell-safety check. That used to be a comparison
+against a tool NAME spelled inside the core, which assumed every installation
+names its tools the way the first one did. `contracts/tool_roles.py` replaces
+it: `ToolRole` is the capability (`reads_path`, `writes_path`, `appends_path`,
+`edits_path`, `finalizes_path`, `searches_workspace`, `runs_shell`,
+`fetches_url`, `delegates_work`, `records_plan`, `discovers_tools`,
+`asks_user`, `never_delegated`), and `ToolRoleMap` — passed in as
+`QueryEngineConfig.tool_roles` — is the host's declaration of which of ITS
+names carry which of them, together with the ARGUMENT spellings that go with
+them (which key holds the shell command, which holds the body of a write,
+which holds a terminal answer). A role the map does not mention is a
+capability this installation does not have, and the feature that needs it says
+so in a warning rather than going quietly inert.
+`runtime/child_capabilities.py::narrow_child_capabilities` reads the same map
+to compute what a delegated run may do: narrowing only, never widening, and
+applied twice — once when the child's catalogue is resolved and again on each
+of the child's calls, so the advertised surface and the gate cannot disagree.
+
+**One value, three audiences.** `ToolResult.content` is the canonical value —
+complete, whatever its size — and the projections sit beside it rather than
+replacing it. `model_projection` is what the transcript carries in place of the
+content when the whole of it does not belong there; `ui_payload` rides the
+result event and never enters the transcript at all, so it costs no tokens and
+cannot change what the model decides; `canonical_ref` says where the whole
+value can be fetched back from once the transcript no longer holds it.
+`ToolResult.model_content` is what every path that builds a `ToolResultBlock`
+reads, so a tool that names no projection is unaffected. A tool that serves
+all three audiences out of one string is why truncating a transcript used to
+destroy evidence: there was nothing to truncate but the only copy.
+
+**Durable intent before the call.** Every dispatched call commits an
+`IntentRecord` (`runtime/intent.py`) BEFORE the tool is touched, with its
+result ids reserved, so a run that dies mid-flight can be told apart from one
+that never started — see
+[Intent, usage ledger, …](#intent-usage-ledger-session-tree-lanes-typed-hooks-telemetry-live-control-run-work-budget).
+
+**Pairing repair (`runtime/query.py`).** Providers reject a request whose
+assistant `tool_use` has no matching `tool_result` — or that carries an
+orphaned result, or duplicate ids — with a 400. Pairing is therefore
+guaranteed at the wire boundary as defence in depth, not assumed correct from
+the mutators upstream of it (compaction, resume from a partial batch,
+truncation at `max_tokens`, teardown).
+
+- `_repair_outbound_tool_pairing(messages, placeholder)` — a **pure**,
+  unconditional backstop over the outgoing message list, run immediately
+  before the request is assembled (and before cache breakpoints are computed,
+  so indices address the final list). Four repairs: forward-fill synthetic
+  `is_error` results for orphaned `tool_use` blocks, reposition every real
+  result directly after its `tool_use`, reverse-strip orphaned results,
+  de-duplicate repeated ids.
+- `_synthesize_missing_tool_results(history, error_content)` — mutates history
+  in place at **every teardown checkpoint** (stop-before-start,
+  compaction-failed, lifecycle deny, stop-after-stream, dispatch-cancel, LLM
+  terminal error), so the persisted snapshot stays pairing-valid and ordered
+  for a resume on another pod. Idempotent.
+
+**Prompt templates.** `tool_result_pairing_repair`, `tool_result_interrupted`.
 
 ### Skills routing / surfacing
 
@@ -479,49 +718,55 @@ catalog.
 rebuilds the catalog on every `_ensure_run_skill_catalog` call. Implement
 `ISkillStore`; there is no ranker to implement.
 
-### Hooks (pluggy) + injection / scratchpad + context_bootstrap
+### The lifecycle seam + injection / scratchpad + context_bootstrap
 
-**What & why.** Extensibility seam: deny/modify/observe at every lifecycle
-point, without touching the loop. Plus an optional turn-1 **context bootstrap**
-that reads the environment's own contract/readme docs and prepends a frozen
-`<environment_context>` orientation message.
+**What & why.** One extension seam: observe, decide, transform, or wrap
+behaviour at every coordinate of a run, without touching the loop. Plus an
+optional turn-1 **context bootstrap** that reads the environment's own
+contract/readme docs and prepends a frozen `<environment_context>` orientation
+message.
 
-**Key classes/files.** `hooks/specs.py` — `AgentHookSpecs`: **8 pluggy
-hookspecs** (`pre_tool_use`, `post_tool_use`, `user_prompt_submit`,
-`session_start`, `session_end`, `pre_compact`, `post_compact`, `file_changed`).
-`hooks/manager.py` — `HookManager` (the in-process pluggy registry + aggregator).
-`contracts/hooks.py` — the cross-pod `IHookManager` contract, `HookResult`,
-`HookActionKind`, `HookSpec`.
-`runtime/typed_hooks.py` — `PUBLISHED_HOOKS` (`before_run`, `before_tool`,
-`after_tool`, `transform_context`, `before_compact`, `after_compact`) plus
-`HookRegistry` / `dispatch_hook`. The host re-exports this published set
-(for example the session-correctness route lists `PUBLISHED_HOOKS`).
-`runtime/correctness_bind.py` is the glue that fires typed hooks and commits
-usage from `_query_raw`.
+**Key classes/files.** `contracts/middleware.py` — the contract:
+`RegistrationKind` (`observe` / `decide` / `transform` / `around` / `notify`),
+`LifecycleVerdict`, `LifecycleContext`, `LifecycleDecision`,
+`LifecycleOutcome`, `LifecycleScope`, `LifecycleDisposer`, and the
+`ILifecycleRegistry` Protocol. `contracts/types.py::HookEvent` — the one list of
+coordinates. `hooks/manager.py` — `HookManager`, the core's in-process
+implementation: order (priority, then registration), per-registration timeout,
+the exception policy, and cancellation that is never read as a verdict.
+`contracts/hooks.py` — the out-of-process `IHookManager` contract, `HookResult`,
+`HookActionKind`, `HookSpec`. `runtime/correctness_bind.py::fire_lifecycle` is
+the loop's single call into the seam.
 
-**How wired (important).** The **core pluggy `HookManager` is exported but does
-not drive the loop.** The loop's `engine.hooks` is typed `IHookManager` and
-calls a **3-arg** `invoke(event, payload, tenant_id)` — production hooks run via
-the host `IHookManager` adapter. The pluggy manager is constructed mainly
-in tests. Also note a contract gap: `HookEvent` enumerates 10 events but
-`AgentHookSpecs` declares only 8 (no `subagent_start`/`subagent_stop`), so those
-two can never fire through the core pluggy manager.
+**How wired.** The registry reaches the engine at construction
+(`QueryEngine(..., lifecycle_hooks=...)`) and runs when `typed_hooks_enabled`
+is on — one switch over the whole seam, no coordinate gated behind an
+unrelated one. `_drive_turn` and the tool dispatch fire `run_start`,
+`turn_start`, `context_transform`, `request_prepare`, `response_received`,
+`request_error`, `turn_end`, `pre_tool_use`, `tool_execute`, `post_tool_use`,
+`pre_compact`,
+`compaction_commit`, `compaction_rollback`, `post_compact` and `run_finalize`.
+A `transform` at `context_transform` is **applied**: the turn's provider
+request is rebuilt from what the chain returned.
 
-Typed hooks are a **second** production surface: when `typed_hooks_enabled` is
-on and `engine.typed_hook_registry` is set, `fire_typed_hook` runs the
-matching published handler. Default-off — no registry, no-op allow.
-`before_run`, `transform_context`, `before_compact`, and `after_compact`
-fire from that flag alone. `before_tool` and `after_tool` are nested inside
-the `intent_settlement_enabled` dispatch branch — they do not run if only
-the typed-hooks flag is on. `transform_context` is fired (and a `hook_fired`
-event may be yielded) but its `rewrite` outcome is **not** applied to history.
+The host's `IHookManager` is the same seam reached from another process — an
+HTTP endpoint or a model asked to judge. The loop drives it at the permission
+gate (`runtime/tool_permission.py`) and around dispatch
+(`runtime/tool_dispatch.py`), and it maps `HookActionKind` onto the same
+verdicts.
 
-**RC/extension.** `judge_failure_mode` (LLM-judge hook fail-open/closed),
-`judge_timeout_ms`; `context_bootstrap_enabled` (default `False`),
-`context_bootstrap_docs`, `context_bootstrap_tree_depth`;
-`typed_hooks_enabled` (default `False`), `typed_hooks_timeout_ms`. Register an
-`IHookManager` implementation (the host), pluggy `hookimpl`s, or handlers
-on `HookRegistry` for the published typed names.
+**Exception policy, and why it is split.** `decide`, `transform` and `around`
+fail **closed**: a handler that raises, overruns its `timeout_s`, or answers
+with something that is not a decision produces a `deny` naming its owner. A
+stage that exists to say whether something may happen has not said yes when it
+crashes. `observe` and `notify` fail **isolated**: the failure is logged and
+recorded in `LifecycleOutcome.failures`, and the verdict, the payload and the
+sibling registrations are untouched.
+
+**RC/extension.** `typed_hooks_enabled` (default `False`). The judge hook's
+failure mode and deadline, and the context-bootstrap settings, are read by the
+surrounding layer and declared there. Extend by registering on the seam with an
+owner, a scope, and a disposer, or by implementing `IHookManager` in the host.
 
 ### Events / observability / streaming
 
@@ -543,18 +788,46 @@ on `HookRegistry` for the published typed names.
   `follow_up_queued`, `queue_update`), live-control
   `model_changed`/`thinking_changed`, and candidate-verification events
   (`candidate_ready`, `verification_started`, `verification_reported`,
-  `repair_requested`, `release_decided`, `candidate_released`). Each value is
-  the `event:` line surfaced to SSE clients.
+  `repair_requested`, `release_decided`, `candidate_released`), and
+  `interrupt_parked` — emitted whenever the run records something it is waiting
+  for, carrying that interrupt's id, kind and tool call, so a host learns WHAT
+  the run stopped on at the moment it stops rather than by reading the snapshot
+  back. Each value is the `event:` line surfaced to SSE clients.
 - `runtime/events/envelope.py` — `TurnEvent` (the frozen wire envelope).
 - `runtime/llm/delta_bridge.py` — translates a provider's stream into
   `ProviderDelta` → `TurnEvent` (`_normalise_finish_reason`, `is_block_end`,
   …).
-- `contracts/observability.py` — `CacheObserverProtocol` (the optional
-  prompt-cache hit-rate sink injected via `QueryEngineConfig.cache_observer`).
+  Tool-transport events (`tool_transport_starting`, `tool_transport_ready`,
+  `tool_transport_failed`, `tool_transport_teardown`) report the way out to a
+  tool coming up, being ready, failing and being torn down; every one of them
+  carries the same payload key naming which transport it is about, so a host
+  correlates them without parsing text.
+- `runtime/events/envelope.py` — `TurnEvent` (the frozen wire envelope).
+- `runtime/llm/delta_bridge.py` — translates a provider's stream into
+  `ProviderDelta` → `TurnEvent` (`_normalise_finish_reason`, `is_block_end`,
+  …).
+- `contracts/observability.py` — two optional sinks. `CacheObserverProtocol`
+  is the prompt-cache hit-rate sink injected via
+  `QueryEngineConfig.cache_observer`. `IRequestManifestSink` answers a
+  different question — not "how did this call perform" but "what exactly was
+  sent". A provider request is assembled from the history, the compaction
+  checkpoint, the pairing repair, the tool surface and the constants in force,
+  and until `RequestManifest` existed it lived only in the stack frame that
+  made the call: nothing durable could say whether a run that behaved oddly
+  was sent a different request or got a different answer to the same one, and
+  nothing could re-drive a recorded run without paying for the tokens again.
+  The core builds the manifest, computes its id — a SHA-256 over the
+  manifest's own canonical serialisation, so it is known before the host has
+  written anything and a snapshot can address a manifest by id rather than
+  carry it by value — and hands it to the sink. Where it is kept, and for how
+  long, is the host's decision: the core has neither a store nor a retention
+  policy, and acquiring one mid-run is exactly the obligation the loop must
+  not take on.
 
-**How wired.** `query()` yields `TurnEvent`s throughout; the usage delta feeds
-the cache observer. Tracing/observability sinks are injected across the
-boundary.
+**How wired.** The loop yields `TurnEvent`s throughout; the usage delta feeds
+the cache observer, and `build_llm_request` feeds the manifest sink when
+`QueryEngineConfig.request_manifest_sink` is bound. Tracing/observability
+sinks are injected across the boundary.
 
 ### Safety (shell policy + chain parser + path isolation + approvals)
 
@@ -580,7 +853,7 @@ capability-based deny/approval patterns, and isolate workspace paths.
 > `WorkspacePathPolicy` are not in the default stack — the host must register
 > them via `register_policy`.
 
-### RuntimeConstants system
+### LoopConstants system
 
 **What & why.** The single mechanism for tunable values — **no inline magic
 numbers**. Every tunable is a field on a frozen Pydantic snapshot, default-safe,
@@ -588,25 +861,87 @@ and dashboard-configurable.
 
 **Key classes/files.**
 
-- `contracts/runtime_constants.py` (7423 lines) — `RuntimeConstants`
+- `contracts/runtime_constants.py` — `LoopConstants`
   (`model_config = ConfigDict(frozen=True, extra="forbid")`) and the
-  `RuntimeConstantsProvider` Protocol (`async get(tenant_id) -> RuntimeConstants`).
+  `RuntimeConstantsProvider` Protocol (`async get(tenant_id) -> LoopConstants`).
   `extra="forbid"` means an unknown key is a validation error (rejected), not
   silently dropped, so **core and the host must deploy paired**. The snapshot
   includes the default-off surfaces `intent_settlement_enabled`,
-  `usage_ledger_enabled`, `session_tree_enabled`, `lanes_enabled`,
-  `typed_hooks_enabled`, `telemetry_spans_enabled` (and
-  `compaction_manual_enabled`, `steer_follow_up_enabled`).
-  `workspace_enabled` defaults to `True`.
+  `usage_ledger_enabled`, `lanes_enabled`, `typed_hooks_enabled`,
+  `telemetry_spans_enabled` (and `compaction_manual_enabled`,
+  `steer_follow_up_enabled`).
 - `runtime/runtime_constants.py` — `StaticRuntimeConstantsProvider` +
   `default_runtime_constants(**overrides)` (tests + the in-memory smoke runtime;
   production pods supply a Postgres-backed provider with a Redis cache).
 - `constants.py` (~70 lines) — module-level memory-safety caps (`MAX_ARTIFACTS`,
   `MAX_TOOL_CALL_ARGUMENT_BYTES`, `PROTOCOL_VERSION`, `DEFAULT_MODEL`, …).
 
-**The 3-edit rule.** Adding a tunable: (1) a core Pydantic field (default
-safe/off) + (2) the host `_FIELD_MAP` identity entry + (3) the migration
-catalog seed. The Constants dashboard page then renders a toggle for free.
+- `contracts/config.py` — the registry the snapshot is one group of.
+  `ConstantSpec` is one knob's descriptor: its wire `kind`, `default`,
+  operator-facing `description`, bounds (`minimum` / `maximum`,
+  `allowed_values`, `zero_means_unlimited`), and its visibility — `editable`,
+  `editable=False` (a row that is shown and refused on write), or
+  `not_a_lever="<reason>"` (no row at all: a value the running system derives
+  or owns outright, whose appearance in an editor would be an invitation to
+  break the deployment). `ConstantGroup` is a set of specs with one `owner` and
+  one `key`; `group_from_model` reflects a declaring model into a group, so
+  nobody hand-writes a list of hundreds of names that drifts on the first field
+  anyone adds, and `build_loop_group` does that for `LoopConstants` itself.
+  `IConstantsRegistry` is the declaration side: `declare`, a fail-closed
+  `resolve` (a name no group declares raises rather than resolving to a
+  default), `defaults`, `coerce` and `repair`. `ICoreConstantsProvider` is how
+  the loop asks for the snapshot in force for a scope.
+
+**The tunable surface is a set of groups, not one flat model.** Each group is
+declared by the layer that actually reads its values: the loop's own
+thresholds are the core's group, and every knob a surrounding layer reads is
+declared by that layer, in its own model, through the same `group_from_model`
+reflection. A name claimed by two owning groups is refused
+(`DuplicateConstantError`); a name claimed by an owning group and by a
+`provisional` one — the stand-in a layer keeps while it hands ownership over —
+goes to the owner, and the displacement is recorded. That is why a knob
+governing authentication, session storage or the transport to a provider is
+**not** a field of `LoopConstants` and looking for it there will not find it.
+
+**Adding a tunable.** Add the field to the model whose layer reads it, with a
+default-safe value, bounds and a `description`; the group reflects it and the
+operator catalogue picks it up from the group. Nothing else in the core has to
+be told about it.
+
+### The session work pool and delegated runs
+
+**What & why.** One pool, two kinds of work. A shell command started in the
+background and a child run started by delegation are the same thing from the
+loop's side: a unit of work with an address, a status, a way to wait for it and
+a way to stop it. They used to be two mechanisms — the command was a pool
+record with an id, the child run was a function call that blocked its caller
+for as long as it took and had no address at all. Nothing could ask a child run
+how far along it was, nothing could stop one, and a parent waiting on one held
+its turn and its slot in the tree budget for the whole descendant run.
+
+**Key names (`contracts/background.py`).** `IWorkPool` extends
+`IBackgroundTaskPool`; `TaskRecord.kind` tells the two apart (`command` /
+`agent`), and a subagent handle is simply a `WorkHandle` over a record of kind
+`agent`. `AgentRef` says which agent a record of kind `agent` is running and as
+which run. `BACKGROUND_TERMINAL_STATUSES` is the set from which a record will
+never report again.
+
+**Why it is not run state.** A background task outlives the run that started
+it: the command is spawned in one run, the run ends, and whichever run is live
+when it finishes is the one that has to be told. So the pool is a collaborator
+the host injects, and on a cold start — a fresh process picking up a session
+whose tasks were spawned by a process that is gone — the host must put the
+session's still-running commands back in the new pool's hands before the loop
+asks it anything. `ensure_session_attached` is where the loop asks whether that
+happened; a pool answering `False` gets an explicit event on the run rather
+than the empty wake list that reads exactly like a session with nothing
+running.
+
+**Narrowing a child.** `SubagentDef` is the child's definition and
+`runtime/child_capabilities.py::narrow_child_capabilities` computes what it may
+do from its parent and nothing else — never a tool, a permission or a hop of
+depth more than the parent had, because a run that could widen on the way down
+would make every bound above it advisory.
 
 ### Intent, usage ledger, session tree, lanes, typed hooks, telemetry, live control, run work budget
 
@@ -614,15 +949,21 @@ Modules that sit beside the shared ReAct loop. Each is default-off unless
 the matching RC field says otherwise.
 
 - `runtime/intent.py` — `IntentRecord` / `commit_intent` / `settle_intent` /
-  `resume_open_intents` / `replay_policy_for`. When
-  `intent_settlement_enabled` is on, **every** dispatched tool call commits
-  an `IntentRecord` with reserved result ids before `ToolDispatcher.dispatch`.
-  `replay_policy_for` sets `replay="never"` when the tool name is in
-  `intent_never_replay_tools` (default `Write,Edit,Bash,Finalize,AppendFile`);
-  every other name is `"safe"`. A crash mid-flight: never-replay intents
-  become `interrupted` (synthetic error, no replay); safe intents stay
-  `open`. `should_skip_never_replay` short-circuits a resumed interrupted
-  never-replay call. Snapshot field: `open_intents`.
+  `orphaned_intents` / `unknown_outcome_text` / `replay_policy_for` /
+  `repeat_is_safe_for`. **Every** dispatched tool call commits an
+  `IntentRecord` with reserved result ids before the tool is touched,
+  unconditionally; the record carries a lifecycle `state`
+  (`RESERVED|PENDING_APPROVAL|DISPATCHED|PAUSED_ASK_USER|SETTLED`) and the
+  turn preamble closes out whatever a stopped run left behind. A crash
+  mid-flight is reported as an outcome that was never recorded — never as a
+  failure, which would invite a repeat of a side effect that may already have
+  happened — and a call parked at a gate, waiting on a user, or merely
+  reserved is not reported at all, because none of them ran.
+  `intent_repeat_safe_tools` (default `Read,Grep,Glob,ToolSearch`) decides
+  which calls skip the durability write and get the milder text;
+  `intent_never_replay_tools` (default `Write,Edit,Bash,Finalize,AppendFile`)
+  sets `replay`. `intent_settlement_enabled` gates only the recovery events
+  and the ledger row. Snapshot field: `open_intents`.
 - `runtime/usage_ledger.py` — append-only `UsageRow` list. When
   `usage_ledger_enabled` is on, `correctness_bind.commit_usage` appends a
   row. `_query_raw` records `inference` / `retry` / `compaction` / `abort`
@@ -630,21 +971,20 @@ the matching RC field says otherwise.
   on the intent-settlement dispatch path (the same
   `if intent_settlement_enabled` block that settles the intent). A failed
   attempt plus its retry is two rows. Snapshot field: `usage_rows`.
-- `runtime/session_tree.py` — `fork_session` / `clone_session` copy a path
-  of history into a new `SessionBranch` without mutating the source. Gated
-  by `session_tree_enabled`; clone requires a settled source;
-  `session_tree_max_copy_messages` (default 500) caps the copy. **Host-
-  invoked** — the loop does not call these helpers.
+- Session forking — copying a path of history into a new branch without
+  mutating the source. Gated by a host knob; clone requires a settled source,
+  and a second host knob caps the number of copied messages.
+  **Host-owned** — the loop does not do this.
 - `runtime/lanes.py` — named lanes over shared history. `ensure_main`
   makes `main` exist; extras take exclusive locks (`create_lane` /
   `acquire_lane` / `release_lane`). Gated by `lanes_enabled`;
   `lanes_max_per_session` (default 4) includes main. **Host-invoked**;
   `QueryEngine.lanes` is snapshot-persisted so a resume sees the same
   locks.
-- `runtime/typed_hooks.py` — `PUBLISHED_HOOKS` + `HookRegistry` /
-  `dispatch_hook`. See the
-  [Hooks](#hooks-pluggy--injection--scratchpad--context_bootstrap) section
-  for which names fire without a second flag.
+- `contracts/middleware.py` + `hooks/manager.py` — the lifecycle seam and its
+  in-process dispatcher. See
+  [the lifecycle seam](#the-lifecycle-seam--injection--scratchpad--context_bootstrap)
+  for the coordinates and the exception policy.
 - `runtime/telemetry.py` — low-cardinality spans (`run` / `turn` / `step` /
   `tool` / `compact` / `hook`). Gated by `telemetry_spans_enabled`. High-
   cardinality ids stay attributes; `is_prometheus_safe_label` refuses
@@ -653,7 +993,7 @@ the matching RC field says otherwise.
   (`correctness_bind.mark_intent_recovery`). Spans live on `engine.spans`
   (in-process); they are **not** in the snapshot.
 - `runtime/correctness_bind.py` — glue so intent, ledger, typed hooks, and
-  recovery run inside `_query_raw` (`commit_usage`, `fire_typed_hook`,
+  recovery run inside `_drive_turn` (`commit_usage`, `fire_lifecycle`,
   `mark_intent_recovery`, `persist_correctness`).
 - `runtime/live_control.py` — steer / follow-up queues (`QueuedPrompt`,
   `enqueue`, `place_items`), live model/thinking overrides, and the settled
@@ -677,26 +1017,34 @@ The principal extension points:
 |---|---|---|
 | `ILLMProvider` | `contracts/llm.py` | LLM completions: `stream_with_tools`, `complete_structured`, `complete_text`, and `count_tokens`; a universal LiteLLM/OpenAI-compatible adapter (OpenRouter / vLLM / OpenAI). |
 | `IProviderChain` | `contracts/llm.py` | Ordered remaining providers plus a one-way `advance()` cursor. Injected on `QueryEngine(..., provider_chain=...)` for mid-stream failover; `None` leaves existing recovery untouched. |
-| `RuntimeConstantsProvider` | `contracts/runtime_constants.py` | Per-tenant `RuntimeConstants` backed by Postgres + Redis cache. |
+| `RuntimeConstantsProvider` | `contracts/runtime_constants.py` | Per-tenant `LoopConstants` backed by Postgres + Redis cache. |
 | `ISessionStore` | `contracts/session.py` | Session/transcript persistence (Postgres). |
 | `IRunStore` | `contracts/run.py` | Run record create/list/read (Postgres + Redis hot record). |
 | `IToolRegistry` | `contracts/tool_registry.py` | The concrete `ToolRegistry` is in core; the host registers concrete `Tool`s + visibility policy. |
-| `Tool` (ABC) / `@tool` | `contracts/tools.py`, `tools/decorator.py` | Concrete tool implementations (sandbox-backed exec/file tools, the lean verbs). |
+| `Tool` (ABC) / `@tool` | `contracts/tools.py`, `tools/decorator.py` | Concrete tool implementations (sandbox-backed exec/file tools). |
 | `IToolTransport` | `contracts/resilience.py` | The tool/VM transport (e.g. ConnectRPC) the resilience wrapper wraps; optional `rebuild()` hook. |
-| `IMemory` | `contracts/memory.py` | `PgMemoryStore` (Postgres FTS/BM25, two-stage idempotent write, drift-guard) + an `IMemoryContentScanner`. |
+| `IMemory` | `contracts/memory.py` | A scoped, durable fact store with lexical recall, a two-stage idempotent write and a drift guard, plus an `IMemoryContentScanner`. |
 | `IWorkspace` | `contracts/workspace.py` | Durable byte store + Postgres FTS/BM25 manifest, atomic write, per-scope GC. |
 | `ISkillStore` | `contracts/skills.py` | Skill bundle storage + lookup **and** multi-file `list_files` / `load_file` (`SkillFileRef`). The core loop catalogs via `list` / `list_enabled_subset` and loads bodies via `load` / `list_subset`; `list_files` / `load_file` are the host file API. The catalog renderer lives in core, `runtime/skill_index.py`. |
-| `IHookManager` | `contracts/hooks.py` | The production 3-arg hook dispatcher (this drives the loop, not the pluggy `HookManager`). Typed `PUBLISHED_HOOKS` are a separate default-off surface in `runtime/typed_hooks.py`. |
+| `IHookManager` | `contracts/hooks.py` | The 3-arg dispatcher for hooks whose executor is out of process; driven at the permission gate and around tool dispatch. |
+| `ILifecycleRegistry` | `contracts/middleware.py` | The one lifecycle seam — registrations carry an owner, a scope and an idempotent disposer. Default-off behind `typed_hooks_enabled`. |
 | `IEventStream` | `contracts/events.py` | Cross-pod durable event stream (Redis Streams) for SSE reconnect/replay. |
 | `IBlobStore` | `contracts/blob.py` | Content-addressed blob storage (S3) used by Tier-1 compaction. |
 | `ISearchIndex` | `contracts/search.py` | Generic lexical search index. |
 | `ITodoStorage` | `contracts/todo.py` | Per-session todo persistence. |
 | `IAgentDispatch` | `contracts/agent_dispatch.py` | Subagent dispatch/lookup. |
 | `IPromptTemplateProvider` | `contracts/prompts.py` | System-prompt template rendering. |
+| `IWorkPool` / `IBackgroundTaskPool` | `contracts/background.py` | The session's work pool: background commands and delegated child runs under one address space, with `ensure_session_attached` on a cold start. |
+| `IConstantsRegistry` / `ICoreConstantsProvider` | `contracts/config.py` | Declaration of the host's own constant groups, fail-closed name resolution, and the per-scope `LoopConstants` snapshot the loop reads. |
+| `IResilienceClassifier` | `contracts/resilience.py` | The verdict on which neutral failure class a message describes. Core reads failure text it did not write and must not learn to recognise it; an unbound classifier means no wording is recognised, which is the neutral behaviour. |
+| `IRequestManifestSink` | `contracts/observability.py` | Where a `RequestManifest` is kept, and for how long. |
+| `IDelegationTool` | `contracts/agent_dispatch.py` | The tool shape a delegated run is started through. |
+| `IRunToolErrorCounter` | `contracts/run.py` | Durable per-run tool-error counting across processes. |
+| `ITurnPolicy` | `contracts/turn_policy.py` | A product decision about a turn, substituted into the core's set by name. |
 | `IToolSafetyPolicy` | `runtime/tool_permission.py` | Extra permission policies (`HttpDnsAllowlistPolicy`, `WorkspacePathPolicy`) registered via `register_policy`. |
-| Hook specs (pluggy) | `hooks/specs.py` | In-process `hookimpl`s for the 8 spec events (when using the pluggy path). |
+| `ToolRoleMap` | `contracts/tool_roles.py` | Which of the host's tool names carry which `ToolRole`, and the argument spellings that go with them. Passed as `QueryEngineConfig.tool_roles`. |
+| Lifecycle coordinates | `contracts/types.py::HookEvent` | The one list of points a registration may name. |
 | `CacheObserverProtocol` | `contracts/observability.py` | Prompt-cache hit-rate sink injected via `QueryEngineConfig.cache_observer`. |
-| `WorkspaceStatProtocol` | `runtime/finalization_gate.py` | Stat-only workspace facade for the finalization gate. |
 | Self-verify trigger callables | `runtime/query_engine.py` | `pre_terminal_self_verify_trigger` / `pre_dispatch_terminal_verify_trigger` on `QueryEngineConfig`. |
 
 ---
@@ -707,27 +1055,37 @@ The principal extension points:
   `protocore_` — the sibling distributions that sit above it. Add
   behaviour via contracts / adapters / RC, not by importing upward. Guard:
   `tests/test_core_import_boundary.py`.
-- **No inline magic numbers.** Every tunable is a `RuntimeConstants` field
-  (frozen, `extra="forbid"`) or a `constants.py` cap. Runtime code reads from
-  the RC snapshot, never a hard-coded literal. Adding one is the 3-edit rule
-  (core field + the host `_FIELD_MAP` + migration seed).
+- **No inline magic numbers.** Every tunable the loop reads is a
+  `LoopConstants` field (frozen, `extra="forbid"`) or a `constants.py` cap.
+  Runtime code reads from the RC snapshot, never a hard-coded literal. A knob
+  a surrounding layer reads is declared by that layer, in its own constant
+  group (`contracts/config.py`).
 - **Horizontal-scale-safe.** No module-level dicts, no module-held locks, no
   per-pod in-memory authority. Correctness-affecting state lives per-run on the
   `QueryEngine` (snapshot/resume); ephemeral cross-pod state is Redis, durable
   state is Postgres — both injected across the boundary. The token-bucket and
   adaptive band take injected locks/stores rather than module state.
-- **Streaming is mandatory.** `query()` returns an async iterator; every
+- **Streaming is mandatory.** Every drive is an async iterator; every
   provider delta is forwarded immediately as a `TurnEvent`. Do not buffer a
   whole turn before emitting.
 - **No backward compatibility.** Dev-version project — break freely, delete
   dead code, no migration shims. (Hence `compaction_thresholds.py` was deleted
-  outright once `budgets.py` subsumed it.)
+  outright once `budgets.py` subsumed it.) The one exception is the run
+  snapshot, which crosses builds rather than releases: it states its schema
+  version and is either upcast or refused, never half-read
+  (`contracts/snapshot.py`).
 - **Use `Message` models, never raw dicts.** All messages flow as the Pydantic
   `Message` / `ContentBlock` union from `contracts/types.py`.
-- **Do not modify the loop structure.** Customise via hooks, `QueryEngineConfig`
-  injection, RC toggles, or `system_prompt_sections`.
+- **Do not modify the loop structure.** Customise via a lifecycle
+  registration, a turn policy, `QueryEngineConfig` injection, RC toggles, or
+  `system_prompt_sections`.
+- **A host proves its adapters, and does not wait for a run to do it.**
+  `protocore.conformance.SUITES` has one suite per contract; a host binds each
+  to its own adapter and finds out in its own test run that the shape is the
+  one the core will call. Installed with `pip install "protocore[testing]"`.
 - **Production logging = WARNING.** Use `logger.warning(...)` for operationally
   significant events; reserve lower levels for local debugging.
 
 Repo commands: `uv sync --extra dev`, `uv run pytest .`, `uv run ruff check .`,
-`uv run mypy protocore`.
+`uv run mypy --strict` (never with a path — a path replaces the configured
+file list and silently drops the test tree).

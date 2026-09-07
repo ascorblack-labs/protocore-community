@@ -1,6 +1,6 @@
-# RuntimeConstants
+# LoopConstants
 
-`RuntimeConstants` is the single configuration surface that flows across the
+`LoopConstants` is the single configuration surface that flows across the
 core ↔ the host boundary. It is the mechanism behind the project's hard rule:
 **no inline magic numbers.** Every runtime-tunable threshold — token-budget
 fractions, operational caps, timeouts, feature kill-switches — is a typed field
@@ -11,16 +11,16 @@ This page is the conceptual reference for that model. The operational day-to-day
 (the dashboard flow, override precedence, and anti-patterns) lives with 
 the host service and its administration dashboard, which read and persist the
 per-tenant overrides this model describes. The deep architecture treatment is in
-the [RuntimeConstants system](architecture.md#runtimeconstants-system) section of
+the [LoopConstants system](architecture.md#loopconstants-system) section of
 [`architecture.md`](architecture.md).
 
 ## The model: frozen Pydantic, `extra="forbid"`
 
-`RuntimeConstants` lives in `protocore/contracts/runtime_constants.py`. It is a
+`LoopConstants` lives in `protocore/contracts/runtime_constants.py`. It is a
 `pydantic.BaseModel` whose configuration is:
 
 ```python
-class RuntimeConstants(BaseModel):
+class LoopConstants(BaseModel):
     model_config = ConfigDict(frozen=True, extra="forbid")
     ...
 ```
@@ -29,7 +29,7 @@ Two properties matter, and both are deliberate.
 
 - **`frozen=True`** — a snapshot is immutable once constructed. The runtime
   binds one snapshot at engine construction — it is stored on
-  `QueryEngineConfig.rc`, and `query(engine)` reads it from `engine.config.rc` —
+  `QueryEngineConfig.rc`, and the loop reads it from `engine.config.rc` —
   so a run's behaviour cannot drift mid-flight even if an operator edits a value
   while the run is in progress. There is no global state and no module-level
   cache; the snapshot is the authority for the lifetime of the engine. New
@@ -49,6 +49,52 @@ token budgets and the compaction trigger in tokens) are *computed* from these
 inputs elsewhere in the runtime — they are not stored as fields. Adding a
 derived value as its own field would invite two sources of truth.
 
+## The registry: groups, specs and who owns a knob
+
+The snapshot is not the whole tunable surface — it is **one group of it**. A
+deployment's knobs are a set of groups, each declared by the layer that
+actually reads its values: the loop's own thresholds are the core's group, and
+everything a surrounding layer reads is declared by that layer. `contracts/config.py`
+owns the vocabulary both sides speak.
+
+- **`ConstantSpec`** — one knob's descriptor: its wire `kind`
+  (`int` / `float` / `bool` / `str` / `json`), its `default`, its
+  operator-facing `description`, its bounds (`minimum` / `maximum`,
+  `exclusive_*`, `allowed_values`, and `zero_means_unlimited` — the one piece of
+  semantics a numeric bound cannot carry, a floor of zero that means "no ceiling
+  at all" rather than "the smallest ceiling"), the `group` and `owner` it
+  belongs to, and its visibility. Visibility has **three** states, not two:
+  `editable=True` (a row an operator may set), `editable=False` (a row that is
+  shown and refused on write) and `not_a_lever="<reason>"` (**no row at all** —
+  a value the running system derives or owns outright, whose appearance in an
+  editor would be an invitation to break the deployment).
+- **`ConstantGroup`** — a set of specs with one `owner` and one `key`, plus the
+  `invariants` relating its own constants. `group_from_model(model, key=...,
+  owner=...)` reflects a declaring model into a group rather than restating it:
+  a hand-written list of hundreds of names drifts from the model it describes on
+  the first field anyone adds, and reflection cannot. `build_loop_group()` is
+  that call for `LoopConstants` itself.
+- **`IConstantsRegistry`** — declaration (`declare`), fail-closed resolution
+  (`resolve` raises `UnknownConstantError` for a name no group declares; it
+  never resolves to a default), `defaults`, `coerce` (a store keeps every value
+  as text, and both the write path and the snapshot build must read it the same
+  way) and `repair` (a bad stored row is reset by name and reported, because
+  discarding the whole set would take every unrelated setting of the scope down
+  with it). A name claimed by two **owning** groups is a `DuplicateConstantError`;
+  a name claimed by an owning group and by a `provisional` one — the stand-in a
+  layer keeps while it hands ownership over — goes to the owner, and the
+  displacement is recorded.
+- **`ICoreConstantsProvider`** — how the loop asks for the snapshot in force for
+  one scope. The snapshot is always passed by value into a turn: no global
+  state, no module-level cache, and freshness belongs entirely to the
+  implementation.
+
+Two facts about a knob deliberately live elsewhere, because a second
+declaration of one fact drifts from the first: whether changing it requires a
+restart, and which capability toggle it belongs to. Both are properties of the
+place that consumes the value, and they are joined onto the catalogue as an
+overlay rather than restated in the descriptor.
+
 ## The provider: `RuntimeConstantsProvider`
 
 Core does not know how snapshots are built or where tenant overrides live — that
@@ -58,7 +104,7 @@ the host implements:
 ```python
 @runtime_checkable
 class RuntimeConstantsProvider(Protocol):
-    async def get(self, tenant_id: str) -> RuntimeConstants:
+    async def get(self, tenant_id: str) -> LoopConstants:
         """Return the latest snapshot for ``tenant_id``."""
         ...
 ```
@@ -81,30 +127,22 @@ behaviour until an operator opts in per tenant. Feature kill-switches default
 `True` only when the feature is the established steady-state path and the switch
 exists for incident rollback.
 
-Read the live `Field(...)` default — do not infer it from older docs. Two
-exceptions worth naming because they have been mis-stated:
+Read the live `Field(...)` default — do not infer it from older docs. Intent,
+ledger, lanes, typed hooks, telemetry, manual compact and steer/follow-up are
+default-**off**: `intent_settlement_enabled`, `usage_ledger_enabled`,
+`lanes_enabled`, `typed_hooks_enabled`, `telemetry_spans_enabled`,
+`compaction_manual_enabled`, `steer_follow_up_enabled`.
 
-- `workspace_enabled` defaults to **`True`** (the workspace subsystem is
-  available; the host does not expose the legacy Workspace* LLM tools by
-  default).
-- Intent, ledger, tree, lanes, typed hooks, telemetry, manual compact, and
-  steer/follow-up are default-**off**: `intent_settlement_enabled`,
-  `usage_ledger_enabled`, `session_tree_enabled`, `lanes_enabled`,
-  `typed_hooks_enabled`, `telemetry_spans_enabled`,
-  `compaction_manual_enabled`, `steer_follow_up_enabled`.
-
-Personal API-key policy is part of this tunable surface. By default, one user
-may hold at most 10 active keys in an account
-(`personal_api_key_active_limit`), and successful key use updates its durable
-last-used timestamp at most once every 300 seconds
-(`personal_api_key_last_used_write_interval_seconds`). Setting the write
-interval to `0` records every authenticated use; the active-key limit must
-remain positive.
+The snapshot carries only what the loop itself reads. Knobs that govern a
+surface the host owns — authentication policy, session storage, the transport
+to a provider — are declared by the host in its own model and reach the
+operator through the same catalog; they are not fields of `LoopConstants` and
+looking for them here will not find them.
 
 For tests and the in-memory smoke runtime — anywhere there is no Postgres-backed
 provider — core ships two helpers in `protocore/runtime/runtime_constants.py`:
 
-- `default_runtime_constants(**overrides)` — returns a `RuntimeConstants`
+- `default_runtime_constants(**overrides)` — returns a `LoopConstants`
   built entirely from field defaults, with optional keyword overrides for the
   fields a test needs to vary.
 - `StaticRuntimeConstantsProvider` — a `RuntimeConstantsProvider` that returns
@@ -117,7 +155,7 @@ default_runtime_constants, StaticRuntimeConstantsProvider`). Production pods do
 
 ## Static caps in `constants.py`
 
-`RuntimeConstants` is for values that should be tunable per tenant through the
+`LoopConstants` is for values that should be tunable per tenant through the
 dashboard. A small, separate set of values must **never** vary per scope: memory
 safety ceilings and protocol identifiers. Those live as module-level constants
 in `protocore/constants.py` — for example `MAX_TOOL_CALL_ARGUMENT_BYTES`,
@@ -128,7 +166,7 @@ tunable would let a misconfiguration defeat a safety bound.
 
 The decision rule:
 
-- **Should an operator be able to tune it per tenant?** → `RuntimeConstants`
+- **Should an operator be able to tune it per tenant?** → `LoopConstants`
   field.
 - **Is it a hard safety ceiling or a protocol/identity constant that must hold
   everywhere?** → `constants.py`.
@@ -136,29 +174,28 @@ The decision rule:
 A value belongs to exactly one of these. It is never both, and it is never an
 inline literal in runtime logic.
 
-## Adding a tunable: the 3-edit rule
+## Adding a tunable
 
-Because the configuration surface spans the core and its host, adding one new tunable is a
-**three-edit** operation. Skipping any edit yields a field that either rejects
-at the boundary (`extra="forbid"`) or never reaches the dashboard.
+**Add the field to the model whose layer reads it.** For a threshold the loop
+reads, that is `LoopConstants` in
+`protocore/contracts/runtime_constants.py`, with a `Field(...)` declaration
+carrying a default-safe/off value, validation bounds where applicable, and a
+`description` written for an operator. For a knob a surrounding layer reads,
+it is that layer's own model.
 
-1. **Core Pydantic field.** Add the field to `RuntimeConstants` in
-   `protocore/contracts/runtime_constants.py`, with a `Field(...)` declaration
-   that carries a default-safe/off value, validation bounds where applicable,
-   and a `description`. The default on the field is the canonical value.
+Nothing else in the core has to be told about it. The group is reflected from
+the model by `group_from_model`, so the descriptor — type, bounds,
+enumeration, default and the field's own words — comes from the declaration
+itself, and the operator catalogue enumerates what the registry resolves. Where
+a declaration cannot state something about itself (a unit, a category, the
+reason a value is `not_a_lever`), a `SpecOverlay` supplies it at the point the
+group is built.
 
-2. **The host `_FIELD_MAP` identity entry.** Register the field in 
-   the host `_FIELD_MAP` so the provider knows to read and write it. Without
-   this entry the dashboard cannot persist an override for the field.
-
-3. **Migration catalog seed.** Add the field to the host migration catalog
-   seed so existing tenants get a row for it. Without the seed the field exists
-   in the model but has no catalog presence for the dashboard to enumerate.
-
-With all three edits in place, the dashboard Constants page auto-discovers the
-field and renders an editor for it — no further registration is needed. The
-exact the host file locations and the dashboard persistence flow live with 
-the host service that owns the `_FIELD_MAP` and the migration catalog.
+Two mistakes the shape of the model prevents. Adding the field to the wrong
+layer's model puts a knob in a group whose owner does not read it, and the
+first thing a reviewer sees is an owner that makes no sense. Adding it to two
+models is a `DuplicateConstantError` at declaration, not a silent race between
+two defaults.
 
 ## How to read a field default
 
@@ -171,7 +208,7 @@ from the live snapshot:
 
 ```python
 # Correct — read the tunable from the injected snapshot.
-if iteration >= rc.max_iterations:
+if turns >= rc.max_turns_per_run:
     stop()
 
 # Wrong — an inline literal is a magic number. It bypasses the snapshot,
@@ -181,11 +218,12 @@ if iteration >= 50:
 ```
 
 The literal in the "wrong" example is exactly what the model exists to
-eliminate: the bound lives on the `max_iterations` field, not in the branch.
+eliminate: the bound lives on the `max_turns_per_run` field, not in the
+branch.
 
 ## See also
 
-- [`architecture.md`](architecture.md) — the RuntimeConstants system in the
+- [`architecture.md`](architecture.md) — the LoopConstants system in the
   full core architecture, including where the snapshot is bound to the engine.
 - `contracts.md` — the wider contract surface (the interface Protocols
   the host implements), of which `RuntimeConstantsProvider` is one.

@@ -7,9 +7,10 @@ from __future__ import annotations
 
 import pytest
 
-from protocore.contracts.runtime_constants import RuntimeConstants
+from protocore.contracts.evidence import VerificationDelivery
+from protocore.contracts.runtime_constants import LoopConstants
+from protocore.contracts.tool_roles import ToolRoleMap
 from protocore.contracts.types import ToolPrecondition
-from protocore.contracts.verification import VerificationDelivery
 from protocore.runtime.query_engine import QueryEngine, QueryEngineConfig
 from protocore.tests_support.adapters import (
     InMemoryAgentDispatch,
@@ -24,6 +25,7 @@ from protocore.tests_support.adapters import (
     InMemoryTodoStorage,
     InMemoryToolRegistry,
 )
+from tests._fixtures.tool_roles import CONVENTIONAL_TOOL_ROLES
 
 
 @pytest.fixture
@@ -55,7 +57,7 @@ def engine_factory(in_memory_runtime: dict[str, object]):
         session_id: str = "sess-test",
         model_name: str = "qwen3.6-35b-a3b",
         account_id: str | None = None,
-        rc: RuntimeConstants | None = None,
+        rc: LoopConstants | None = None,
         expected_terminal_tool: str | None = None,
         root_run_id: str = "",
         parent_run_id: str | None = None,
@@ -64,6 +66,8 @@ def engine_factory(in_memory_runtime: dict[str, object]):
         pinned_skill_names: frozenset[str] = frozenset(),
         tool_preconditions: tuple[ToolPrecondition, ...] = (),
         verification_delivery: VerificationDelivery | None = None,
+        tool_roles: ToolRoleMap = CONVENTIONAL_TOOL_ROLES,
+        work_session_id: str = "",
     ) -> QueryEngine:
         # A root run sits at depth 0 and a child one hop below it, which is
         # what a caller naming a parent almost always wants; tests that build a
@@ -81,7 +85,7 @@ def engine_factory(in_memory_runtime: dict[str, object]):
                 account_id=tenant_id if account_id is None else account_id,
                 session_id=session_id,
                 model_name=model_name,
-                rc=rc or RuntimeConstants(model_context_window=4_096),
+                rc=rc or LoopConstants(model_context_window=4_096),
                 expected_terminal_tool=expected_terminal_tool,
                 root_run_id=root_run_id,
                 parent_run_id=parent_run_id,
@@ -90,6 +94,8 @@ def engine_factory(in_memory_runtime: dict[str, object]):
                 pinned_skill_names=pinned_skill_names,
                 tool_preconditions=tool_preconditions,
                 verification_delivery=verification_delivery,
+                tool_roles=tool_roles,
+                work_session_id=work_session_id,
             ),
             llm_provider=in_memory_runtime["llm"],
             tool_registry=in_memory_runtime["tools"],

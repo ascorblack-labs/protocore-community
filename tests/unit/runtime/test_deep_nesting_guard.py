@@ -1,8 +1,8 @@
 """Pathologically nested model data fails by name, not by stack exhaustion.
 
 Every walk in this file runs over a structure the model chose the shape of: a
-tool call's arguments, a message's metadata, a partially streamed JSON blob, the
-helper bag a tool wrote into. A recursive walk over one of those answers a deep
+tool call's arguments, a message's metadata, a partially streamed JSON blob. A
+recursive walk over one of those answers a deep
 enough payload with ``RecursionError``, which is not raised by the code that
 knows what it was walking and carries nothing about it by the time the run loop
 catches it. What these tests pin is that each walk stops at a stated depth and
@@ -15,7 +15,8 @@ from typing import Any
 import pytest
 
 from protocore.constants import MAX_DATA_NESTING_DEPTH
-from protocore.contracts.runtime_constants import RuntimeConstants
+from protocore.contracts.run_state import RunScopedState
+from protocore.contracts.runtime_constants import LoopConstants
 from protocore.contracts.tool_registry import ToolVisibilityPolicy
 from protocore.contracts.tools import ToolContext
 from protocore.contracts.types import (
@@ -34,7 +35,6 @@ from protocore.json_utils import (
     parse_complete_json,
     parse_complete_json_any,
 )
-from protocore.runtime.query import HelperStateTooDeep, _deep_copy_helper_value
 from protocore.runtime.tool_dispatch import (
     DispatchErrorKind,
     DispatchOutcome,
@@ -42,6 +42,7 @@ from protocore.runtime.tool_dispatch import (
 )
 from protocore.runtime.tool_permission import ToolPermissionGate
 from protocore.runtime.tool_registry import ToolRegistry
+from tests._fixtures.tool_roles import CONVENTIONAL_TOOL_ROLES
 
 from ._tool_fixtures import MockTool
 
@@ -182,26 +183,6 @@ def test_the_non_finite_rejection_still_names_the_path_it_found() -> None:
 
 
 # ----------------------------------------------------------------------
-# Helper-bag snapshot (parallel dispatch)
-# ----------------------------------------------------------------------
-
-
-def test_the_helper_bag_copier_refuses_a_runaway_value() -> None:
-    with pytest.raises(HelperStateTooDeep):
-        _deep_copy_helper_value(_deep_dict())
-
-
-def test_the_helper_bag_copier_still_deep_copies_ordinary_state() -> None:
-    original = {"streak": {"count": 1}, "seen": {"a"}, "rows": [{"x": 1}]}
-    copied = _deep_copy_helper_value(original)
-    copied["streak"]["count"] = 99
-    copied["rows"][0]["x"] = 99
-    assert original["streak"]["count"] == 1
-    assert original["rows"][0]["x"] == 1
-    assert copied["seen"] == {"a"}
-
-
-# ----------------------------------------------------------------------
 # Tool dispatch
 # ----------------------------------------------------------------------
 
@@ -209,13 +190,13 @@ def test_the_helper_bag_copier_still_deep_copies_ordinary_state() -> None:
 async def _dispatch(tool_call: ToolCall) -> DispatchOutcome:
     dispatcher = ToolDispatcher(
         registry=ToolRegistry([MockTool(tool_name="Echo")]),
-        permission_gate=ToolPermissionGate(),
+        permission_gate=ToolPermissionGate(roles=CONVENTIONAL_TOOL_ROLES),
     )
     ctx = ToolContext(
         tenant_id="tenant-depth",
         run_id="run-depth",
         session_id="sess-depth",
-        metadata={"protocore.helpers": {}},
+        run_state=RunScopedState(),
     )
     outcome: DispatchOutcome | None = None
     async for item in dispatcher.dispatch(
@@ -256,4 +237,4 @@ async def test_ordinary_nested_tool_arguments_dispatch_normally() -> None:
 
 def test_the_dashboard_tunable_ceiling_defaults_to_the_structural_floor() -> None:
     """One number, two reachable places — a drift between them is the bug."""
-    assert RuntimeConstants().max_data_nesting_depth == MAX_DATA_NESTING_DEPTH
+    assert LoopConstants().max_data_nesting_depth == MAX_DATA_NESTING_DEPTH

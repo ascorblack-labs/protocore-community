@@ -6,15 +6,15 @@ provider used by core fixtures and the in-memory runtime helper.
 """
 from __future__ import annotations
 
-from protocore.contracts.runtime_constants import RuntimeConstants
+from protocore.contracts.runtime_constants import LoopConstants
 
 
-def default_runtime_constants(**overrides: object) -> RuntimeConstants:
-    """Build a default :class:`RuntimeConstants` with optional overrides.
+def default_runtime_constants(**overrides: object) -> LoopConstants:
+    """Build a default :class:`LoopConstants` with optional overrides.
 
     Used by :func:`protocore.testing.build_in_memory_runtime` and tests.
     """
-    return RuntimeConstants(**overrides)  # type: ignore[arg-type]
+    return LoopConstants(**overrides)  # type: ignore[arg-type]
 
 
 class StaticRuntimeConstantsProvider:
@@ -24,10 +24,10 @@ class StaticRuntimeConstantsProvider:
     a PG-backed provider.
     """
 
-    def __init__(self, snapshot: RuntimeConstants | None = None) -> None:
+    def __init__(self, snapshot: LoopConstants | None = None) -> None:
         self._snapshot = snapshot or default_runtime_constants()
 
-    async def get(self, tenant_id: str) -> RuntimeConstants:
+    async def get(self, tenant_id: str) -> LoopConstants:
         return self._snapshot
 
 

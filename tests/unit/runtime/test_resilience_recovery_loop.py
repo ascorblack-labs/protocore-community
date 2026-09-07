@@ -17,7 +17,7 @@ from typing import Any
 import pytest
 
 from protocore.contracts.llm import LLMRequest, LLMStreamEvent
-from protocore.contracts.runtime_constants import RuntimeConstants
+from protocore.contracts.runtime_constants import LoopConstants
 from protocore.contracts.tools import Tool, ToolContext
 from protocore.contracts.types import (
     PARTIAL_ASSISTANT_ATTEMPT_METADATA_KEY,
@@ -58,7 +58,7 @@ _PRIOR_RUN_ANSWER = (
 
 def _build_engine(
     *,
-    rc: RuntimeConstants,
+    rc: LoopConstants,
     llm: object,
     expected_terminal_tool: str | None = TERMINAL_TOOL,
     register_terminal: bool = True,
@@ -174,7 +174,7 @@ def _terminal_metadata_in_history(engine: QueryEngine) -> bool:
 
 
 def test_partial_attempts_are_not_answer_candidates() -> None:
-    rc = RuntimeConstants(model_context_window=4_096)
+    rc = LoopConstants(model_context_window=4_096)
     engine = _build_engine(rc=rc, llm=_PlainTextEndTurnLLM())
     engine.history.extend(
         [
@@ -197,7 +197,7 @@ def test_partial_attempts_are_not_answer_candidates() -> None:
 
 
 def test_only_strict_true_marks_a_partial_attempt() -> None:
-    rc = RuntimeConstants(model_context_window=4_096)
+    rc = LoopConstants(model_context_window=4_096)
     engine = _build_engine(rc=rc, llm=_PlainTextEndTurnLLM())
     engine.history.append(
         Message(
@@ -247,7 +247,7 @@ def _seed_prior_run(engine: QueryEngine, *, question: str, answer: str) -> None:
 def testrun_has_final_answer_ignores_prior_run_seeded_turns() -> None:
     """The same run boundary applies to the empty-completion guard's
     precondition: a seeded prior answer must not mask an unanswered run."""
-    rc = RuntimeConstants(model_context_window=4_096)
+    rc = LoopConstants(model_context_window=4_096)
     engine = _build_engine(rc=rc, llm=_PlainTextEndTurnLLM())
     _seed_prior_run(
         engine,
@@ -309,7 +309,7 @@ def test_prior_run_terminal_result_leaves_the_finalisation_check_armed() -> None
     that has answered nothing — the seeded turn is the run before this one
     finishing properly, which is the ordinary shape of any continued session.
     """
-    rc = RuntimeConstants(
+    rc = LoopConstants(
         model_context_window=4_096,
         terminal_tool_nudge_enabled=True,
     )
@@ -322,7 +322,7 @@ def test_prior_run_terminal_result_leaves_the_finalisation_check_armed() -> None
 
 def test_this_runs_own_terminal_result_still_disarms_the_finalisation_check() -> None:
     """The complement: the boundary must not cost the check its real job."""
-    rc = RuntimeConstants(
+    rc = LoopConstants(
         model_context_window=4_096,
         terminal_tool_nudge_enabled=True,
     )
@@ -339,7 +339,7 @@ def test_write_first_steer_survives_a_prior_runs_seeded_write() -> None:
     produced its file deliverable. A prior run's seeded ``Write`` must not
     answer it: the run that has written nothing is exactly the one the steer
     is for."""
-    rc = RuntimeConstants(model_context_window=4_096)
+    rc = LoopConstants(model_context_window=4_096)
     engine = _build_engine(rc=rc, llm=_PlainTextEndTurnLLM())
     write_tool = rc.terminal_tool_nudge_file_write_tool_names[0]
     engine.history.append(
@@ -491,7 +491,7 @@ class _ToolThenEmptyThenAnswerLLM:
 async def test_post_tool_empty_nudge_recovers_when_enabled() -> None:
     """A fully-empty turn right after a tool result triggers the API-valid
     assistant('(empty)') + user(nudge) injection + a re-stream that answers."""
-    rc = RuntimeConstants(
+    rc = LoopConstants(
         model_context_window=4_096,
         max_consecutive_empty_responses=3,
         resilience_post_tool_empty_nudge_enabled=True,
@@ -600,7 +600,7 @@ class _ToolThenAlwaysEmptyLLM:
 async def test_post_tool_empty_nudge_off_is_bit_identical() -> None:
     """RC OFF → the fully-empty turn falls through to the normal no-tool
     end-turn (the run COMPLETES on the empty turn with no nudge)."""
-    rc = RuntimeConstants(
+    rc = LoopConstants(
         model_context_window=4_096,
         max_consecutive_empty_responses=3,
         resilience_post_tool_empty_nudge_enabled=False,

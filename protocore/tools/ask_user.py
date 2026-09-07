@@ -50,6 +50,7 @@ from typing import Any, ClassVar
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
+from protocore.contracts.tool_roles import ToolRole
 from protocore.contracts.tools import Tool, ToolContext, ToolError
 from protocore.contracts.types import (
     ToolDefinition,
@@ -330,6 +331,10 @@ class AskUserTool(Tool):
     """
 
     name_: ClassVar[str] = ASK_USER_TOOL_NAME
+    # What this tool does, so the loop and the surface it advertises can reason
+    # about the human-in-the-loop pause by role rather than by the name a
+    # deployment happened to give it.
+    tool_roles: ClassVar[tuple[ToolRole, ...]] = (ToolRole.asks_user,)
     description_: ClassVar[str] = (
         "Pause the agent loop and ask the user one or more questions, then "
         "return the user's answers as the tool result. Each question may offer "

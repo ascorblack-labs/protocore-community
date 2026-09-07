@@ -3,7 +3,7 @@
 The pure decision logic for driving a large-file write to completion on a weak
 local model at a small per-call output cap. The model's dominant failure shape
 is NON-CONVERGENCE: it writes one header (often truncated), then idle-inspects
-via non-mutation tool calls (Read/Grep/Bash/List) or prose, never appending or
+with non-mutation tool calls or prose, never appending or
 finalizing, until the turn cap. Both naive recoveries fail — "discard & redo"
 re-truncates/spirals, and "the file is SAFE on disk, continue" reads to the
 model as "task done" so it stops producing.
@@ -13,15 +13,15 @@ is for the
 RUNTIME to drive completion:
 
 * a **stall detector** keyed to *turns-since-last-BYTE-ADDING-mutation* (a
-  Write/AppendFile that actually grew the file) while the file is below an
+  call that actually grew the file) while the file is below an
   expected-complete floor — NOT keyed to append-count and NOT the prose path
   (both are bypassed by the header-then-idle shape);
-* on a stall while the file is below its plausible-complete floor → force
-  ``tool_choice=AppendFile`` ("continue now");
+* on a stall while the file is below its plausible-complete floor → force the
+  host's append tool ("continue now");
 * on a byte-plateau (recent delta shrank) OR a stall while the file is already
-  at/above floor → force ``tool_choice=FinalizeFile``;
-* a **HARD empty-finalize guard** (the validated edge): NEVER force
-  FinalizeFile on an empty / below-floor file (the probe's one weak task was a
+  at/above floor → force the host's sealing tool;
+* a **HARD empty-finalize guard** (the validated edge): NEVER force a seal
+  on an empty / below-floor file (the probe's one weak task was a
   forced-finalize firing on a 0-byte file);
 * everything bounded by per-run forced-round caps (``longfile_max_forced_*``),
   subordinate to ``max_turns_per_run`` — the driver can NEVER spin.
@@ -36,12 +36,18 @@ point is a no-op, so behaviour is bit-identical to pre-FEAT.
 from __future__ import annotations
 
 import json
-from typing import TYPE_CHECKING, Any, Final, Literal
+from typing import TYPE_CHECKING, Any, Literal
 
+from protocore.contracts.tool_roles import (
+    BYTE_PRODUCING_ROLES,
+    ToolArgumentSlot,
+    ToolRole,
+)
 from protocore.logging_utils import get_logger
+from protocore.runtime.tool_arguments import string_argument
 
 if TYPE_CHECKING:  # pragma: no cover - typing only
-    from protocore.contracts.runtime_constants import RuntimeConstants
+    from protocore.contracts.runtime_constants import LoopConstants
     from protocore.contracts.types import ToolCall
     from protocore.runtime.query_engine import QueryEngine
 
@@ -75,21 +81,75 @@ class _SafeFormatDict(dict[str, Any]):
         )
         return "{" + key + "}"
 
-# The runtime's own chunkable file-write tools. The stall detector keys on byte
-# production reported by THESE tools' results; a per-tenant flagged content tool
-# drives the truncation-recovery wording but its append-resume byte semantics
-# are tool-specific, so it is not tracked here (mirrors
-# ``query._record_chunk_write_success`` / ``CHUNKABLE_CONTENT_MUTATION_ALLOWLIST``).
-_BYTE_MUTATION_TOOLS: frozenset[str] = frozenset({"Write", "AppendFile"})
+#: The two decisions the driver can reach. Roles, not names: which of the
+#: host's tools continues a file and which seals it is the host's statement,
+#: and the driver has no business knowing what either is called.
+ForcedRole = Literal[ToolRole.appends_path, ToolRole.finalizes_path]
 
-ForcedTool = Literal["AppendFile", "FinalizeFile"]
 
-# The tool that seals an in-flight artifact. Named here because the wind-down
-# has to keep it on an otherwise-emptied tool surface: a run cut short while a
-# long file is being written has that file on disk, unsealed, and removing the
-# only tool able to close it would throw the work away in the name of stopping
-# cleanly.
-FINALIZE_FILE_TOOL_NAME: Final[str] = "FinalizeFile"
+def byte_producing_tools(engine: QueryEngine) -> frozenset[str]:
+    """The host tools whose results report bytes landing at a path.
+
+    The stall detector keys on byte production reported by THESE tools'
+    results; a per-tenant flagged content tool drives the truncation-recovery
+    wording but its append-resume byte semantics are tool-specific, so it is
+    not tracked here (mirrors ``query._record_chunk_write_success``).
+    """
+    return engine.config.tool_roles.names_with(*BYTE_PRODUCING_ROLES)
+
+
+#: Latch so the "nothing to drive" warning is stated once per run, not once
+#: per tool result.
+_ROLES_WARNED_ATTR = "_longfile_roles_warned"
+
+
+def _warn_no_byte_producing_tools(engine: QueryEngine) -> None:
+    """Say once that convergence is on and there is nothing for it to watch.
+
+    Silence here was the old failure exactly: the driver keyed on names it had
+    spelled itself, a host that named its tools differently produced no match,
+    and the run simply never converged with nothing anywhere saying why.
+    """
+    if getattr(engine, _ROLES_WARNED_ATTR, False):
+        return
+    setattr(engine, _ROLES_WARNED_ATTR, True)
+    _logger.warning(
+        "DIAG longfile.no_byte_producing_tools run=%s: large-file convergence "
+        "is enabled but the role map declares no tool that produces bytes at a "
+        "path; nothing will be tracked or driven",
+        engine.config.run_id,
+    )
+
+
+def forced_tool_name(engine: QueryEngine, role: ForcedRole) -> str | None:
+    """The host's name for a forced decision, or None when it named none.
+
+    ``tool_choice`` carries exactly one name, so a role held by two tools is
+    as unusable as a role held by none: the driver cannot pick for the host.
+    Either way the decision cannot be issued, and that is said out loud —
+    a convergence driver that goes quiet because a tool was renamed is the
+    failure this map exists to end.
+    """
+    name = engine.config.tool_roles.sole_name(role)
+    if name is None:
+        _logger.warning(
+            "DIAG longfile.unnamed_role run=%s role=%s: large-file convergence "
+            "is enabled but the role map names no single tool for it",
+            engine.config.run_id,
+            role.value,
+        )
+    return name
+
+
+def sealing_tool_name(engine: QueryEngine) -> str | None:
+    """The tool that seals an in-flight artifact, as the host named it.
+
+    Asked by the wind-down, which has to keep that tool on an otherwise-emptied
+    surface: a run cut short while a long file is being written has that file
+    on disk, unsealed, and removing the only tool able to close it would throw
+    the work away in the name of stopping cleanly.
+    """
+    return engine.config.tool_roles.sole_name(ToolRole.finalizes_path)
 
 # The forced-tool the convergence driver wants on the NEXT assistant stream.
 # Stored as a transient engine attribute (consumed + cleared by the stream
@@ -119,15 +179,15 @@ def _int_field(payload: dict[str, Any], key: str) -> int | None:
 
 
 def _parse_byte_result(
-    tool_call: ToolCall, content: str
+    engine: QueryEngine, tool_call: ToolCall, content: str
 ) -> tuple[int, int | None, int | None] | None:
-    """Parse a Write/AppendFile result into ``(delta_bytes, total_bytes, lines)``.
+    """Parse a byte-producing result into ``(delta_bytes, total_bytes, lines)``.
 
  The tool result content is ``BaseToolOutput.model_dump_json`` (the JSON the
- model sees). ``WriteOutput`` carries ``bytes_written`` — a Write OVERWRITES,
- so that IS both the delta and the new total; it carries NO line count, so
- the caller derives the full-file line count from the Write ``content`` arg.
- ``AppendFileOutput`` carries ``bytes_appended`` (delta), ``bytes_total``
+ model sees). An overwrite reports ``bytes_written`` — it replaces the file, so that IS
+ both the delta and the new total; it carries NO line count, so the caller
+ derives the full-file line count from the body it was given.
+ An append reports ``bytes_appended`` (delta), ``bytes_total``
  (cumulative size) and ``line_count_total`` (full-file lines).
 
  Returns ``(delta, total, lines)`` where ``total``/``lines`` are ``None`` when
@@ -137,7 +197,7 @@ never the bare delta, see A-). Returns None entirely for a non-byte
  parse failure is treated as "no bytes" (the stall counter then advances, the
  safe direction: drive MORE production, never a premature seal).
  """
-    if tool_call.name not in _BYTE_MUTATION_TOOLS:
+    if tool_call.name not in byte_producing_tools(engine):
         return None
     try:
         payload: Any = json.loads(content)
@@ -145,12 +205,12 @@ never the bare delta, see A-). Returns None entirely for a non-byte
         return None
     if not isinstance(payload, dict):
         return None
-    if tool_call.name == "Write":
+    if not _appends(engine, tool_call.name):
         written = _int_field(payload, "bytes_written")
         if written is None:
             return None
-        # A Write overwrites: bytes_written IS the new total. No line count in
-        # WriteOutput — the caller counts lines from the Write ``content`` arg.
+        # An overwrite reports one number: it IS the new total. It carries no
+        # line count, so the caller counts lines from the body it was given.
         return (written, written, None)
     # AppendFile — the explicit delta is required; total + line_count_total are
     # reported but tolerated-absent (the caller falls back to running-size+delta
@@ -163,18 +223,22 @@ never the bare delta, see A-). Returns None entirely for a non-byte
     return (appended, total, lines)
 
 
-def _resolve_write_path(tool_call: ToolCall) -> str | None:
-    """Resolve the file path a Write/AppendFile call targets, or None.
+def _appends(engine: QueryEngine, name: str) -> bool:
+    """True iff the host declared ``name`` as continuing a file rather than
+    replacing it. The two report their bytes differently — an append states a
+    delta and a cumulative total, an overwrite states one number that is both."""
+    return engine.config.tool_roles.has_role(name, ToolRole.appends_path)
 
-    Accepts the canonical ``path`` plus the ``file_path`` alias (mirrors
-    the host write-tool ``AliasChoices``). A call with no resolvable path is
-    not tracked (returns None) — the stall detector then keeps using the
-    previously-bound active path.
+
+def _resolve_write_path(engine: QueryEngine, tool_call: ToolCall) -> str | None:
+    """Resolve the file path a byte-producing call targets, or None.
+
+    A call with no resolvable path is not tracked (returns None) — the stall
+    detector then keeps using the previously-bound active path.
     """
-    args = tool_call.arguments
-    if not isinstance(args, dict):
-        return None
-    return _resolve_path_from_args(args)
+    return string_argument(
+        tool_call.arguments, ToolArgumentSlot.path, roles=engine.config.tool_roles
+    )
 
 
 def observe_tool_result(
@@ -188,7 +252,7 @@ def observe_tool_result(
     """Record one tool result's effect on byte production .
 
  Called from the successful-dispatch path for EVERY tool result. When the
- driver is disabled this is a no-op. A Write/AppendFile result that reports a
+ driver is disabled this is a no-op. A byte-producing result that reports a
  positive byte delta:
 
  * resets ``_turns_since_last_byte_adding_mutation`` to 0;
@@ -218,7 +282,7 @@ def observe_tool_result(
  Otherwise a multi-file run corrupts the tracked size for the real artifact
  → false stall/plateau → spurious forced actions (universality violation).
 
- The same per-path discipline applies to FinalizeFile: a successful finalize
+ The same per-path discipline applies to the seal: a successful finalize
  seals the run-global ``_longfile_finalized`` latch ONLY when it targets the
  bound active path. A voluntary finalize of a small SIDE file (its own
  chunk-protocol use) while the truncation-latched large artifact is still in
@@ -228,25 +292,28 @@ def observe_tool_result(
  """
     if not is_enabled(engine):
         return
+    if not byte_producing_tools(engine):
+        _warn_no_byte_producing_tools(engine)
+        return
     if is_error:
         return
-    # A successful FinalizeFile seals the file — the driver stops (no point
+    # A successful seal ends the driver's work on the file — the driver stops (no point
     # re-forcing a finalize on an already-sealed file, even when FinalizeFile
     # is not the tenant's terminal tool and the loop continues). Path-aware:
     # only flip the run-global latch when the finalize targets the bound active
     # path. A finalize of a side file, or one with no active artifact in flight,
     # must NOT seal the latch — sealing the wrong path would let the
     # truncation-latched artifact end unconverged.
-    if tool_call.name == "FinalizeFile":
+    if engine.config.tool_roles.has_role(tool_call.name, ToolRole.finalizes_path):
         active_path = engine._longfile_active_path
-        if active_path is not None and _resolve_write_path(tool_call) == active_path:
+        if active_path is not None and _resolve_write_path(engine, tool_call) == active_path:
             engine._longfile_finalized = True
         return
-    parsed = _parse_byte_result(tool_call, content)
+    parsed = _parse_byte_result(engine, tool_call, content)
     if parsed is None:
         return
     delta, total, lines = parsed
-    call_path = _resolve_write_path(tool_call)
+    call_path = _resolve_write_path(engine, tool_call)
     if engine._longfile_active_path is None:
         if call_path is not None:
             engine._longfile_active_path = call_path
@@ -266,7 +333,7 @@ def observe_tool_result(
     # reported/derived total as authoritative (it already accounts for the
     # delta). The ``max()`` guards a malformed under-report.
     engine._longfile_active_file_bytes = max(
-        engine._longfile_active_file_bytes if tool_call.name == "AppendFile" else 0,
+        engine._longfile_active_file_bytes if _appends(engine, tool_call.name) else 0,
         total,
     )
     # Track the REAL full-file line count (B-) so the continue
@@ -274,7 +341,7 @@ def observe_tool_result(
     # reports ``line_count_total`` directly; a Write overwrites, so its full-file
     # line count is the line count of its ``content`` arg.
     engine._longfile_active_file_lines = _resolve_file_lines(
-        tool_call, lines, fallback=engine._longfile_active_file_lines
+        engine, tool_call, lines, fallback=engine._longfile_active_file_lines
     )
     engine._longfile_mutation_deltas.append(delta)
     # Do NOT clear the truncated-tail flag on a
@@ -294,7 +361,7 @@ def observe_tool_result(
     # self-loop. A Write is the file's (re)creation, not an append, so it is not
     # counted. The path key is the bound active path (the off-path guard above
     # already returned for a side-file).
-    if tool_call.name == "AppendFile" and engine._longfile_active_path is not None:
+    if _appends(engine, tool_call.name) and engine._longfile_active_path is not None:
         active = engine._longfile_active_path
         engine._longfile_appends_per_path[active] = (
             engine._longfile_appends_per_path.get(active, 0) + 1
@@ -302,24 +369,24 @@ def observe_tool_result(
 
 
 def _resolve_file_lines(
-    tool_call: ToolCall, reported_lines: int | None, *, fallback: int
+    engine: QueryEngine, tool_call: ToolCall, reported_lines: int | None, *, fallback: int
 ) -> int:
     """Resolve the full-file line count after a byte-adding mutation (B-).
 
-    AppendFile reports ``line_count_total`` (the cumulative full-file lines) —
-    used directly when present. A Write OVERWRITES, so its full-file line count
-    is the line count of its ``content`` argument (WriteOutput carries no line
-    count). When neither is available, keep the prior ``fallback`` count rather
+    An append reports ``line_count_total`` (the cumulative full-file lines) —
+    used directly when present. An overwrite replaces the file, so its
+    full-file line count is the line count of the body it was given (an
+    overwrite result carries no line count). When neither is available, keep the prior ``fallback`` count rather
     than reporting a wrong number.
     """
     if reported_lines is not None:
         return reported_lines
-    if tool_call.name == "Write":
-        args = tool_call.arguments
-        if isinstance(args, dict):
-            content = args.get("content")
-            if isinstance(content, str) and content:
-                return content.count("\n") + 1
+    if not _appends(engine, tool_call.name):
+        content = string_argument(
+            tool_call.arguments, ToolArgumentSlot.content, roles=engine.config.tool_roles
+        )
+        if content:
+            return content.count("\n") + 1
     return fallback
 
 
@@ -418,7 +485,7 @@ def active_file_bytes(engine: QueryEngine) -> int:
     return max(0, engine._longfile_active_file_bytes)
 
 
-def _finalize_floor(rc: RuntimeConstants) -> int:
+def _finalize_floor(rc: LoopConstants) -> int:
     """The minimum bytes required before a forced FinalizeFile is permitted.
 
  The HARD empty-finalize guard : ``max(1, floor * min_fraction)``.
@@ -536,7 +603,7 @@ def _stall_detected(engine: QueryEngine) -> bool:
     )
 
 
-def decide_next_forced_tool(engine: QueryEngine) -> ForcedTool | None:
+def decide_next_forced_tool(engine: QueryEngine) -> ForcedRole | None:
     """Decide the forced ``tool_choice`` for the NEXT assistant stream (-5.5).
 
     Mirrors the validated probe decision (``cases/probe_longfile_converge.py``):
@@ -558,7 +625,7 @@ def decide_next_forced_tool(engine: QueryEngine) -> ForcedTool | None:
            remaining → force FinalizeFile (the model has stopped producing; stop
            fighting it with endless appends).
 
-    Returns the forced tool name, or None when the driver should not act
+    Returns the forced ROLE, or None when the driver should not act
     (disabled / no stall / no budget / guard blocks finalize). The HARD
     empty-finalize guard (:func:`finalize_permitted`) gates EVERY FinalizeFile
     decision so a 0-byte / below-floor file is NEVER sealed — the one validated
@@ -599,7 +666,7 @@ def decide_next_forced_tool(engine: QueryEngine) -> ForcedTool | None:
         and finalize_permitted(engine)
         and _plateau_reached(engine)
     ):
-        return "FinalizeFile"
+        return ToolRole.finalizes_path
 
     # 2. Terminal seal — enough forced content; the body keeps truncating so it
     # never cleanly plateaus, but the file is comfortably past its floor.
@@ -609,7 +676,7 @@ def decide_next_forced_tool(engine: QueryEngine) -> ForcedTool | None:
         and engine._longfile_forced_appends >= rc.longfile_max_forced_appends
         and not plausibly_complete(engine)
     ):
-        return "FinalizeFile"
+        return ToolRole.finalizes_path
 
     # Per-path forced-append circuit-breaker. Once the active path has hit
     # ``longfile_max_appends_per_path`` total appends (forced + voluntary) the
@@ -619,7 +686,7 @@ def decide_next_forced_tool(engine: QueryEngine) -> ForcedTool | None:
     # the truncation gate removes the small-file voluntary flood at the root).
     if append_breaker_tripped(engine):
         if finalize_budget and finalize_permitted(engine):
-            return "FinalizeFile"
+            return ToolRole.finalizes_path
         return None
 
     # 3. Stall handling — only when the stall threshold is actually met.
@@ -627,14 +694,14 @@ def decide_next_forced_tool(engine: QueryEngine) -> ForcedTool | None:
         return None
 
     if not plausibly_complete(engine) and append_budget:
-        return "AppendFile"
+        return ToolRole.appends_path
 
     # Plausibly complete (model is done producing, just won't seal) OR append
     # budget exhausted → force the seal, but ONLY if the empty-finalize guard
     # permits it. Below-floor + no append budget left → no action (let the loop
     # take its normal terminal path; we never seal an under-floor file).
     if finalize_budget and finalize_permitted(engine):
-        return "FinalizeFile"
+        return ToolRole.finalizes_path
     return None
 
 
@@ -711,7 +778,7 @@ def commit_forced_finalize(engine: QueryEngine) -> None:
     engine._longfile_forced_finalizes += 1
 
 
-def set_force_next_tool(engine: QueryEngine, tool_name: ForcedTool) -> None:
+def set_force_next_tool(engine: QueryEngine, tool_name: str) -> None:
     """Record the forced ``tool_choice`` for the next assistant stream.
 
     Stored as a transient engine attribute consumed (and cleared) by the stream
@@ -728,7 +795,7 @@ def peek_force_next_tool(engine: QueryEngine) -> str | None:
     forced tool is on the per-turn surface BEFORE popping it — a
     compacted / BM25-clipped surface may not include the tool (e.g.
     ``AppendFile`` / ``FinalizeFile`` are not in
-    :attr:`RuntimeConstants.tool_surface_forced_pins` by default), in which
+    :attr:`LoopConstants.tool_surface_forced_pins` by default), in which
     case :func:`take_force_next_tool` must NOT consume the hint: the
     forcing is the active ingredient, and burning the budget on a stream
     the model never sees offered is the exact failure that drops the force
@@ -759,8 +826,8 @@ def take_force_next_tool(engine: QueryEngine) -> str | None:
 def build_continue_message(engine: QueryEngine) -> str:
     """Build the bilingual INCOMPLETE continue message + tail anchor .
 
- The tail anchor is read from the model's OWN most-recent ``Write``/
- ``AppendFile`` history entry for the active path via :func:`_active_file_tail`
+ The tail anchor is read from the model's OWN most-recent byte-producing
+ history entry for the active path via :func:`_active_file_tail`
 core has NO direct workspace read, so the history scan is the universal
  source (Deviation #1; no disk read, an empty tail on a compacted history).
  ``file_lines`` is the REAL full-file line count tracked from the tool-result
@@ -825,17 +892,21 @@ def _active_file_tail(engine: QueryEngine, chars: int) -> str:
             if tool_use is None:
                 continue
             name, args = tool_use
-            if name not in _BYTE_MUTATION_TOOLS:
+            if name not in byte_producing_tools(engine):
                 continue
-            block_path = _resolve_path_from_args(args)
+            block_path = string_argument(
+                args, ToolArgumentSlot.path, roles=engine.config.tool_roles
+            )
             # Require an EXPLICIT path match: a block whose path is unparseable
             # (``block_path is None``) must be SKIPPED, never wildcard-matched to
             # the active path — reading the tail from an unknown-path write would
             # hand the model the wrong continuation anchor (B-/ ).
             if block_path != path:
                 continue
-            content = args.get("content")
-            if isinstance(content, str) and content:
+            content = string_argument(
+                args, ToolArgumentSlot.content, roles=engine.config.tool_roles
+            )
+            if content:
                 return content[-chars:]
     return ""
 
@@ -862,11 +933,3 @@ def _tool_use_block(block: Any) -> tuple[str, dict[str, Any]] | None:
             return name, parsed
     return None
 
-
-def _resolve_path_from_args(args: dict[str, Any]) -> str | None:
-    """Resolve a file path from a tool-call args dict (``path``/``file_path``)."""
-    for key in ("path", "file_path"):
-        value = args.get(key)
-        if isinstance(value, str) and value:
-            return value
-    return None

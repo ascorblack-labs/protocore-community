@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import math
 import uuid
+from collections.abc import Sequence
 from datetime import UTC, datetime
 from enum import StrEnum
 from typing import Any, Literal, Self
@@ -244,14 +245,11 @@ SYNTHETIC_RECOVERY_PRE_DISPATCH_TERMINAL_VERIFY = "pre_dispatch_terminal_verify"
 SYNTHETIC_RECOVERY_CIRCUIT_BREAKER = "tool_error_circuit_breaker"
 """``SYNTHETIC_RECOVERY_METADATA_KEY`` value for the repeated-tool-error
 circuit-breaker corrective turn — injected ONCE when a tool crosses
-``RuntimeConstants.max_consecutive_tool_errors`` consecutive failures of the same
+``LoopConstants.max_consecutive_tool_errors`` consecutive failures of the same
 error class and is hard-stopped for the rest of the run. The bounded user turn
 tells the model the tool has been disabled and to answer/finalize from the
 conversation instead of retrying. Runtime scaffolding (not user-authored), so it
 is filtered from the durable transcript like the other synthetic user nudges."""
-
-SYNTHETIC_RECOVERY_SANDBOX_DOWN_NUDGE = "sandbox_down_inline_strategy"
-"""``SYNTHETIC_RECOVERY_METADATA_KEY`` value for sandbox-down strategy nudges."""
 
 SYNTHETIC_RECOVERY_GUARANTEED_TERMINAL = "guaranteed_terminal_scaffold"
 """``SYNTHETIC_RECOVERY_METADATA_KEY`` value for guaranteed-terminal scaffold."""
@@ -431,21 +429,67 @@ class RunStatus(StrEnum):
 
 
 class HookEvent(StrEnum):
-    """The 10 hook events.
+    """Every coordinate a run passes through — the one lifecycle list.
 
-    Spec lives in core; executor (HTTP POST URL / LLM-as-hook prompt) is
-    the host. 8 base events + ``subagent_start`` (sync, can DENY) +
-    ``subagent_stop`` (async, observer only) for subagent observability.
+    This enum is the whole vocabulary of the lifecycle seam described in
+    :mod:`protocore.contracts.middleware`: a registration names one of these
+    and nothing else, and there is no second list to keep in step with it.
+    Members are grouped by what part of a run they sit on.
+
+    Run and session
+        ``run_start`` — the run is about to drive anything;
+        ``run_finalize`` — the run has stopped, whatever the reason;
+        ``session_start`` / ``session_end`` — the conversation's own ends.
+
+    Turn
+        ``turn_start`` / ``turn_end`` — one assistant message, start to finish.
+
+    Context
+        ``context_transform`` — the assembled context, before it is sent. A
+        ``transform`` here replaces what the provider is asked with.
+
+    Provider exchange
+        ``request_prepare`` — before the provider is called;
+        ``response_received`` — after it answered;
+        ``request_error`` — after it did not.
+
+    Tool call
+        ``user_prompt_submit`` — a user message enters the session;
+        ``pre_tool_use`` — before a call runs (may deny or park it);
+        ``tool_execute`` — the invocation itself, wrapped by the dispatcher:
+        an ``around`` here sees the call go in and the result come out, and a
+        handler that skips ``next`` means the tool never runs at all;
+        ``post_tool_use`` — after it returned;
+        ``file_changed`` — a workspace file was created, changed or removed.
+
+    Compaction, as a transaction
+        ``pre_compact`` opens it, ``compaction_commit`` closes it on success,
+        ``compaction_rollback`` closes it when the pass could not finish, and
+        ``post_compact`` reports the finished transaction.
+
+    Delegation
+        ``subagent_start`` (may deny) / ``subagent_stop`` (observer only).
     """
 
-    pre_tool_use = "pre_tool_use"
-    post_tool_use = "post_tool_use"
-    user_prompt_submit = "user_prompt_submit"
+    run_start = "run_start"
+    run_finalize = "run_finalize"
     session_start = "session_start"
     session_end = "session_end"
-    pre_compact = "pre_compact"
-    post_compact = "post_compact"
+    turn_start = "turn_start"
+    turn_end = "turn_end"
+    context_transform = "context_transform"
+    request_prepare = "request_prepare"
+    response_received = "response_received"
+    request_error = "request_error"
+    user_prompt_submit = "user_prompt_submit"
+    pre_tool_use = "pre_tool_use"
+    tool_execute = "tool_execute"
+    post_tool_use = "post_tool_use"
     file_changed = "file_changed"
+    pre_compact = "pre_compact"
+    compaction_commit = "compaction_commit"
+    compaction_rollback = "compaction_rollback"
+    post_compact = "post_compact"
     subagent_start = "subagent_start"
     subagent_stop = "subagent_stop"
 
@@ -599,15 +643,62 @@ class ToolUseBlock(BaseModel):
 
 
 class ToolResultBlock(BaseModel):
-    """Tool-call result returned to the model."""
+    """The MODEL PROJECTION of one tool result, as it sits in the transcript.
+
+    This is not the tool's result; it is the view of it the model is shown.
+    :class:`ToolResult` is the canonical value the tool returned, and this
+    block carries only what belongs in a conversation: the text for the model,
+    whether the call failed, and two references back to the value the text was
+    projected from.
+
+    Keeping the two apart is what makes shrinking a transcript safe. Compaction
+    and eviction rewrite :attr:`content`, because a projection is by definition
+    replaceable; they never claim to have preserved the value, because
+    :attr:`canonical_ref` is where the value went and it is left alone.
+    """
 
     model_config = ConfigDict(frozen=True)
 
     kind: Literal[ContentBlockKind.tool_result] = ContentBlockKind.tool_result
     tool_call_id: str
     content: str
+    """The text the model reads. A projection — shrinkable, and shrunk."""
+
     is_error: bool = False
     metadata: dict[str, Any] = Field(default_factory=dict)
+
+    canonical_ref: str | None = None
+    """Where the full canonical value is kept, when it is kept anywhere.
+
+    A blob key in the run's store. ``None`` means the value is not stored: it
+    is either exactly what :attr:`content` still says, or held beside it in
+    :attr:`canonical_content` until something stores it. Once this is set,
+    :attr:`content` may be a
+    summary, a placeholder or a first page without any of that being a loss:
+    the value is retrievable, and the reference says so out loud rather than
+    leaving a reader to guess whether the text in front of it is all there was.
+    """
+
+    canonical_content: str | None = None
+    """The value :attr:`content` is a projection of, while it is nowhere else.
+
+    A tool that hands back a short view of a long result leaves the long result
+    here, so the transcript still holds it. ``None`` means there is nothing to
+    hold apart: either no projection was taken, or the value has already been
+    stored and :attr:`canonical_ref` says where. Compaction reads this field to
+    store the value the projection came from rather than the projection, and
+    clears it once it has an address to point at instead.
+    """
+
+    path: str | None = None
+    """The workspace path this result describes, when it describes one.
+
+    A result that is a view of a file goes stale when that file is rewritten,
+    and this is the only field that lets the runtime notice. It is what
+    :func:`protocore.runtime.result_eviction.pins_invalidated_by_writes`
+    matches a later mutating call against, so a result the caller asked to keep
+    stops being kept once it stopped being true.
+    """
 
     @field_validator("metadata")
     @classmethod
@@ -651,7 +742,17 @@ class Message(BaseModel):
     model_config = ConfigDict(frozen=True)
 
     role: MessageRole
-    content_blocks: list[ContentBlock] = Field(default_factory=list)
+    content_blocks: Sequence[ContentBlock] = Field(default_factory=tuple)
+    """The blocks that make up this message, held as an immutable sequence.
+
+    Frozen means the field cannot be rebound; it says nothing about the
+    contents of a mutable value behind it, and a list here would still accept
+    an ``append``. That matters because estimates of a message's token weight
+    are remembered against the message object: appending to a list in place
+    would leave the object the same and its remembered weight stale, and the
+    budget that sizes a history would go on believing a number that stopped
+    being true. Validation converts whatever is passed to a tuple, so the
+    premise the cache rests on is enforced rather than asserted."""
     reasoning_content: str | None = None
     """Persisted chain-of-thought for thinking-capable providers.
 
@@ -674,6 +775,15 @@ class Message(BaseModel):
     exclude it and never submit runtime scaffolding as the model's answer
     Survives snapshot/resume via ``model_dump`` / ``model_validate``
     (``QueryEngine.snapshot``). Default empty → no annotations, no wire effect."""
+
+    @field_validator("content_blocks", mode="after")
+    @classmethod
+    def _freeze_content_blocks(
+        cls,
+        value: Sequence[ContentBlock],
+    ) -> Sequence[ContentBlock]:
+        """Hold the blocks in something nothing can append to."""
+        return tuple(value)
 
     @field_validator("metadata")
     @classmethod
@@ -721,7 +831,7 @@ class ToolCall(BaseModel):
     parser). Drives the mid-tool-call recovery branch in
     :func:`protocore.runtime.query._stream_one_assistant_message`: the loop
     synthesises a resume nudge naming the truncated tool(s) and re-streams up
-    to :attr:`RuntimeConstants.max_output_recovery_rounds` times rather than
+    to :attr:`LoopConstants.max_output_recovery_rounds` times rather than
     dispatching the partial call (which would silently corrupt large-file
     writes)."""
 
@@ -738,7 +848,25 @@ class ToolCall(BaseModel):
 
 
 class ToolResult(BaseModel):
-    """Result of a single tool invocation.
+    """The canonical value one tool invocation produced.
+
+    One value, three audiences, and they want different things. The model
+    wants as few tokens as will still let it decide what to do next; the
+    person watching wants the diff rendered, the table laid out, the image;
+    the run itself wants the whole thing kept so a later turn — or an
+    operator — can go back to it. Serving all three out of one string is why
+    truncating a transcript used to destroy evidence: there was nothing to
+    truncate except the only copy.
+
+    So this type states the value once and names the projections beside it.
+    :attr:`content` is the value — complete, whatever its size.
+    :attr:`model_projection` is what the transcript carries in its place when
+    the whole of it does not belong there; :attr:`ui_payload` rides the result
+    event and never enters the transcript at all; :attr:`canonical_ref` says
+    where the whole value can be fetched back from once the transcript no
+    longer holds it. A tool that names none of them says the value is small
+    enough to be its own projection, which is the common case and costs it
+    nothing.
 
     ``evidence_records`` is a trusted runtime side channel.  It is deliberately
     not copied to :class:`ToolResultBlock`, result metadata, or the public
@@ -751,15 +879,74 @@ class ToolResult(BaseModel):
 
     tool_call_id: str
     content: str
+    """The canonical value. Never shortened by the tool for the model's sake."""
+
     is_error: bool = False
     metadata: dict[str, Any] = Field(default_factory=dict)
     evidence_records: tuple[Any, ...] = ()
+
+    model_projection: str | None = None
+    """What the transcript carries instead of :attr:`content`, if anything.
+
+    ``None`` — the default, and what a tool that says nothing about
+    projections gets — means the canonical value IS the model's view of it.
+    A tool sets this when it knows a shorter honest rendering: the first page
+    of a long listing, the summary line of a large diff, ``wrote 4.2 MB to
+    <path>`` for bytes the model has no use for reading back.
+    """
+
+    ui_payload: dict[str, Any] | None = None
+    """Structured detail for whoever is watching, which the model never sees.
+
+    Carried on the result event and dropped there. It does not reach the
+    transcript, so it costs no tokens, cannot be compacted away, and cannot
+    change what the model decides — which is what makes it safe to put a whole
+    rendered table or a per-hunk diff in it.
+    """
+
+    canonical_ref: str | None = None
+    """Where :attr:`content` can be fetched back from, if the tool stored it.
+
+    A blob key. A tool that already wrote its output somewhere durable names
+    it here instead of making the runtime store a second copy; when the tool
+    names nothing, compaction stores the value itself at the moment it first
+    needs the room, and fills this in on the block it rewrites.
+    """
+
+    path: str | None = None
+    """The workspace path this result is a view of, when it is a view of one.
+
+    Stated by the tool, because only the tool knows whether its output was
+    about a file at all. It travels onto :attr:`ToolResultBlock.path`, where
+    it is what lets a later write say that this result is no longer true.
+    """
+
+    @property
+    def model_content(self) -> str:
+        """The text the transcript should carry for this result.
+
+        The projection when there is one, the canonical value when there is
+        not. Every path that builds a :class:`ToolResultBlock` reads this
+        rather than :attr:`content`, so a tool gets the projection it asked
+        for and a tool that asked for none is unaffected.
+        """
+        return self.content if self.model_projection is None else self.model_projection
+
+    @field_validator("ui_payload")
+    @classmethod
+    def _reject_non_finite_ui_payload(
+        cls, value: dict[str, Any] | None
+    ) -> dict[str, Any] | None:
+        """The UI payload is serialised to JSON like every other event field."""
+        if value is None:
+            return None
+        return _reject_non_finite_floats(value, field="ToolResult.ui_payload")
 
     @model_validator(mode="after")
     def _validate_evidence_records(self) -> Self:
         """Accept only immutable typed evidence from successful tools.
 
-        ``EvidenceRecord`` lives in ``contracts.verification`` which imports
+        ``EvidenceRecord`` lives in ``contracts.evidence`` which imports
         the conversation block types in this module.  Resolving it lazily here
         preserves that acyclic contract layering while still rejecting raw
         mappings, text, and arbitrary objects at the tool boundary.
@@ -768,7 +955,7 @@ class ToolResult(BaseModel):
             raise ValueError("an error ToolResult must not contain evidence records")
         if not self.evidence_records:
             return self
-        from protocore.contracts.verification import EvidenceRecord
+        from protocore.contracts.evidence import EvidenceRecord
 
         if any(not isinstance(record, EvidenceRecord) for record in self.evidence_records):
             raise ValueError("ToolResult evidence_records must contain EvidenceRecord values")
@@ -814,8 +1001,8 @@ class ToolPrecondition(BaseModel):
 
     A call that errored did not run, so it never counts towards this total —
     it only spends an attempt against
-    :attr:`RuntimeConstants.run_tool_precondition_max_attempts`. The upper
-    bound is :attr:`RuntimeConstants.run_tool_precondition_max_calls`,
+    :attr:`LoopConstants.run_tool_precondition_max_attempts`. The upper
+    bound is :attr:`LoopConstants.run_tool_precondition_max_calls`,
     enforced where the tuple meets the engine config rather than here, because
     a per-tenant runtime constant cannot be a class-level field bound.
     """
@@ -830,7 +1017,7 @@ class Event(BaseModel):
     """In-flight event envelope.
 
     Anthropic-aligned event names
-    plus Protocore extensions (``sandbox_starting``/``subagent_spawn``/
+    plus this runtime's extensions (``tool_transport_starting``/``subagent_spawn``/
     ``hook_fired``/``tool_call_pending``). The enum lives in
     :mod:`protocore.events`.
     """
@@ -968,6 +1155,55 @@ class SubagentDef(BaseModel):
     blocked_tools: list[str] = Field(default_factory=list)
     tool_call_soft_caps: dict[str, int] = Field(default_factory=dict)
     skill_whitelist: list[str] = Field(default_factory=list)
+
+    # -- how the child is driven ------------------------------------------
+    #
+    # A definition used to say what a subagent IS and nothing about how it
+    # runs: which model answers for it, how many turns it may take, how long
+    # it may take them, how strict its permissions are, and whether its caller
+    # waits for it. Every one of those was decided by whatever the parent
+    # happened to be configured with, so a cheap classifier and an expensive
+    # researcher were dispatched identically and neither could be bounded on
+    # its own terms.
+    #
+    # These are DECLARATIONS, and the core enforces none of them: nothing in
+    # the loop builds a child run, so nothing here can choose its model, count
+    # its turns or start its clock. Each field says what the definition asks
+    # for and names who has to honour it, and a host that reads one as already
+    # enforced will ship a bound that does not exist.
+
+    model: str = ""
+    """Model this agent answers with, or empty to inherit the parent's.
+
+    Honoured by whoever resolves the child's provider chain, which is the host:
+    the core is handed a model name and never chooses one.
+    """
+
+    max_turns: int = 0
+    """Turn ceiling for one child run; ``0`` inherits the parent's bound.
+
+    Honoured by the host that builds the child run, which is where a turn
+    ceiling becomes a number the loop is configured with.
+    """
+
+    timeout_seconds: float | None = None
+    """Wall-clock ceiling for one child run; ``None`` inherits the parent's.
+
+    Honoured by the host that builds the child run, as its wall budget.
+    """
+
+    permission_mode: str = ""
+    """Permission strictness for the child, or empty to inherit the parent's.
+
+    Narrowing only. :func:`~protocore.runtime.child_capabilities.narrow_child_capabilities`
+    resolves this against the parent's mode and keeps the STRICTER of the two,
+    so a definition can tighten a child and can never loosen one. Core ships no
+    mode names and applies no mode: the resolved value is for the host that
+    asks people for permission to act on.
+    """
+
+    background: bool = False
+    """Whether a call on this agent returns as soon as the child is launched."""
 
 
 class SubagentResult(BaseModel):
@@ -1210,7 +1446,7 @@ class ToolParameterSchema(BaseModel):
             "Write->AppendFile->FinalizeFile). ``None`` (default) "
             "omits the marker. Only a tool with this flag ``True`` (or one on "
             "the built-in allowlist — see "
-            ":data:`~protocore.contracts.tool_chunking.CHUNKABLE_CONTENT_MUTATION_ALLOWLIST`) "
+            ":func:`~protocore.contracts.tool_chunking.chunkable_content_mutation_names`) "
             "whose required ``content`` field was cut at the output cap is routed "
             "into the runtime chunk-recovery protocol; an unknown/dynamic tool "
             "that merely happens to declare a ``content`` field gets the generic "
@@ -1243,7 +1479,7 @@ class ToolDefinition(BaseModel):
             "The check is performed by "
             ":func:`protocore.runtime.tool_preconditions.check_preconditions` "
             "inside :class:`~protocore.runtime.tool_dispatch.ToolDispatcher` "
-            "when ``RuntimeConstants.tool_preconditions_enabled`` is True; "
+            "when ``LoopConstants.tool_preconditions_enabled`` is True; "
             "an unmet precondition returns a "
             "``[PRECONDITION NOT MET: ...]`` tool-error envelope without "
             "dispatching."
@@ -1273,6 +1509,25 @@ class SubagentTask(BaseModel):
     subagent_id: str
     parent_run_id: str
     task_prompt: str
+
+    # -- how this one call is collected -----------------------------------
+    #
+    # The definition states the agent's defaults; these state what THIS call
+    # asked for. A caller that wants one child in the background and the next
+    # one waited on has to be able to say so per call, or "background" is a
+    # property of the agent forever.
+
+    background: bool = False
+    """Return the task id as soon as the child is launched, rather than waiting."""
+
+    notify_on_finish: bool = False
+    """Wake the session with the outcome when the child settles."""
+
+    expected_seconds: float | None = None
+    """How long the caller expects this to take; shapes the hard timeout."""
+
+    timeout_seconds: float | None = None
+    """Hard ceiling for this call, or ``None`` to take the definition's."""
 
     @field_validator("task_prompt")
     @classmethod

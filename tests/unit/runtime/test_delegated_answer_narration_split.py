@@ -23,7 +23,7 @@ from typing import Any
 import pytest
 
 from protocore.contracts.llm import LLMStreamEvent
-from protocore.contracts.runtime_constants import RuntimeConstants
+from protocore.contracts.runtime_constants import LoopConstants
 from protocore.contracts.types import (
     BlockVisibility,
     Message,
@@ -34,6 +34,7 @@ from protocore.contracts.types import (
 )
 from protocore.runtime.answer_narration import leading_narration_span
 from protocore.runtime.events import EventType, TurnEvent
+from tests._fixtures.delegation import DelegationContract
 
 from ._tool_fixtures import MockTool
 
@@ -188,11 +189,10 @@ def test_a_span_is_unsettled_while_the_narration_run_can_still_grow() -> None:
 # ---------------------------------------------------------------------------
 
 
-class _DelegationTool(MockTool):
+class _DelegationTool(DelegationContract, MockTool):
     """Stands in for the host subagent-dispatch tool."""
 
     is_concurrent_safe = False
-    is_parallel_delegation = True
 
     async def invoke(self, context, arguments: dict[str, Any]) -> ToolResult:  # type: ignore[no-untyped-def]
         self.calls.append(dict(arguments))
@@ -202,8 +202,8 @@ class _DelegationTool(MockTool):
 ANSWER_TURN_TEXT = NARRATION_OPENERS[0] + BODY
 
 
-def _rc(**overrides: Any) -> RuntimeConstants:
-    return RuntimeConstants(
+def _rc(**overrides: Any) -> LoopConstants:
+    return LoopConstants(
         model_context_window=4_096,
         finalize_prose_gate_enabled=False,
         terminal_tool_nudge_enabled=False,
@@ -299,7 +299,7 @@ async def _run_scripted(
     engine_factory,  # type: ignore[no-untyped-def]
     in_memory_runtime: dict[str, object],
     *,
-    rc: RuntimeConstants,
+    rc: LoopConstants,
     delegate: bool,
 ) -> tuple[Any, list[TurnEvent]]:
     engine = engine_factory(rc=rc)
