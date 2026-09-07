@@ -18,14 +18,17 @@ Pins the contract of the parallel-dispatch branch in
 from __future__ import annotations
 
 import asyncio
-from collections.abc import AsyncIterator, Callable, Iterable
+from collections.abc import AsyncIterator, Awaitable, Callable, Iterable
 from typing import Any
 
 import pytest
 
+from protocore.contracts.evidence import EvidenceProducerBinding, EvidenceRecord
 from protocore.contracts.hooks import HookActionKind, HookResult, HookSpec
 from protocore.contracts.llm import LLMStreamEvent
-from protocore.contracts.runtime_constants import RuntimeConstants
+from protocore.contracts.middleware import ILifecycleRegistry
+from protocore.contracts.run_state import ConsecutiveErrorStreak
+from protocore.contracts.runtime_constants import LoopConstants
 from protocore.contracts.tool_registry import ToolVisibilityPolicy
 from protocore.contracts.tools import ToolContext
 from protocore.contracts.types import (
@@ -43,7 +46,6 @@ from protocore.contracts.types import (
     ToolResult,
     ToolResultBlock,
 )
-from protocore.contracts.verification import EvidenceProducerBinding, EvidenceRecord
 from protocore.runtime import soft_stop as _soft_stop
 from protocore.runtime.events import EventType, TurnEvent
 from protocore.runtime.loop_state import LoopState
@@ -262,11 +264,16 @@ class _RecordingDispatcher(ToolDispatcher):
         visibility_policy: ToolVisibilityPolicy,
         timeout_seconds: int,
         subagent_whitelist: Iterable[str] | None = None,
+        child_run: bool = False,
         preapproved_tool_call_id: str | None = None,
         admit_evidence: Callable[[tuple[EvidenceRecord, ...], EvidenceProducerBinding], None]
         | None = None,
+        on_dispatch_start: Callable[[ToolCall], Awaitable[None]] | None = None,
+        lifecycle: ILifecycleRegistry | None = None,
     ) -> AsyncIterator[TurnEvent | DispatchOutcome]:
         object.__setattr__(self, "captured_visibility_policy", visibility_policy)
+        if on_dispatch_start is not None:
+            await on_dispatch_start(tool_call)
         object.__setattr__(self, "captured_visibility_policy_id", id(visibility_policy))
         yield TurnEvent(
             type=EventType.TOOL_RESULT,
@@ -323,7 +330,7 @@ async def test_drain_dispatch_tool_deferred_uses_effective_tool_policy(
         pinned=set(),
         forced_pinned=frozenset(),  # raw config has NO floor
     )
-    rc = RuntimeConstants(
+    rc = LoopConstants(
         model_context_window=4_096,
         tool_surface_forced_pins=("Agent", "Read", "Write", "Edit", "Bash", "Glob", "Grep"),
     )
@@ -941,7 +948,7 @@ async def test_hook_gated_tool_uses_web_mode_downgrade_in_parallel_batch(
  actually execute. NO ``TOOL_CALL_PENDING`` event reaches the
  consumer; the engine completes the turn normally.
  """
-    engine = engine_factory(rc=RuntimeConstants(model_context_window=4_096))
+    engine = engine_factory(rc=LoopConstants(model_context_window=4_096))
     assert engine.config.rc.approval_gate_web_enabled is False  # sanity
     read_tool = _RecordingReadTool(
         tool_name="Read", description="read", response_content="OK"
@@ -986,20 +993,21 @@ async def test_hook_gated_tool_uses_web_mode_downgrade_in_parallel_batch(
 
 
 @pytest.mark.asyncio
-async def test_hook_gated_tool_emits_single_pending_event_when_kill_switch_on(
+async def test_every_hook_gated_call_of_the_batch_is_parked_when_kill_switch_on(
     engine_factory,
     in_memory_runtime,
 ) -> None:
-    """``approval_gate_web_enabled=True`` keeps the single-pending flow.
+    """``approval_gate_web_enabled=True`` parks the whole gated message.
 
- With the kill switch ON the serial path's TOOL_CALL_PENDING envelope
- reaches the outer loop on the FIRST hook-matched call; the engine
- transitions to AWAITING and the rest of the batch never executes. The
- predicate steered the calls onto the serial path so only ONE pending
- event surfaces (not one per parallel batch outcome).
+ The predicate steers every hook-matched call onto the serial path, and
+ that path walks the message to the end: each call the gate holds becomes
+ its own wait, none of them executes, and the run goes to AWAITING once.
+ Stopping at the first left the calls behind it to the wire repair, so an
+ operator who approved the one card they were shown resumed into a run
+ that had silently dropped the rest.
  """
     engine = engine_factory(
-        rc=RuntimeConstants(
+        rc=LoopConstants(
             model_context_window=4_096,
             approval_gate_web_enabled=True,
         ),
@@ -1028,25 +1036,24 @@ async def test_hook_gated_tool_emits_single_pending_event_when_kill_switch_on(
         if evt.type is EventType.TOOL_CALL_PENDING:
             pending_events.append(evt)
 
-    # Exactly one pending event surfaces — the serial path stops on the
-    # first hook-required approval.
-    assert len(pending_events) == 1
-    # The pending event is for the FIRST tool call (LLM-requested order).
-    assert pending_events[0].payload.get("tool_call_id") == "call-r1"
-    # Engine snapshot pins the first call as pending approval.
+    # One pending event per gated call, in the order the model asked.
+    assert [evt.payload.get("tool_call_id") for evt in pending_events] == [
+        "call-r1",
+        "call-r2",
+    ]
+    # The run waits on both, and says so once.
     assert engine.state is LoopState.AWAITING
+    assert [item.tool_call_id for item in engine.pending_interrupts] == [
+        "call-r1",
+        "call-r2",
+    ]
     # No tool executed (gate paused before invoke).
     assert read_tool.calls == []
 
 
 # ---------------------------------------------------------------------------
-# Helper-bag state follows LLM order in parallel dispatch
+# Run state follows LLM order in parallel dispatch
 # ---------------------------------------------------------------------------
-
-
-def _make_helpers_with_rc(rc: RuntimeConstants) -> dict[str, Any]:
-    """Build a helper bag with the RC wired so the dispatcher reads caps."""
-    return {"rc": rc, "run_metadata": {}}
 
 
 class _ScriptedReadTool(MockTool):
@@ -1079,22 +1086,22 @@ class _ScriptedReadTool(MockTool):
 
 
 @pytest.mark.asyncio
-async def test_helper_bag_streak_state_follows_llm_order_success_then_error(
+async def test_streak_state_follows_llm_order_success_then_error(
     engine_factory,
     in_memory_runtime,
 ) -> None:
     """``[success, error]`` batch → final streak state matches LLM order.
 
- The dispatcher tracks a consecutive-error streak on the helper bag;
+ The dispatcher tracks a consecutive-error streak on the run state;
  serial order is ``streak.success_reset -> streak.error_inc == count=1``.
- Under parallel dispatch the two calls race on the shared helper bag, so
+ Under parallel dispatch the two calls race on the shared run state, so
  the final state depended on gather completion order before the fix. With
  snapshot/restore + LLM-order replay the final state is deterministic: a
  single error after a success → ``count=1`` on the error's signature.
  """
-    rc = RuntimeConstants(model_context_window=4_096)
+    rc = LoopConstants(model_context_window=4_096)
     engine = engine_factory(rc=rc)
-    engine._helpers = _make_helpers_with_rc(rc)  # type: ignore[attr-defined]
+    engine.run_state.rc = rc
 
     read_tool = _ScriptedReadTool(
         tool_name="Read", description="read", response_content="ok"
@@ -1118,10 +1125,10 @@ async def test_helper_bag_streak_state_follows_llm_order_success_then_error(
 
     # After the LLM-order replay: success reset cleared the streak,
     # then the error incremented to count=1.
-    state = engine._helpers.get("tool_dispatch.consecutive_error_state")  # type: ignore[attr-defined]
-    assert state is not None
-    assert state["tool_name"] == "Read"
-    assert state["count"] == 1
+    streak = engine.run_state.consecutive_error
+    assert streak is not None
+    assert streak.tool_name == "Read"
+    assert streak.count == 1
 
 
 @pytest.mark.asyncio
@@ -1135,9 +1142,9 @@ async def test_helper_bag_streak_state_follows_llm_order_error_then_success(
  in LLM order resets the streak to empty. Without the fix the final
  state could carry the streak forward if the error completed last.
  """
-    rc = RuntimeConstants(model_context_window=4_096)
+    rc = LoopConstants(model_context_window=4_096)
     engine = engine_factory(rc=rc)
-    engine._helpers = _make_helpers_with_rc(rc)  # type: ignore[attr-defined]
+    engine.run_state.rc = rc
 
     read_tool = _ScriptedReadTool(
         tool_name="Read", description="read", response_content="ok"
@@ -1160,37 +1167,34 @@ async def test_helper_bag_streak_state_follows_llm_order_error_then_success(
         pass
 
     # After replay: success in LLM order cleared the streak entirely.
-    state = engine._helpers.get("tool_dispatch.consecutive_error_state")  # type: ignore[attr-defined]
-    assert state is None, (
-        f"success in LLM order must reset the streak; got {state!r}"
+    streak = engine.run_state.consecutive_error
+    assert streak is None, (
+        f"success in LLM order must reset the streak; got {streak!r}"
     )
 
 
 @pytest.mark.asyncio
-async def test_helper_bag_state_restored_after_parallel_dispatch_succeeds(
+async def test_run_state_restored_after_parallel_dispatch_succeeds(
     engine_factory,
     in_memory_runtime,
 ) -> None:
-    """Parallel batch's helper-bag mutations are discarded then replayed.
+    """Parallel batch's run-state mutations are discarded then replayed.
 
  The intermediate dispatcher-side mutations during the gather MUST NOT
- leak into the per-run helper bag; only the LLM-order replay's final
+ leak into the per-run state; only the LLM-order replay's final
  state may. This test pins a pre-gather streak value and verifies that
  after a 2-tool error batch the final state reflects ONLY the replay's
  increments (the pre-gather state is the baseline; replay added two
  increments in order).
  """
-    rc = RuntimeConstants(model_context_window=4_096)
+    rc = LoopConstants(model_context_window=4_096)
     engine = engine_factory(rc=rc)
-    helpers = _make_helpers_with_rc(rc)
+    engine.run_state.rc = rc
     # Pre-populate a streak from a prior turn (different signature so
     # the new errors don't compound).
-    helpers["tool_dispatch.consecutive_error_state"] = {
-        "tool_name": "PriorTool",
-        "signature": "prior-sig",
-        "count": 2,
-    }
-    engine._helpers = helpers  # type: ignore[attr-defined]
+    engine.run_state.consecutive_error = ConsecutiveErrorStreak(
+        tool_name="PriorTool", signature="prior-sig", count=2
+    )
 
     read_tool = _ScriptedReadTool(
         tool_name="Read", description="read", response_content="ok"
@@ -1214,25 +1218,25 @@ async def test_helper_bag_state_restored_after_parallel_dispatch_succeeds(
 
     # Replay first error: switches tool from PriorTool to Read → count=1.
     # Replay second error: same (tool, signature) → count=2.
-    state = helpers["tool_dispatch.consecutive_error_state"]
-    assert state["tool_name"] == "Read"
-    assert state["count"] == 2
+    streak = engine.run_state.consecutive_error
+    assert streak is not None
+    assert streak.tool_name == "Read"
+    assert streak.count == 2
 
 
 @pytest.mark.asyncio
-async def test_helper_bag_replay_uses_original_error_at_cap_boundary(
+async def test_replay_uses_original_error_at_cap_boundary(
     engine_factory,
     in_memory_runtime,
 ) -> None:
     """Parallel replay records the raw error signature, not cap-rewritten text."""
 
-    rc = RuntimeConstants(
+    rc = LoopConstants(
         model_context_window=4_096,
         tool_dispatch_consecutive_error_cap=2,
     )
     engine = engine_factory(rc=rc)
-    helpers = _make_helpers_with_rc(rc)
-    engine._helpers = helpers  # type: ignore[attr-defined]
+    engine.run_state.rc = rc
 
     read_tool = _ScriptedReadTool(
         tool_name="Read", description="read", response_content="ok"
@@ -1253,10 +1257,11 @@ async def test_helper_bag_replay_uses_original_error_at_cap_boundary(
     async for evt in engine.run(user_msg):
         events.append(evt)
 
-    state = helpers["tool_dispatch.consecutive_error_state"]
-    assert state["tool_name"] == "Read"
-    assert state["count"] == 2
-    assert state["signature"] == ToolDispatcher._error_signature(
+    streak = engine.run_state.consecutive_error
+    assert streak is not None
+    assert streak.tool_name == "Read"
+    assert streak.count == 2
+    assert streak.signature == ToolDispatcher._error_signature(
         DispatchErrorKind.execution,
         "out:x",
         "Read",
@@ -1326,7 +1331,7 @@ async def test_terminal_only_blocked_parallel_reads_do_not_pollute_error_streak(
     With the fix, two blocked parallel reads leave the streak untouched, just
     like the serial path.
     """
-    rc = RuntimeConstants(
+    rc = LoopConstants(
         model_context_window=4_096,
         max_turns_per_run=1,
         # ``expected_terminal_tool`` resolves ``pcm_answer`` as the single
@@ -1335,8 +1340,7 @@ async def test_terminal_only_blocked_parallel_reads_do_not_pollute_error_streak(
         terminal_tool_nudge_enabled=True,
     )
     engine = engine_factory(rc=rc, expected_terminal_tool="pcm_answer")
-    helpers = _make_helpers_with_rc(rc)
-    engine._helpers = helpers  # type: ignore[attr-defined]
+    engine.run_state.rc = rc
     # Arm the terminal-only latch as the deadline/contract-repair nudge would
     # — inside the turn — so the blocks fire on the parallel reads.
     _arm_terminal_only_at_the_model_call(engine, in_memory_runtime["llm"])
@@ -1383,10 +1387,10 @@ async def test_terminal_only_blocked_parallel_reads_do_not_pollute_error_streak(
 
     # The crux: the consecutive-error streak must NOT have been advanced by
     # the blocked synthetics — matching the serial no-streak-mutation path.
-    state = helpers.get("tool_dispatch.consecutive_error_state")
-    assert state is None, (
+    streak = engine.run_state.consecutive_error
+    assert streak is None, (
         f"terminal-only blocked parallel reads must not advance the error "
-        f"streak; got {state!r}"
+        f"streak; got {streak!r}"
     )
 
     # The hard circuit breaker must ALSO stay untouched: a terminal-only
@@ -1425,14 +1429,13 @@ async def test_terminal_only_blocked_serial_read_does_not_pollute_error_streak(
     ``_dispatch_tool`` short-circuit, which never calls the consecutive-error
     cap. This pins the reference behaviour the parallel fix mirrors.
     """
-    rc = RuntimeConstants(
+    rc = LoopConstants(
         model_context_window=4_096,
         max_turns_per_run=1,
         terminal_tool_nudge_enabled=True,
     )
     engine = engine_factory(rc=rc, expected_terminal_tool="pcm_answer")
-    helpers = _make_helpers_with_rc(rc)
-    engine._helpers = helpers  # type: ignore[attr-defined]
+    engine.run_state.rc = rc
     _arm_terminal_only_at_the_model_call(engine, in_memory_runtime["llm"])
     _soft_stop.enter(engine, cause_name=_soft_stop.CAUSE_DEADLINE)
 
@@ -1461,8 +1464,7 @@ async def test_terminal_only_blocked_serial_read_does_not_pollute_error_streak(
         and evt.payload.get("error", {}).get("kind") == "terminal_only"
     ]
     assert len(blocked_results) == 1
-    state = helpers.get("tool_dispatch.consecutive_error_state")
-    assert state is None
+    assert engine.run_state.consecutive_error is None
 
 
 @pytest.mark.asyncio
@@ -1470,12 +1472,11 @@ async def test_parallel_replay_preserves_post_tool_use_modified_error_output(
     engine_factory,
     in_memory_runtime,
 ) -> None:
-    """Replay updates helper state without undoing PostToolUse redaction."""
+    """Replay updates the run's state without undoing PostToolUse redaction."""
 
-    rc = RuntimeConstants(model_context_window=4_096)
+    rc = LoopConstants(model_context_window=4_096)
     engine = engine_factory(rc=rc)
-    helpers = _make_helpers_with_rc(rc)
-    engine._helpers = helpers  # type: ignore[attr-defined]
+    engine.run_state.rc = rc
     engine.hooks = _TargetedPostHookManager("call-e1", "[redacted]")
 
     read_tool = _ScriptedReadTool(
@@ -1515,3 +1516,108 @@ async def test_parallel_replay_preserves_post_tool_use_modified_error_output(
     assert [tr.tool_call_id for tr in tool_results] == ["call-e1", "call-e2"]
     assert tool_results[0].content == "[redacted]"
     assert tool_results[0].is_error is True
+
+
+class _RacingApprovalHookManager:
+    """A gate that appears after the turn decided where its calls would run.
+
+    ``list`` reports no PreToolUse hook, so the pre-turn predicate leaves the
+    calls on the parallel path; ``invoke`` then demands approval anyway. That
+    is the shape of a hook registered mid-turn, and the only way the parallel
+    fan-out ever sees an approval at all.
+    """
+
+    def __init__(self) -> None:
+        self.invocations: list[tuple[HookEvent, dict[str, Any], str]] = []
+
+    async def invoke(
+        self,
+        event: HookEvent,
+        payload: dict[str, Any],
+        tenant_id: str,
+    ) -> HookResult:
+        self.invocations.append((event, payload, tenant_id))
+        if event is HookEvent.pre_tool_use:
+            return HookResult(
+                action=HookActionKind.ALLOW,
+                modifications={
+                    "requires_approval": True,
+                    "approval_token": f"tok-{payload.get('tool_call_id')}",
+                },
+                reason="gate registered mid-turn",
+            )
+        return HookResult(action=HookActionKind.ALLOW)
+
+    async def register(self, spec: HookSpec) -> None:  # pragma: no cover
+        return
+
+    async def unregister(
+        self, hook_id: str, tenant_id: str
+    ) -> None:  # pragma: no cover
+        return
+
+    async def list(
+        self,
+        tenant_id: str,
+        *,
+        event: HookEvent | None = None,
+    ) -> list[HookSpec]:
+        return []
+
+
+@pytest.mark.asyncio
+async def test_a_gate_that_races_a_parallel_batch_parks_every_held_call(
+    engine_factory,
+    in_memory_runtime,
+) -> None:
+    """The fan-out parks the whole batch, not only the first call.
+
+    It used to mark the first approval in LLM order and discard every outcome
+    behind it, so a host resumed into a run whose remaining calls had no
+    result and no wait — invisible in both the transcript and the pause.
+    """
+    engine = engine_factory(
+        rc=LoopConstants(
+            model_context_window=4_096,
+            approval_gate_web_enabled=True,
+        ),
+    )
+    read_tool = _RecordingReadTool(
+        tool_name="Read", description="read", response_content="OK"
+    )
+    in_memory_runtime["tools"].register(read_tool)
+    engine.hooks = _RacingApprovalHookManager()
+
+    _queue_multi_tool_stream(
+        in_memory_runtime["llm"],
+        tool_calls=[
+            ("call-r1", "Read", {"path": "a"}),
+            ("call-r2", "Read", {"path": "b"}),
+        ],
+    )
+
+    user_msg = Message(
+        role=MessageRole.user, content_blocks=[TextBlock(text="go")]
+    )
+    events: list[Any] = []
+    async for evt in engine.run(user_msg):
+        events.append(evt)
+
+    assert engine.state is LoopState.AWAITING
+    assert [item.tool_call_id for item in engine.pending_interrupts] == [
+        "call-r1",
+        "call-r2",
+    ]
+    # One announcement for the batch, carrying the whole open set.
+    announcements = [
+        evt for evt in events if evt.type is EventType.INTERRUPT_PARKED
+    ]
+    assert len(announcements) == 1
+    assert len(announcements[0].payload["pending_interrupts"]) == 2
+    # Neither held call left a result behind it.
+    assert [
+        block.tool_call_id
+        for msg in engine.history
+        for block in msg.content_blocks
+        if isinstance(block, ToolResultBlock)
+    ] == []

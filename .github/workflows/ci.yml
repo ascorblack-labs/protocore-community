@@ -6,9 +6,15 @@ on:
     branches:
       - main
       - master
+  # A published release must be able to prove it was tested. Without this the
+  # workflow never runs on a release commit, and "the gates were green" is a
+  # claim about some earlier push rather than about the artifact being uploaded.
+  release:
+    types: [published]
 
 jobs:
   test-lint-typecheck:
+    name: Tests, lint and types
     runs-on: ubuntu-latest
     strategy:
       matrix:
@@ -31,26 +37,22 @@ jobs:
 
       - name: Run contract unit gate
         id: contracts
-        run: uv run pytest tests/unit/contracts -q --no-cov
+        run: uv run --no-sync pytest tests/unit/contracts -q --no-cov
 
       - name: Run full test suite
         id: tests
-        run: uv run pytest . --cov=protocore --cov-fail-under=90
+        run: uv run --no-sync pytest . --cov=protocore --cov-fail-under=90
 
       - name: Run lint gate
         id: lint
-        run: uv run ruff check .
+        run: uv run --no-sync ruff check .
 
       - name: Run strict typing gate
         id: typing
         # No path argument on purpose: a path on the command line REPLACES the
         # configured `files` list, which silently drops the test tree and
         # leaves every test double unchecked.
-        run: uv run mypy --strict
-
-      - name: Run security audit
-        id: security
-        run: uv run bandit -r protocore -q -c pyproject.toml
+        run: uv run --no-sync mypy --strict
 
       - name: Publish quality gate summary
         if: always()
@@ -62,5 +64,111 @@ jobs:
             echo "- full test suite: ${{ steps.tests.outcome }}"
             echo "- lint: ${{ steps.lint.outcome }}"
             echo "- strict typing: ${{ steps.typing.outcome }}"
-            echo "- security: ${{ steps.security.outcome }}"
           } >> "$GITHUB_STEP_SUMMARY"
+
+  security:
+    name: Security audit
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install uv
+        run: python -m pip install --upgrade uv
+
+      - name: Install dependencies
+        run: uv sync --extra dev
+
+      # `-c pyproject.toml` is the whole point of this line. Without it bandit
+      # reads no configuration at all, the per-check exclusions in
+      # `[tool.bandit.assert_used]` are silently ignored, and the packaged
+      # assertion-based conformance suites turn the audit red for being what
+      # they are. Never pipe this into `tail`: a pipeline reports the last
+      # command's status, so a failing audit would read as a pass.
+      - name: Run security audit
+        run: uv run --no-sync bandit -r protocore -q -c pyproject.toml
+
+  native:
+    name: Token estimator, both arrangements
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python-version: ["3.12", "3.13", "3.14"]
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Install uv
+        run: python -m pip install --upgrade uv
+
+      # The optional extension is a separate distribution. Its sources are here
+      # only once they are, so the leg that builds it detects them rather than
+      # assuming them, and the pure-Python leg below runs either way. A
+      # job-level guard cannot do this: the tree is not checked out when a
+      # job's condition is evaluated.
+      - name: Look for the extension sources
+        id: crate
+        run: |
+          set -euo pipefail
+          if [ -f native/Cargo.toml ]; then
+            echo "present=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "present=false" >> "$GITHUB_OUTPUT"
+            echo "no extension sources in this tree; the pure-Python leg is the whole run" >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      # Both arrangements are shipped, so both are tested: the core selects the
+      # native estimator when it can import it and its own implementation when
+      # it cannot, and the two must return the same numbers either way.
+      - name: Run the estimator suites without the extension
+        env:
+          PROTOCORE_DISABLE_NATIVE: "1"
+        run: |
+          uv sync --extra dev
+          uv run --no-sync python -c \
+            'import protocore.runtime.token_counting as t; assert not t.NATIVE_ACTIVE'
+          uv run --no-sync pytest tests/unit/runtime/test_token_counting_parity.py \
+            tests/unit/test_token_counting.py -q --no-cov
+
+      - name: Check the crate
+        if: steps.crate.outputs.present == 'true'
+        working-directory: native
+        run: |
+          cargo fmt --check
+          cargo clippy --all-targets -- -D warnings
+          cargo test
+
+      # The extension installs into the environment's own copy of the package,
+      # while an import from a working copy resolves to the source tree, so the
+      # built artefact is placed there too.
+      - name: Build and install the extension
+        if: steps.crate.outputs.present == 'true'
+        run: |
+          uv sync --extra dev --extra native
+          uv run --no-sync python - <<'PY'
+          import glob, os, shutil, sysconfig
+          root = sysconfig.get_paths()["purelib"]
+          built = glob.glob(os.path.join(root, "protocore", "_native*.so"))
+          if not built:
+              raise SystemExit("the extension was not installed")
+          shutil.copy(built[0], os.path.join("protocore", os.path.basename(built[0])))
+          PY
+
+      - name: Run the estimator suites with the extension
+        if: steps.crate.outputs.present == 'true'
+        run: |
+          uv run --no-sync python -c \
+            'import protocore.runtime.token_counting as t; assert t.NATIVE_ACTIVE'
+          uv run --no-sync pytest tests/unit/runtime/test_token_counting_parity.py \
+            tests/unit/test_token_counting.py -q --no-cov

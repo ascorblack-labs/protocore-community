@@ -25,6 +25,13 @@ from protocore.logging_utils import get_logger
 _logger = get_logger(__name__)
 
 
+#: Payload key on every ``tool_transport_*`` event: which transport the event
+#: is about, in the host's own vocabulary. Core neither supplies nor reads the
+#: value — it states the key so every host spells it the same way, and so a
+#: reader of one of these events knows where to look for the answer.
+TOOL_TRANSPORT_EVENT_FIELD: str = "transport"
+
+
 class EventName(StrEnum):
     """Typed event taxonomy. ~70 events.
 
@@ -35,7 +42,8 @@ class EventName(StrEnum):
         - Tools: tool_call_*, tool_dispatch_*, tool_permission_*
         - Compaction: compaction_*, snapshot_*
         - Hooks: hook_fired, hook_denied, hook_failed
-        - Sandbox: sandbox_starting, sandbox_ready, sandbox_failed
+        - Tool transport: tool_transport_starting, tool_transport_ready,
+          tool_transport_failed
         - Subagent: subagent_spawn, subagent_complete, subagent_failed
         - GC: gc_started, gc_completed
         - Audit: audit_emit
@@ -99,11 +107,15 @@ class EventName(StrEnum):
     hook_failed = "hook_failed"
     hook_modified = "hook_modified"
 
-    # ----- Sandbox -----
-    sandbox_starting = "sandbox_starting"
-    sandbox_ready = "sandbox_ready"
-    sandbox_failed = "sandbox_failed"
-    sandbox_teardown = "sandbox_teardown"
+    # ----- Tool transport -----
+    # The lifecycle of whatever a host puts between a tool call and the place
+    # it runs — a pool of machines, a container, a remote executor. Core names
+    # none of them: the payload says which one this is, under
+    # :data:`TOOL_TRANSPORT_EVENT_FIELD`.
+    tool_transport_starting = "tool_transport_starting"
+    tool_transport_ready = "tool_transport_ready"
+    tool_transport_failed = "tool_transport_failed"
+    tool_transport_teardown = "tool_transport_teardown"
 
     # ----- Subagent -----
     subagent_spawn = "subagent_spawn"
@@ -198,4 +210,4 @@ class EventBus:
         return len(self._subs.get(name, []))
 
 
-__all__ = ["EventBus", "EventName", "Handler"]
+__all__ = ["TOOL_TRANSPORT_EVENT_FIELD", "EventBus", "EventName", "Handler"]

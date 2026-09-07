@@ -1,7 +1,6 @@
 """#6 cancel propagation — core tool-dispatch cancel-event race.
 
-The executor places a per-run cancel ``asyncio.Event`` on the helper bag
-(``ctx.metadata["protocore.helpers"]["cancel_event"]``). When it fires while a
+A run carries a cancel ``asyncio.Event`` on its state. When it fires while a
 tool is mid-flight, the dispatcher must cancel the in-flight tool task,
 bounded-drain it, and raise :class:`ToolDispatchCancelled` so a leader parked
 inside a synchronous long tool (the ``Agent`` tool / whole subagent) unblocks
@@ -16,12 +15,12 @@ import asyncio
 
 import pytest
 
+from protocore.contracts.run_state import RunScopedState
 from protocore.contracts.tool_registry import ToolVisibilityPolicy
 from protocore.contracts.tools import ToolContext
 from protocore.contracts.types import ToolCall
 from protocore.runtime.events import EventType
 from protocore.runtime.tool_dispatch import (
-    HELPER_RUN_CANCEL_EVENT_KEY,
     DispatchErrorKind,
     DispatchOutcome,
     ToolDispatchCancelled,
@@ -29,6 +28,7 @@ from protocore.runtime.tool_dispatch import (
 )
 from protocore.runtime.tool_permission import ToolPermissionGate
 from protocore.runtime.tool_registry import ToolRegistry
+from tests._fixtures.tool_roles import CONVENTIONAL_TOOL_ROLES
 
 from ._tool_fixtures import MockTool
 
@@ -38,23 +38,18 @@ def _ctx_with_cancel(
     *,
     rc: object | None = None,
 ) -> ToolContext:
-    helpers: dict[str, object] = {}
-    if cancel_event is not None:
-        helpers[HELPER_RUN_CANCEL_EVENT_KEY] = cancel_event
-    if rc is not None:
-        helpers["rc"] = rc
     return ToolContext(
         run_id="run-1",
         tenant_id="tenant-1",
         session_id="sess-1",
-        metadata={"protocore.helpers": helpers} if helpers else {},
+        run_state=RunScopedState(cancel_event=cancel_event, rc=rc),
     )
 
 
 def _dispatcher(tool: MockTool) -> ToolDispatcher:
     return ToolDispatcher(
         registry=ToolRegistry([tool]),
-        permission_gate=ToolPermissionGate(),
+        permission_gate=ToolPermissionGate(roles=CONVENTIONAL_TOOL_ROLES),
         hook_manager=None,
     )
 

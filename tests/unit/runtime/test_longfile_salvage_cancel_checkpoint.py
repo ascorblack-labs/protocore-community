@@ -21,7 +21,7 @@ from typing import Any
 import pytest
 
 from protocore.contracts.llm import LLMRequest, LLMStreamEvent
-from protocore.contracts.runtime_constants import RuntimeConstants
+from protocore.contracts.runtime_constants import LoopConstants
 from protocore.contracts.tools import Tool, ToolContext
 from protocore.contracts.types import (
     Message,
@@ -48,7 +48,7 @@ READ = "Read"
 TARGET = "/workspace/big.py"
 
 
-def _build_engine(*, rc: RuntimeConstants, llm: object) -> QueryEngine:
+def _build_engine(*, rc: LoopConstants, llm: object) -> QueryEngine:
     return QueryEngine(
         config=QueryEngineConfig(
             run_id="run-f12-08",
@@ -236,7 +236,7 @@ async def test_salvage_loop_skips_dispatch_after_stop_requested() -> None:
     ``stop_requested`` checkpoint, so the synthetic Write ran, mutating
     the workspace AFTER cancellation.
     """
-    rc = RuntimeConstants(
+    rc = LoopConstants(
         model_context_window=8_192,
         longfile_convergence_enabled=True,
         longfile_stall_turns=2,

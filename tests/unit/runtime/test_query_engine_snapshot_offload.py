@@ -22,9 +22,7 @@ import asyncio
 
 import pytest
 
-from protocore.contracts.runtime_constants import RuntimeConstants
-from protocore.contracts.types import Message, MessageRole, TextBlock
-from protocore.contracts.verification import (
+from protocore.contracts.evidence import (
     CandidateBundle,
     DeliveryMode,
     EvidenceLedger,
@@ -35,11 +33,13 @@ from protocore.contracts.verification import (
     VerificationLifecycle,
     VerificationState,
 )
+from protocore.contracts.runtime_constants import LoopConstants
+from protocore.contracts.types import Message, MessageRole, TextBlock
 
 
 @pytest.mark.asyncio
 async def test_persist_snapshot_offloads_serialization_to_thread(engine_factory, monkeypatch) -> None:
-    engine = engine_factory(rc=RuntimeConstants(model_context_window=4_096))
+    engine = engine_factory(rc=LoopConstants(model_context_window=4_096))
     for i in range(20):
         engine.history.append(
             Message(
@@ -74,7 +74,7 @@ async def test_persist_snapshot_offloads_serialization_to_thread(engine_factory,
 
 @pytest.mark.asyncio
 async def test_persist_snapshot_payload_roundtrips_history(engine_factory) -> None:
-    engine = engine_factory(rc=RuntimeConstants(model_context_window=4_096))
+    engine = engine_factory(rc=LoopConstants(model_context_window=4_096))
     engine.history.append(
         Message(
             role=MessageRole.user,
@@ -96,7 +96,7 @@ async def test_persist_snapshot_payload_roundtrips_history(engine_factory) -> No
 
 @pytest.mark.asyncio
 async def test_snapshot_roundtrips_nonempty_verification_lifecycle(engine_factory) -> None:
-    engine = engine_factory(rc=RuntimeConstants(model_context_window=4_096))
+    engine = engine_factory(rc=LoopConstants(model_context_window=4_096))
     origin = RunTreeOrigin(run_id=engine.config.run_id, root_run_id=engine.config.run_id, depth=0)
     ledger = EvidenceLedger(ledger_id="ledger-1", attempt_owner=origin).append(
         EvidenceRecord(
@@ -127,7 +127,7 @@ async def test_snapshot_roundtrips_nonempty_verification_lifecycle(engine_factor
     )
 
     snapshot = engine.snapshot()
-    restored = engine_factory(rc=RuntimeConstants(model_context_window=4_096))
+    restored = engine_factory(rc=LoopConstants(model_context_window=4_096))
     await restored.resume_from_snapshot(snapshot)
 
     assert "verification" in snapshot
@@ -140,9 +140,9 @@ async def test_snapshot_roundtrips_nonempty_verification_lifecycle(engine_factor
 async def test_resume_treats_absent_verification_as_legacy_but_malformed_as_failed(
     engine_factory,
 ) -> None:
-    source = engine_factory(rc=RuntimeConstants(model_context_window=4_096))
+    source = engine_factory(rc=LoopConstants(model_context_window=4_096))
     legacy_snapshot = source.snapshot()
-    restored = engine_factory(rc=RuntimeConstants(model_context_window=4_096))
+    restored = engine_factory(rc=LoopConstants(model_context_window=4_096))
     await restored.resume_from_snapshot(legacy_snapshot)
 
     assert restored.verification_lifecycle == VerificationLifecycle()
@@ -159,9 +159,9 @@ async def test_resume_fails_closed_for_present_truncated_or_unknown_verification
     engine_factory,
     verification: dict[str, str],
 ) -> None:
-    source = engine_factory(rc=RuntimeConstants(model_context_window=4_096))
+    source = engine_factory(rc=LoopConstants(model_context_window=4_096))
     snapshot = {**source.snapshot(), "verification": verification}
-    restored = engine_factory(rc=RuntimeConstants(model_context_window=4_096))
+    restored = engine_factory(rc=LoopConstants(model_context_window=4_096))
 
     await restored.resume_from_snapshot(snapshot)
 
@@ -171,7 +171,7 @@ async def test_resume_fails_closed_for_present_truncated_or_unknown_verification
 
 
 def test_engine_rejects_candidate_for_another_run(engine_factory) -> None:
-    engine = engine_factory(rc=RuntimeConstants(model_context_window=4_096))
+    engine = engine_factory(rc=LoopConstants(model_context_window=4_096))
     origin = RunTreeOrigin(run_id="another-run", root_run_id="another-run", depth=0)
     ledger = EvidenceLedger(ledger_id="ledger-1", attempt_owner=origin).append(
         EvidenceRecord(
@@ -205,7 +205,7 @@ def test_engine_rejects_candidate_for_another_run(engine_factory) -> None:
 
 
 def test_engine_rejects_evidence_from_outside_candidate_run_tree(engine_factory) -> None:
-    engine = engine_factory(rc=RuntimeConstants(model_context_window=4_096))
+    engine = engine_factory(rc=LoopConstants(model_context_window=4_096))
     unrelated = RunTreeOrigin(
         run_id="unrelated-run",
         root_run_id="unrelated-parent",
@@ -255,7 +255,7 @@ def test_engine_rejects_evidence_from_outside_candidate_run_tree(engine_factory)
 
 
 def test_engine_accepts_evidence_from_a_direct_subagent(engine_factory) -> None:
-    engine = engine_factory(rc=RuntimeConstants(model_context_window=4_096))
+    engine = engine_factory(rc=LoopConstants(model_context_window=4_096))
     ledger = EvidenceLedger(
         ledger_id="ledger-1",
         attempt_owner=RunTreeOrigin(
@@ -298,7 +298,7 @@ def test_engine_accepts_evidence_from_a_direct_subagent(engine_factory) -> None:
 
 
 def test_engine_accepts_evidence_from_a_nested_subagent(engine_factory) -> None:
-    engine = engine_factory(rc=RuntimeConstants(model_context_window=4_096))
+    engine = engine_factory(rc=LoopConstants(model_context_window=4_096))
     ledger = EvidenceLedger(
         ledger_id="ledger-1",
         attempt_owner=RunTreeOrigin(
@@ -342,7 +342,7 @@ def test_engine_accepts_evidence_from_a_nested_subagent(engine_factory) -> None:
 
 @pytest.mark.asyncio
 async def test_resume_fails_closed_for_a_legacy_evidence_origin_without_root_binding(engine_factory) -> None:
-    engine = engine_factory(rc=RuntimeConstants(model_context_window=4_096))
+    engine = engine_factory(rc=LoopConstants(model_context_window=4_096))
     origin = RunTreeOrigin(run_id=engine.config.run_id, root_run_id=engine.config.run_id, depth=0)
     ledger = EvidenceLedger(ledger_id="ledger-1", attempt_owner=origin).append(
         EvidenceRecord(
@@ -374,7 +374,7 @@ async def test_resume_fails_closed_for_a_legacy_evidence_origin_without_root_bin
     snapshot = engine.snapshot()
     del snapshot["verification"]["ledger"]["records"][0]["origin"]["root_run_id"]
 
-    restored = engine_factory(rc=RuntimeConstants(model_context_window=4_096))
+    restored = engine_factory(rc=LoopConstants(model_context_window=4_096))
     await restored.resume_from_snapshot(snapshot)
 
     assert restored.verification_lifecycle.state is VerificationState.failed
@@ -383,7 +383,7 @@ async def test_resume_fails_closed_for_a_legacy_evidence_origin_without_root_bin
 
 @pytest.mark.asyncio
 async def test_resume_fails_closed_for_a_foreign_run_verification_snapshot(engine_factory) -> None:
-    source = engine_factory(run_id="source-run", rc=RuntimeConstants(model_context_window=4_096))
+    source = engine_factory(run_id="source-run", rc=LoopConstants(model_context_window=4_096))
     origin = RunTreeOrigin(run_id=source.config.run_id, root_run_id=source.config.run_id, depth=0)
     ledger = EvidenceLedger(ledger_id="ledger-1", attempt_owner=origin).append(
         EvidenceRecord(
@@ -413,8 +413,10 @@ async def test_resume_fails_closed_for_a_foreign_run_verification_snapshot(engin
         )
     )
 
-    restored = engine_factory(run_id="destination-run", rc=RuntimeConstants(model_context_window=4_096))
-    await restored.resume_from_snapshot(source.snapshot())
+    restored = engine_factory(run_id="destination-run", rc=LoopConstants(model_context_window=4_096))
+    # A snapshot belonging to another run is refused outright now, so the
+    # candidate and its evidence never reach this engine at all.
+    with pytest.raises(ValueError, match="run_id"):
+        await restored.resume_from_snapshot(source.snapshot())
 
-    assert restored.verification_lifecycle.state is VerificationState.failed
-    assert restored.verification_lifecycle.restore_error == "verification snapshot run binding failed"
+    assert restored.verification_lifecycle == VerificationLifecycle()

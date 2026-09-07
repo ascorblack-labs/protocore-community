@@ -30,7 +30,7 @@ from protocore.contracts.llm import (
     LLMResponse,
     LLMStreamEvent,
 )
-from protocore.contracts.runtime_constants import RuntimeConstants
+from protocore.contracts.runtime_constants import LoopConstants
 from protocore.contracts.tools import Tool, ToolContext
 from protocore.contracts.types import (
     SYNTHETIC_RECOVERY_METADATA_KEY,
@@ -54,6 +54,7 @@ from protocore.tests_support.adapters import (
     InMemoryHookManager,
     InMemorySkillStore,
 )
+from tests._fixtures.tool_roles import CONVENTIONAL_TOOL_ROLES
 
 TERMINAL_TOOL = "Finalize"
 
@@ -117,7 +118,7 @@ class _FinalizeTool(Tool):
 
 def _build_engine(
     *,
-    rc: RuntimeConstants,
+    rc: LoopConstants,
     llm: object,
     tools: list[Tool],
     expected_terminal_tool: str | None = TERMINAL_TOOL,
@@ -125,6 +126,7 @@ def _build_engine(
     registry = ToolRegistry(tools)
     return QueryEngine(
         config=QueryEngineConfig(
+            tool_roles=CONVENTIONAL_TOOL_ROLES,
             run_id="run-soft-stop",
             tenant_id="tenant-soft-stop",
             session_id="sess-soft-stop",
@@ -259,7 +261,7 @@ async def test_the_wind_down_is_five_observable_steps_in_order() -> None:
     it from an agent's behaviour is what made the old mechanism impossible to
     audit: it left no trace except a paragraph inside a tool result.
     """
-    rc = RuntimeConstants(model_context_window=4_096, leader_tool_call_soft_cap=1)
+    rc = LoopConstants(model_context_window=4_096, leader_tool_call_soft_cap=1)
     finalize = _FinalizeTool()
     llm = _ScriptedLLM(
         [
@@ -286,7 +288,7 @@ async def test_the_wind_down_is_five_observable_steps_in_order() -> None:
 
 @pytest.mark.asyncio
 async def test_a_run_that_answered_under_the_wind_down_completes() -> None:
-    rc = RuntimeConstants(model_context_window=4_096, leader_tool_call_soft_cap=1)
+    rc = LoopConstants(model_context_window=4_096, leader_tool_call_soft_cap=1)
     llm = _ScriptedLLM(
         [
             {"tool": "Read", "args": {"x": "a"}},
@@ -307,7 +309,7 @@ async def test_a_run_that_answered_under_the_wind_down_completes() -> None:
 @pytest.mark.asyncio
 async def test_a_wind_down_that_produced_no_answer_does_not_complete() -> None:
     """A run given turns to answer in, that did not answer, is not a success."""
-    rc = RuntimeConstants(
+    rc = LoopConstants(
         model_context_window=4_096,
         leader_tool_call_soft_cap=1,
         soft_stop_max_turns=1,
@@ -327,7 +329,7 @@ async def test_a_wind_down_that_produced_no_answer_does_not_complete() -> None:
 @pytest.mark.asyncio
 async def test_the_notification_lands_in_history_as_the_runtimes_own_words() -> None:
     """Marked synthetic, so it cannot be mistaken for the model answering."""
-    rc = RuntimeConstants(model_context_window=4_096, leader_tool_call_soft_cap=1)
+    rc = LoopConstants(model_context_window=4_096, leader_tool_call_soft_cap=1)
     llm = _ScriptedLLM([{"tool": "Read", "args": {"x": "a"}}, {"text": "done"}])
     engine = _build_engine(rc=rc, llm=llm, tools=[_NamedTool("Read"), _FinalizeTool()])
 
@@ -349,7 +351,7 @@ async def test_the_notification_is_bilingual_and_names_the_bound_that_was_hit() 
     """A model told to wrap up in a language the conversation is not in switches
     languages before it wraps up. And "the run is closing" is not actionable
     without which budget ran out."""
-    rc = RuntimeConstants(model_context_window=4_096, leader_tool_call_soft_cap=1)
+    rc = LoopConstants(model_context_window=4_096, leader_tool_call_soft_cap=1)
     llm = _ScriptedLLM([{"tool": "Read", "args": {"x": "a"}}, {"text": "done"}])
     engine = _build_engine(rc=rc, llm=llm, tools=[_NamedTool("Read"), _FinalizeTool()])
 
@@ -385,7 +387,7 @@ async def test_the_withdrawal_beats_the_pinned_floor() -> None:
     against the CONFIGURED policy would pass while the live run failed. So this
     reads the tool list off the request the provider was actually sent.
     """
-    rc = RuntimeConstants(
+    rc = LoopConstants(
         model_context_window=4_096,
         leader_tool_call_soft_cap=1,
         tool_surface_forced_pins=("Agent", "Read"),
@@ -418,7 +420,7 @@ async def test_a_withdrawn_tool_is_also_refused_at_dispatch() -> None:
     A model working from a stale schema in its own context will try a tool that
     is no longer on the surface. It must not run.
     """
-    rc = RuntimeConstants(
+    rc = LoopConstants(
         model_context_window=4_096,
         leader_tool_call_soft_cap=1,
         soft_stop_max_turns=1,
@@ -442,7 +444,7 @@ async def test_with_no_terminal_tool_the_surface_is_emptied_entirely() -> None:
     opposite — which is why the emptiness is stated explicitly rather than left
     to fall out of an empty set.
     """
-    rc = RuntimeConstants(model_context_window=4_096, leader_tool_call_soft_cap=1)
+    rc = LoopConstants(model_context_window=4_096, leader_tool_call_soft_cap=1)
     llm = _ScriptedLLM([{"tool": "Read", "args": {"x": "a"}}, {"text": "the answer"}])
     engine = _build_engine(
         rc=rc,
@@ -466,7 +468,7 @@ async def test_the_artifact_sealer_survives_the_withdrawal() -> None:
     Removing the one tool that can close it would throw the work away in the
     name of stopping cleanly.
     """
-    rc = RuntimeConstants(
+    rc = LoopConstants(
         model_context_window=4_096,
         leader_tool_call_soft_cap=1,
         longfile_convergence_enabled=True,
@@ -490,7 +492,7 @@ async def test_the_artifact_sealer_survives_the_withdrawal() -> None:
 
 @pytest.mark.asyncio
 async def test_a_run_with_no_open_artifact_does_not_keep_the_sealer() -> None:
-    rc = RuntimeConstants(
+    rc = LoopConstants(
         model_context_window=4_096,
         leader_tool_call_soft_cap=1,
         longfile_convergence_enabled=True,
@@ -515,7 +517,7 @@ async def test_the_tool_result_the_model_reads_is_left_alone() -> None:
     Appending to a tool result is what the old mechanism did, and it also broke
     every consumer that parses that body as JSON.
     """
-    rc = RuntimeConstants(model_context_window=4_096, leader_tool_call_soft_cap=1)
+    rc = LoopConstants(model_context_window=4_096, leader_tool_call_soft_cap=1)
     llm = _ScriptedLLM([{"tool": "Read", "args": {"x": "a"}}, {"text": "answer"}])
     engine = _build_engine(rc=rc, llm=llm, tools=[_NamedTool("Read"), _FinalizeTool()])
 
@@ -532,7 +534,7 @@ async def test_the_tool_result_the_model_reads_is_left_alone() -> None:
 
 @pytest.mark.asyncio
 async def test_the_turn_cap_takes_the_wind_down() -> None:
-    rc = RuntimeConstants(model_context_window=4_096, max_turns_per_run=1)
+    rc = LoopConstants(model_context_window=4_096, max_turns_per_run=1)
     llm = _ScriptedLLM([{"tool": "Read", "args": {"x": "a"}}, {"text": "the answer"}])
     engine = _build_engine(rc=rc, llm=llm, tools=[_NamedTool("Read"), _FinalizeTool()])
 
@@ -551,7 +553,7 @@ async def test_the_turn_cap_takes_the_wind_down() -> None:
 
 @pytest.mark.asyncio
 async def test_the_output_token_budget_takes_the_wind_down() -> None:
-    rc = RuntimeConstants(
+    rc = LoopConstants(
         model_context_window=4_096, run_max_output_tokens_budget=1
     )
     llm = _ScriptedLLM([{"tool": "Read", "args": {"x": "a"}}, {"text": "the answer"}])
@@ -571,7 +573,7 @@ async def test_the_output_token_budget_takes_the_wind_down() -> None:
 
 @pytest.mark.asyncio
 async def test_the_wall_clock_deadline_takes_the_wind_down() -> None:
-    rc = RuntimeConstants(
+    rc = LoopConstants(
         model_context_window=4_096,
         agent_max_seconds=1.0,
         agent_deadline_finalize_slack_seconds=0.0,
@@ -599,7 +601,7 @@ async def test_a_provider_failure_takes_the_wind_down() -> None:
     Terminating here throws away a run that may already have everything it
     needs to answer — which is what the incident this was written for did.
     """
-    rc = RuntimeConstants(model_context_window=4_096)
+    rc = LoopConstants(model_context_window=4_096)
     recovered = _ScriptedLLM([{"text": "Here is the answer despite the failure."}])
     llm = _FailingLLM(LLMProviderError("provider down"), recovered)
     engine = _build_engine(rc=rc, llm=llm, tools=[_NamedTool("Read"), _FinalizeTool()])
@@ -620,7 +622,7 @@ async def test_a_provider_failure_takes_the_wind_down() -> None:
 @pytest.mark.asyncio
 async def test_a_provider_failure_the_wind_down_cannot_rescue_still_reports_it() -> None:
     """The original error is surfaced, not buried under a silent no-answer stop."""
-    rc = RuntimeConstants(model_context_window=4_096, soft_stop_max_turns=1)
+    rc = LoopConstants(model_context_window=4_096, soft_stop_max_turns=1)
 
     class _AlwaysFails:
         def __init__(self) -> None:
@@ -658,7 +660,7 @@ async def test_only_one_wind_down_runs_however_many_bounds_are_hit() -> None:
     second budget of turns — which is how "the run is closing" stops meaning
     anything.
     """
-    rc = RuntimeConstants(
+    rc = LoopConstants(
         model_context_window=4_096,
         leader_tool_call_soft_cap=1,
         max_turns_per_run=2,
@@ -698,7 +700,7 @@ async def test_the_prose_gate_still_refuses_a_terminal_call_with_no_answer() -> 
                 ),
             )
 
-    rc = RuntimeConstants(
+    rc = LoopConstants(
         model_context_window=4_096,
         leader_tool_call_soft_cap=1,
         finalize_prose_gate_enabled=True,
@@ -731,7 +733,7 @@ async def test_the_prose_gate_still_refuses_a_terminal_call_with_no_answer() -> 
 
 @pytest.mark.asyncio
 async def test_the_switch_off_restores_the_bare_terminal() -> None:
-    rc = RuntimeConstants(
+    rc = LoopConstants(
         model_context_window=4_096,
         max_turns_per_run=1,
         soft_stop_enabled=False,
@@ -747,7 +749,7 @@ async def test_the_switch_off_restores_the_bare_terminal() -> None:
 
 
 def test_a_wind_down_cannot_be_entered_twice() -> None:
-    rc = RuntimeConstants(model_context_window=4_096)
+    rc = LoopConstants(model_context_window=4_096)
     engine = _build_engine(
         rc=rc, llm=_ScriptedLLM([{"text": "x"}]), tools=[_FinalizeTool()]
     )
@@ -762,7 +764,7 @@ def test_a_wind_down_cannot_be_entered_twice() -> None:
 
 def test_an_unknown_cause_is_refused() -> None:
     """The cause rides every event and the run row; a typo would be invisible."""
-    rc = RuntimeConstants(model_context_window=4_096)
+    rc = LoopConstants(model_context_window=4_096)
     engine = _build_engine(
         rc=rc, llm=_ScriptedLLM([{"text": "x"}]), tools=[_FinalizeTool()]
     )
@@ -774,7 +776,7 @@ def test_an_unknown_cause_is_refused() -> None:
 @pytest.mark.asyncio
 async def test_a_resumed_run_stays_wound_down() -> None:
     """Otherwise the re-drive hands back every tool the stop just took away."""
-    rc = RuntimeConstants(model_context_window=4_096)
+    rc = LoopConstants(model_context_window=4_096)
     engine = _build_engine(
         rc=rc,
         llm=_ScriptedLLM([{"text": "x"}]),

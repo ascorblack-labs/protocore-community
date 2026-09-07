@@ -4,7 +4,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any
 
-from protocore.contracts.runtime_constants import RuntimeConstants
+from protocore.contracts.runtime_constants import LoopConstants
 
 SPAN_NAMES = (
     "run",
@@ -25,7 +25,7 @@ class Span:
         return {"name": self.name, "attributes": dict(self.attributes)}
 
 
-def start_span(name: str, *, rc: RuntimeConstants, **attributes: Any) -> Span | None:
+def start_span(name: str, *, rc: LoopConstants, **attributes: Any) -> Span | None:
     if not rc.telemetry_spans_enabled:
         return None
     if name not in SPAN_NAMES:

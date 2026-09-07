@@ -36,7 +36,7 @@ from __future__ import annotations
 import asyncio
 import logging
 
-from protocore.contracts.runtime_constants import RuntimeConstants
+from protocore.contracts.runtime_constants import LoopConstants
 from protocore.contracts.types import MessageRole, ToolCall
 from protocore.runtime.query import (
     _resolve_terminal_candidate_corrective,
@@ -74,7 +74,7 @@ def _engine(
             #  — prose-gate stays at its DEFAULT: ``final_answer``
             # is unregistered in this in-memory runtime, so the schema-conditioned
             # gate treats it as unknown-schema → EXEMPT (no RC override needed).
-            rc=RuntimeConstants(**(rc_kwargs or {})),
+            rc=LoopConstants(**(rc_kwargs or {})),
             expected_terminal_tool=expected_terminal_tool,
         ),
         llm_provider=InMemoryLLMProvider(),
@@ -324,7 +324,7 @@ def _veto_engine() -> QueryEngine:
             model_name="qwen3.6-35b-a3b",
             #  — prose-gate at DEFAULT: unregistered
             # ``final_answer`` ⟹ unknown-schema ⟹ EXEMPT (no RC override needed).
-            rc=RuntimeConstants(
+            rc=LoopConstants(
                 pre_dispatch_terminal_verify_enabled=True,
                 pre_terminal_self_verify_max_extra_turns=1,
                 terminal_candidate_preserve_enabled=True,
@@ -461,9 +461,8 @@ def test_dispatch_tool_repair_seam_inert_when_preserve_disabled():
 # later fix verifiable) has gone silent again.
 # ---------------------------------------------------------------------------
 
-# Uses the runtime-facing observed-state helper-bag key so the test exercises
+# Uses the runtime-facing observed-state key so the test exercises
 # the same opaque-bag read the heartbeat performs in production.
-_LEDGER_HELPER_KEY = "terminal_answer_observed_refs"
 
 
 def _no_veto_engine() -> QueryEngine:
@@ -485,7 +484,7 @@ def _no_veto_engine() -> QueryEngine:
             model_name="qwen3.6-35b-a3b",
             #  — prose-gate at DEFAULT: unregistered
             # ``final_answer`` ⟹ unknown-schema ⟹ EXEMPT (no RC override needed).
-            rc=RuntimeConstants(
+            rc=LoopConstants(
                 pre_dispatch_terminal_verify_enabled=True,
                 pre_terminal_self_verify_max_extra_turns=1,
             ),
@@ -522,9 +521,6 @@ def test_heartbeat_diag_fires_on_no_veto_dispatch(caplog):
     """
 
     eng = _no_veto_engine()
-    # Seed the opaque helper bag with an observed-ref ledger so the heartbeat's
-    # best-effort ``observed=M`` read off ``engine._helpers`` is exercised.
-    eng._helpers = {_LEDGER_HELPER_KEY: {"/proc/a.json", "/proc/b.json"}}
     call = ToolCall(
         name="final_answer",
         arguments={"message": SUBSTANTIVE, "refs": ["/proc/a.json"]},
@@ -545,7 +541,6 @@ def test_heartbeat_diag_fires_on_no_veto_dispatch(caplog):
     assert "verdict=no_veto" in msg
     assert "run=run-hb-noveto" in msg
     assert "cited=1" in msg  # one ref on the call
-    assert "observed=2" in msg  # ledger seeded with two paths
 
 
 def test_heartbeat_diag_fires_on_veto_dispatch(caplog):
@@ -575,9 +570,6 @@ def test_heartbeat_diag_fires_on_veto_dispatch(caplog):
     assert "verdict=veto" in msg
     assert "run=run-u6" in msg
     assert "cited=2" in msg  # two refs on the call
-    # No ledger seeded on the veto engine -> best-effort read reports the
-    # "unavailable" sentinel rather than a misleading 0.
-    assert "observed=-1" in msg
 
 
 def test_heartbeat_diag_silent_when_gate_does_not_apply(caplog):

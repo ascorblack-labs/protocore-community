@@ -4,8 +4,7 @@ from __future__ import annotations
 
 import pytest
 
-from protocore.contracts.types import TextBlock
-from protocore.contracts.verification import (
+from protocore.contracts.evidence import (
     CandidateBundle,
     DeliveryMode,
     EvidenceLedger,
@@ -23,6 +22,7 @@ from protocore.contracts.verification import (
     VerificationSeverity,
     VerificationState,
 )
+from protocore.contracts.types import TextBlock
 
 
 def _record(engine, record_id: str, **origin_overrides: str | int | None) -> EvidenceRecord:  # type: ignore[no-untyped-def]
@@ -188,10 +188,14 @@ async def test_restore_fails_closed_when_snapshot_root_differs_from_engine(engin
     source.append_tool_evidence((_record(source, "record-1"),))
 
     restored = engine_factory(run_id="child", root_run_id="root-b", parent_run_id="parent", subagent_id="worker")
-    await restored.resume_from_snapshot(source.snapshot())
+    # The snapshot names a different tree. The whole restore is refused, before
+    # any state reaches the engine — a stronger answer than degrading the
+    # verification lifecycle and carrying the foreign history in anyway.
+    with pytest.raises(ValueError, match="root_run_id"):
+        await restored.resume_from_snapshot(source.snapshot())
 
-    assert restored.verification_lifecycle.state is VerificationState.failed
-    assert restored.verification_lifecycle.restore_error == "verification snapshot run binding failed"
+    assert restored.verification_lifecycle == VerificationLifecycle()
+    assert restored.history == []
 
 
 def test_replace_rejects_open_ledger_from_a_sibling_without_mutation(engine_factory) -> None:
@@ -220,10 +224,10 @@ async def test_restore_rejects_open_ledger_from_a_sibling_without_mutation(engin
     destination = engine_factory(
         run_id="child-b", root_run_id="root", parent_run_id="parent", subagent_id="worker-b"
     )
-    await destination.resume_from_snapshot(source.snapshot())
+    with pytest.raises(ValueError, match="run_id"):
+        await destination.resume_from_snapshot(source.snapshot())
 
-    assert destination.verification_lifecycle.state is VerificationState.failed
-    assert destination.verification_lifecycle.restore_error == "verification snapshot run binding failed"
+    assert destination.verification_lifecycle == VerificationLifecycle()
     assert destination.verification_lifecycle.ledger is None
     assert source.verification_lifecycle == source_lifecycle
 
@@ -260,9 +264,9 @@ async def test_empty_open_ledger_restores_only_to_its_exact_attempt_owner(engine
     rejected = engine_factory(
         run_id="same-run", root_run_id="root", parent_run_id="parent-b", subagent_id="worker-b"
     )
-    await rejected.resume_from_snapshot(snapshot)
-    assert rejected.verification_lifecycle.state is VerificationState.failed
-    assert rejected.verification_lifecycle.restore_error == "verification snapshot run binding failed"
+    with pytest.raises(ValueError, match="parent_run_id"):
+        await rejected.resume_from_snapshot(snapshot)
+    assert rejected.verification_lifecycle == VerificationLifecycle()
 
 
 @pytest.mark.asyncio

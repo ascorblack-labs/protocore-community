@@ -2,7 +2,7 @@
 
 Verifies the dispatcher's NEW separate streak counter that fires
 when consecutive Pydantic ``string_type`` validation errors on the
-SAME tool exceed ``RuntimeConstants.tool_dispatch_string_type_terminal_cap``
+SAME tool exceed ``LoopConstants.tool_dispatch_string_type_terminal_cap``
 (default 3, lowered from 5 so the shape-specific TERMINAL guidance fires
 BEFORE the generic ``tool_dispatch_consecutive_error_cap=4`` wraps the error
 with vague guidance). The mainline coercion validators on
@@ -21,7 +21,8 @@ from typing import Any
 
 import pytest
 
-from protocore.contracts.runtime_constants import RuntimeConstants
+from protocore.contracts.run_state import RunScopedState
+from protocore.contracts.runtime_constants import LoopConstants
 from protocore.contracts.tool_registry import ToolVisibilityPolicy
 from protocore.contracts.tools import ToolContext
 from protocore.contracts.types import ToolCall
@@ -33,6 +34,7 @@ from protocore.runtime.tool_dispatch import (
 )
 from protocore.runtime.tool_permission import ToolPermissionGate
 from protocore.runtime.tool_registry import ToolRegistry
+from tests._fixtures.tool_roles import CONVENTIONAL_TOOL_ROLES
 
 from ._tool_fixtures import MockTool
 
@@ -40,23 +42,23 @@ from ._tool_fixtures import MockTool
 def _build_dispatcher(tools: list[MockTool]) -> ToolDispatcher:
     return ToolDispatcher(
         registry=ToolRegistry(tools),
-        permission_gate=ToolPermissionGate(),
+        permission_gate=ToolPermissionGate(roles=CONVENTIONAL_TOOL_ROLES),
     )
 
 
-def _make_helpers_ctx(
+def _make_run_ctx(
     *,
     run_id: str = "run-st-1",
-    helpers: dict[str, Any] | None = None,
-) -> tuple[ToolContext, dict[str, Any]]:
-    bag: dict[str, Any] = dict(helpers) if helpers else {}
+    rc: Any | None = None,
+) -> tuple[ToolContext, RunScopedState]:
+    state = RunScopedState(rc=rc)
     ctx = ToolContext(
         tenant_id="tenant-st",
         run_id=run_id,
         session_id="sess-st",
-        metadata={"protocore.helpers": bag},
+        run_state=state,
     )
-    return ctx, bag
+    return ctx, state
 
 
 async def _drain(
@@ -103,13 +105,13 @@ async def test_string_type_below_cap_returns_original_kind() -> None:
     """
     from protocore.contracts.tools import ToolInvocationError
 
-    rc = RuntimeConstants()  # defaults: generic=4, string_type=3
+    rc = LoopConstants()  # defaults: generic=4, string_type=3
     tool = MockTool(
         tool_name="Write",
         raise_exception=ToolInvocationError(_STRING_TYPE_ERROR_MSG),
     )
     dispatcher = _build_dispatcher([tool])
-    ctx, _ = _make_helpers_ctx(helpers={"rc": rc})
+    ctx, _ = _make_run_ctx(rc=rc)
 
     for attempt in range(2):
         _events, outcome = await _drain(
@@ -132,13 +134,13 @@ async def test_third_string_type_error_trips_terminal_cap() -> None:
     """
     from protocore.contracts.tools import ToolInvocationError
 
-    rc = RuntimeConstants()  # defaults: generic=4, string_type=3
+    rc = LoopConstants()  # defaults: generic=4, string_type=3
     tool = MockTool(
         tool_name="Write",
         raise_exception=ToolInvocationError(_STRING_TYPE_ERROR_MSG),
     )
     dispatcher = _build_dispatcher([tool])
-    ctx, _ = _make_helpers_ctx(helpers={"rc": rc})
+    ctx, _ = _make_run_ctx(rc=rc)
 
     last_outcome: DispatchOutcome | None = None
     for _ in range(3):
@@ -164,13 +166,13 @@ async def test_string_type_terminal_fires_before_generic_under_defaults() -> Non
     """
     from protocore.contracts.tools import ToolInvocationError
 
-    rc = RuntimeConstants()  # defaults: generic=4, string_type=3
+    rc = LoopConstants()  # defaults: generic=4, string_type=3
     tool = MockTool(
         tool_name="Write",
         raise_exception=ToolInvocationError(_STRING_TYPE_ERROR_MSG),
     )
     dispatcher = _build_dispatcher([tool])
-    ctx, _ = _make_helpers_ctx(helpers={"rc": rc})
+    ctx, _ = _make_run_ctx(rc=rc)
 
     last_outcome: DispatchOutcome | None = None
     for _ in range(3):
@@ -202,7 +204,7 @@ async def test_string_type_terminal_wins_over_generic_when_both_fire() -> None:
     """
     from protocore.contracts.tools import ToolInvocationError
 
-    rc = RuntimeConstants(
+    rc = LoopConstants(
         tool_dispatch_consecutive_error_cap=3,
         tool_dispatch_string_type_terminal_cap=3,
     )
@@ -211,7 +213,7 @@ async def test_string_type_terminal_wins_over_generic_when_both_fire() -> None:
         raise_exception=ToolInvocationError(_STRING_TYPE_ERROR_MSG),
     )
     dispatcher = _build_dispatcher([tool])
-    ctx, _ = _make_helpers_ctx(helpers={"rc": rc})
+    ctx, _ = _make_run_ctx(rc=rc)
 
     last_outcome: DispatchOutcome | None = None
     for _ in range(3):
@@ -239,7 +241,7 @@ async def test_non_string_type_error_resets_streak() -> None:
     """
     from protocore.contracts.tools import ToolInvocationError
 
-    rc = RuntimeConstants(
+    rc = LoopConstants(
         tool_dispatch_consecutive_error_cap=20,
         tool_dispatch_string_type_terminal_cap=20,
     )
@@ -251,7 +253,7 @@ async def test_non_string_type_error_resets_streak() -> None:
         tool_name="Write",
         raise_exception=ToolInvocationError("unrelated execution failure"),
     )
-    ctx, bag = _make_helpers_ctx(helpers={"rc": rc})
+    ctx, state = _make_run_ctx(rc=rc)
 
     dispatcher_st = _build_dispatcher([string_type_tool])
     for _ in range(3):
@@ -271,7 +273,7 @@ async def test_non_string_type_error_resets_streak() -> None:
     )
     assert outcome.error_kind is DispatchErrorKind.execution
     # State must show the streak cell gone (or count reset).
-    assert "tool_dispatch.string_type_streak" not in bag
+    assert state.string_type is None
 
     # Back to string_type errors — fresh count restarts at 1, not 4.
     dispatcher_st_again = _build_dispatcher([string_type_tool])
@@ -294,7 +296,7 @@ async def test_string_type_streak_is_per_tool() -> None:
     """
     from protocore.contracts.tools import ToolInvocationError
 
-    rc = RuntimeConstants(
+    rc = LoopConstants(
         tool_dispatch_consecutive_error_cap=20,
         tool_dispatch_string_type_terminal_cap=20,
     )
@@ -311,7 +313,7 @@ async def test_string_type_streak_is_per_tool() -> None:
         ),
     )
     dispatcher = _build_dispatcher([write_st, append_st])
-    ctx, _ = _make_helpers_ctx(helpers={"rc": rc})
+    ctx, _ = _make_run_ctx(rc=rc)
 
     # 4 Write string_type — under cap=20, original kind.
     for _ in range(4):
@@ -342,7 +344,7 @@ async def test_successful_call_resets_string_type_streak() -> None:
     """
     from protocore.contracts.tools import ToolInvocationError
 
-    rc = RuntimeConstants(
+    rc = LoopConstants(
         tool_dispatch_consecutive_error_cap=20,
         tool_dispatch_string_type_terminal_cap=20,
     )
@@ -351,7 +353,7 @@ async def test_successful_call_resets_string_type_streak() -> None:
         raise_exception=ToolInvocationError(_STRING_TYPE_ERROR_MSG),
     )
     ok = MockTool(tool_name="Mix", response_content="ok-result")
-    ctx, bag = _make_helpers_ctx(helpers={"rc": rc})
+    ctx, state = _make_run_ctx(rc=rc)
 
     dispatcher_boom = _build_dispatcher([boom])
     for _ in range(4):
@@ -369,7 +371,7 @@ async def test_successful_call_resets_string_type_streak() -> None:
         ctx=ctx,
     )
     assert outcome.success is True
-    assert "tool_dispatch.string_type_streak" not in bag
+    assert state.string_type is None
 
 
 @pytest.mark.asyncio
@@ -382,7 +384,7 @@ async def test_rc_override_lowers_string_type_cap() -> None:
     """
     from protocore.contracts.tools import ToolInvocationError
 
-    rc = RuntimeConstants(
+    rc = LoopConstants(
         tool_dispatch_consecutive_error_cap=20,
         tool_dispatch_string_type_terminal_cap=2,
     )
@@ -391,7 +393,7 @@ async def test_rc_override_lowers_string_type_cap() -> None:
         raise_exception=ToolInvocationError(_STRING_TYPE_ERROR_MSG),
     )
     dispatcher = _build_dispatcher([tool])
-    ctx, _ = _make_helpers_ctx(helpers={"rc": rc})
+    ctx, _ = _make_run_ctx(rc=rc)
 
     _events, outcome = await _drain(
         dispatcher,

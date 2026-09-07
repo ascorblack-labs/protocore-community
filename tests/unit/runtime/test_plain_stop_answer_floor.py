@@ -21,7 +21,7 @@ from typing import Any
 import pytest
 
 from protocore.contracts.llm import LLMStreamEvent
-from protocore.contracts.runtime_constants import RuntimeConstants
+from protocore.contracts.runtime_constants import LoopConstants
 from protocore.contracts.types import (
     SYNTHETIC_RECOVERY_METADATA_KEY,
     SYNTHETIC_RECOVERY_PROSE_GATE_REPAIR,
@@ -88,7 +88,7 @@ def _build(engine_factory, in_memory_runtime, **rc_kwargs: Any):
     registry: InMemoryToolRegistry = in_memory_runtime["tools"]
     registry.register(MockTool(tool_name="Agent", description="Delegate work"))
     engine = engine_factory(
-        rc=RuntimeConstants(
+        rc=LoopConstants(
             model_context_window=4_096,
             finalize_prose_gate_min_chars=FLOOR,
             **rc_kwargs,
@@ -162,7 +162,7 @@ async def test_a_pointer_instead_of_an_answer_buys_one_more_turn(
     assert len(_repair_turns(engine)) == 1
     assert (
         _repair_turns(engine)[0].content_blocks[0].text
-        == engine.config.rc.finalize_prose_gate_repair_text
+        == engine.prompt_text("finalize_prose_gate_repair")
     )
     # The substantive answer is in history, and the thin one was not erased —
     # the floor asks for more, it does not retract what the model already said.
@@ -252,7 +252,7 @@ async def test_narration_before_the_work_is_not_the_answer(
     """
     registry: InMemoryToolRegistry = in_memory_runtime["tools"]
     registry.register(MockTool(tool_name="Agent", description="Delegate work"))
-    engine = engine_factory(rc=RuntimeConstants(model_context_window=4_096))
+    engine = engine_factory(rc=LoopConstants(model_context_window=4_096))
     assert engine.config.rc.finalize_prose_gate_min_chars == 1
     llm: InMemoryLLMProvider = in_memory_runtime["llm"]
 
@@ -360,7 +360,7 @@ def test_an_answer_already_submitted_in_tool_args_exempts_the_run(
         )
     )
     engine = engine_factory(
-        rc=RuntimeConstants(model_context_window=4_096), expected_terminal_tool="Answer"
+        rc=LoopConstants(model_context_window=4_096), expected_terminal_tool="Answer"
     )
     _seed_unanswered_run(engine)
     _terminal_result(engine, tool="Answer")
@@ -383,7 +383,7 @@ def test_a_background_terminal_does_not_exempt_the_run(
         )
     )
     engine = engine_factory(
-        rc=RuntimeConstants(model_context_window=4_096),
+        rc=LoopConstants(model_context_window=4_096),
         expected_terminal_tool="Finalize",
     )
     _seed_unanswered_run(engine)
@@ -409,7 +409,7 @@ def test_an_uncalled_message_carrying_terminal_exempts_nothing(
         )
     )
     engine = engine_factory(
-        rc=RuntimeConstants(model_context_window=4_096), expected_terminal_tool="Answer"
+        rc=LoopConstants(model_context_window=4_096), expected_terminal_tool="Answer"
     )
     _seed_unanswered_run(engine)
 
@@ -421,7 +421,7 @@ def test_the_latch_is_shared_with_the_dispatch_seam(
 ) -> None:
     """One shot for the whole mechanism, not one per path: a run whose terminal
     dispatch was already vetoed cannot also be repaired here."""
-    engine = engine_factory(rc=RuntimeConstants(model_context_window=4_096))
+    engine = engine_factory(rc=LoopConstants(model_context_window=4_096))
     _seed_unanswered_run(engine)
     assert _plain_stop_answer_floor_applies(engine) is True
 
@@ -442,7 +442,7 @@ def test_a_short_answer_with_no_tool_work_behind_it_is_left_alone(
     threshold.
     """
     engine = engine_factory(
-        rc=RuntimeConstants(
+        rc=LoopConstants(
             model_context_window=4_096, finalize_prose_gate_min_chars=400
         )
     )
@@ -472,7 +472,7 @@ def test_the_same_short_answer_after_real_work_does_trip_the_floor(
     a run that went and did something and then said almost nothing about it.
     """
     engine = engine_factory(
-        rc=RuntimeConstants(
+        rc=LoopConstants(
             model_context_window=4_096, finalize_prose_gate_min_chars=400
         )
     )

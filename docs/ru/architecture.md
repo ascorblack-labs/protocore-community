@@ -23,9 +23,9 @@
 - **Универсальность / мультитенантность.** Ни в одном исполняемом пути нет логики,
   завязанной на отдельную задачу, tenant-id, промпт или
   скорер/рубрику. Каждый метод scoped по тенанту; политика тенанта инъецируется
-  (через `RuntimeConstants` и `ToolContext.metadata`) и никогда не зашита в код.
-- **Всё конфигурируемо через `RuntimeConstants` и безопасно по умолчанию.** Настраиваемые
-  значения проходят через `RuntimeConstants` (замороженный Pydantic-снимок) или
+  (через `LoopConstants` и `ToolContext.metadata`) и никогда не зашита в код.
+- **Всё конфигурируемо через `LoopConstants` и безопасно по умолчанию.** Настраиваемые
+  значения проходят через `LoopConstants` (замороженный Pydantic-снимок) или
   `constants.py` (лимиты безопасности по памяти). Новые возможности по умолчанию **выключены** или принимают
   значение, воспроизводящее прежнее поведение, так что тенант подключает их осознанно.
 - **Безопасно при горизонтальном масштабировании.** Никаких словарей на уровне модуля, никаких блокировок `asyncio`,
@@ -48,17 +48,27 @@ protocore (чистое ядро, ноль импортов вверх)
 
 ### Public API (`protocore/__init__.py`)
 
-Публичная поверхность **contract-first**: реэкспортируются 11 интерфейсных
-`Protocol`-ов store / service плюс ABC `Tool` — `IAgentDispatch`,
-`IBlobStore`, `IEventStream`, `IHookManager`, `ILLMProvider`, `IRunStore`,
-`ISearchIndex`, `ISessionStore`, `ISkillStore`, `IToolRegistry`, `ITodoStorage`
-и `Tool`. (`IMemory`, `IWorkspace`, `IToolTransport` и
-`IPromptTemplateProvider` живут в своих контрактных модулях — `contracts/memory.py`,
-`contracts/workspace.py`, `contracts/resilience.py`, `contracts/prompts.py`, — но
-**не** реэкспортируются на верхнем уровне.) Поверхность также реэкспортирует основную систему
-типов (`Message`, `ToolCall`, `ToolResult`, `Event`, `Run`, `Session`, объединение
-`ContentBlock`, …), `RuntimeConstants` + `RuntimeConstantsProvider`,
-`EventBus`/`EventName`, pluggy-`HookManager`, `DefaultShellSafetyPolicy`,
+Публичная поверхность **contract-first**: реэкспортируются те интерфейсные
+`Protocol`-ы store / service, за которыми хост тянется чаще всего, плюс ABC
+`Tool` — `IAgentDispatch`, `IBlobStore`, `IEventStream`, `IHookManager`,
+`ILifecycleRegistry`, `ILLMProvider`, `IRunStore`, `ISearchIndex`,
+`ISessionStore`, `ISkillStore`, `IToolRegistry`, `ITodoStorage` и `Tool`.
+Остальные из 32 `Protocol`-ов импортируются из собственного контрактного модуля
+и на верхнем уровне **не** реэкспортируются: `IMemory` (`contracts/memory.py`),
+`IWorkspace` (`contracts/workspace.py`), `IToolTransport` и
+`IResilienceClassifier` (`contracts/resilience.py`), `IPromptTemplateProvider`
+(`contracts/prompts.py`), `IWorkPool` (`contracts/background.py`),
+`IConstantsRegistry` и `ICoreConstantsProvider` (`contracts/config.py`),
+`IRequestManifestSink` (`contracts/observability.py`), `IProviderChain`
+(`contracts/llm.py`) и `ITurnPolicy` (`contracts/turn_policy.py`).
+Поверхность также реэкспортирует основную систему
+типов (`Message`, `ToolCall`, `ToolResult`, `Event`, `Run`, `Session`,
+`SubagentDef`, объединение
+`ContentBlock`, …), `LoopConstants` + `RuntimeConstantsProvider`, словарь
+жизненного цикла (`RegistrationKind`, `LifecycleVerdict`, `LifecycleContext`,
+`LifecycleDecision`, `LifecycleOutcome`, `LifecycleScope`,
+`LifecycleDisposer`),
+`EventBus`/`EventName`, lifecycle-`HookManager`, `DefaultShellSafetyPolicy`,
 декоратор `@tool`, утилиты envelope/JSON и помощники подсчёта токенов
 (`LanguageProfile`, `chars_per_token`, `detect_profile`, `estimate_tokens`). Она
 **не** реэкспортирует `derive_budgets`, `retrieve_tools` или `bm25_score` — они
@@ -88,10 +98,10 @@ protocore (чистое ядро, ноль импортов вверх)
 │     agent_dispatch.py IAgentDispatch · events.py IEventStream ·                  │
 │     hooks.py IHookManager · memory.py IMemory · workspace.py IWorkspace ·        │
 │     resilience.py IToolTransport · prompts.py IPromptTemplateProvider            │
-│   runtime_constants.py  RuntimeConstants (frozen, extra="forbid") + Provider     │
-│   lean_tool_surface.py · references.py · terminal_answer_validation.py ·         │
+│   runtime_constants.py  LoopConstants (frozen, extra="forbid") + Provider     │
+│   terminal_answer_validation.py ·                                             │
 │   attempt_ledger.py · tool_action_preconditions.py · observability.py ·          │
-│   verification.py · tool_chunking.py                                             │
+│   evidence.py · tool_chunking.py                                                │
 └──────────────────────────────────────────────────────────────────────────────┘
                                      ▲ implemented by the host / consumed by runtime
 ┌──────────────────────────────────────────────────────────────────────────────┐
@@ -102,12 +112,14 @@ protocore (чистое ядро, ноль импортов вверх)
 │        open_intents · usage_rows · lanes · live_* · steer/follow-up queues ·    │
 │        verification · recovery latches ·                                        │
 │        snapshot()/resume_from_snapshot()  (any pod can resume)                  │
-│   query(engine)  (query.py) ── sync entry: _reset_per_turn_state() then          │
-│        returns an async iterator of TurnEvent (no turn-start/end snapshot)      │
-│   run() ── appends, snapshots, iterates _query_raw (not query())                │
+│   run(message) ── appends, snapshots, drives one turn of TurnEvent              │
+│   resume(engine, snapshot, ...) (query.py) ── restore + pick the drive:          │
+│        resolution map | approved tool call | arrived message | re-drive        │
+│   resume_approved_tool(engine, call) ── run one call held for approval          │
+│   resume_interrupts(engine, resolutions) ── answer every wait, in one drive     │
 │   loop_strategies.py ── DirectStrategy | DeepStrategy (run_mode)                │
-│   intent.py · usage_ledger.py · session_tree.py · lanes.py ·                    │
-│   typed_hooks.py · telemetry.py · correctness_bind.py ·                         │
+│   intent.py · usage_ledger.py · lanes.py ·                                      │
+│   telemetry.py · correctness_bind.py ·                                          │
 │   compact_checkpoint.py · live_control.py · run_work_budget.py                  │
 │        LoopState (loop_state.py): PENDING→RUNNING→{AWAITING|COMPACTING}→         │
 │                                   {COMPLETED|FAILED|CANCELLED}                   │
@@ -119,10 +131,10 @@ protocore (чистое ядро, ноль импортов вверх)
 │ + RETRIEVAL   │ │ + GATING       │ │ context/manager.py    │ │ + GROUNDING    │
 │ tool_registry │ │ tool_dispatch  │ │ context/budgets.py    │ │ finalization_  │
 │ tool_retrieval│ │ ToolDispatcher │ │ context/compaction.py │ │   gate.py      │
-│ tool_pool     │ │ tool_permission│ │ context/session_      │ │ finalization_  │
-│ lean surface  │ │   Gate (4 stg) │ │   memory.py           │ │   contract.py  │
-│ @tool decorat.│ │ tool_precondi- │ │ compact_checkpoint.py │ │ terminal_      │
-│               │ │   tions (DAG)  │ │ token_counting.py     │ │   payload_norm │
+│ @tool decorat.│ │ tool_permission│ │ context/session_      │ │ finalization_  │
+│               │ │   Gate (4 stg) │ │   memory.py           │ │   contract.py  │
+│               │ │ tool_precondi- │ │ compact_checkpoint.py │ │                │
+│               │ │   tions (DAG)  │ │ token_counting.py     │ │                │
 │               │ │ run_tool_pre-  │ │ prompt_caching.py     │ │                │
 │               │ │   conditions   │ │ json_utils strip-     │ │                │
 │               │ │   (run forcer) │ │   thinking            │ │                │
@@ -138,10 +150,10 @@ protocore (чистое ядро, ноль импортов вверх)
 │ (IMemory)    │ │ (IWorkspace) │ │ attempt_     │ │  load_file   │ │  delta_bridge│
 │              │ │              │ │  ledger ·    │ │              │ │ hooks/       │
 │              │ │              │ │ adaptive_    │ │              │ │  manager,    │
-│              │ │              │ │  safety_band │ │              │ │  specs +     │
-│              │ │              │ │ run_work_    │ │              │ │ typed_hooks  │
-│              │ │              │ │  budget      │ │              │ │  PUBLISHED_  │
-│              │ │              │ │              │ │              │ │  HOOKS       │
+│              │ │              │ │  safety_band │ │              │ │  manager +   │
+│              │ │              │ │ run_work_    │ │              │ │ middleware   │
+│              │ │              │ │  budget      │ │              │ │  contract    │
+│              │ │              │ │              │ │              │ │              │
 └──────────────┘ └──────────────┘ └──────────────┘ └──────────────┘ └──────────────┘
         │                 │                 │                 │                 │
         ▼                 ▼                 ▼                 ▼                 ▼
@@ -158,24 +170,26 @@ protocore (чистое ядро, ноль импортов вверх)
 
 ### Поток данных одного хода агента
 
-`query(engine)` — **синхронная** функция: она вызывает `_reset_per_turn_state()`
-и возвращает асинхронный итератор. Каждый внутренний `yield` из `_query_raw` —
-контрольная точка stop-check; исполнитель транслирует выпущенные `TurnEvent`-ы
-наружу по SSE (Redis pub/sub на уровне хоста). `query()` **не** сохраняет
-снимки начала и конца хода — `QueryEngine.run()` добавляет пользовательское
-сообщение, снимает snapshot, затем итерирует `_query_raw` (не `query()`).
+`QueryEngine.run(message)` добавляет пользовательское сообщение, ставит часы
+запуска, сохраняет снимок начала хода и ведёт один ход;
+`resume(engine, snapshot)` сначала восстанавливает сохранённый прогон, а затем
+ведёт то продолжение, которое описала вызывающая сторона. Оба привязывают
+ведущую задачу, чтобы `stop()` мог жёстко отменить, и оба сохраняют снимок на
+выходе, каким бы он ни был. Каждый внутренний `yield` из приватного генератора
+`_query_raw` — контрольная точка stop-check; исполнитель транслирует выпущенные
+`TurnEvent`-ы наружу по SSE (Redis pub/sub на уровне хоста).
 
 ```
                        ┌─────────────────────────────────────────────┐
- caller: async for evt │  query(engine)  — sync reset, then iterator  │
-   in query(engine):   │  of TurnEvent (one already-prepared turn)    │
+ caller: async for evt │  run(message) / resume(engine, snapshot)     │
+   in engine.run(msg): │  — an async iterator of TurnEvent, one turn  │
                        └─────────────────────────────────────────────┘
                                           │
    (1) STOP CHECK ──────────────────────►│  stop_requested? → synthesize missing
                                           │   tool_results → CANCELLED
-        INTENT RECOVERY ─────────────────►│  resume_open_intents +
+        INTENT RECOVERY ─────────────────►│  settle interrupted tool intents +
                                           │   mark_intent_recovery (correctness_bind)
-        TYPED before_run ───────────────►│  fire_typed_hook → deny? → stop
+        LIFECYCLE run_start ────────────►│  fire_lifecycle → deny? → stop 
         MANUAL /compact ────────────────►│  CompactCheckpoint (RC-gated, default off)
    (2) COMPACTION CHECK ─────────────────►│  needs_compaction()?  ── yes ──┐
                                           │                                 ▼
@@ -184,7 +198,11 @@ protocore (чистое ядро, ноль импортов вверх)
                                           │                 │  Tier 1: truncate/blob   │
                                           │                 │   big tool_results       │
                                           │                 │  Tier 2: summarise old   │
-                                          │                 │   turns → snapshot       │
+                                          │                 │   turns (never the       │
+                                          │                 │   operator's) → snapshot │
+                                          │                 │  Tier 3: fold runs of    │
+                                          │                 │   old summaries +        │
+                                          │                 │   old operator turns     │
                                           │                 │  COMPACTING→RUNNING      │
                                           │                 └──────────────────────────┘
    (3) UserPromptSubmit HOOK ────────────►│  _safe_hook_invoke → deny? → FAILED
@@ -228,7 +246,7 @@ protocore (чистое ядро, ноль импортов вверх)
    │   │ 4. preconditions DAG→masked? (post-gate) │ │    verify deliverables (stat) ·
    │   │ 5. execute tool.invoke(ctx)              │ │    terminal_answer_validation
    │   │ 6. post_tool_use hook                    │ │      (refs ⊆ reads, canonical)
-   │   │ → DispatchOutcome (success/err/approval) │ │    terminal_payload_normalize
+   │   │ → DispatchOutcome (success/err/approval) │ │
    │   │     ◄── read records grounding ref       │ │            │
    │   │     ◄── WORKSPACE read-dedup cache       │ │            ▼
    │   └─────────────────────────────────────────┘ │      MESSAGE_STOP → COMPLETED
@@ -236,8 +254,9 @@ protocore (чистое ядро, ноль импортов вверх)
    │  snapshot after every tool_result append       │ │
    │  loop back to (5): next assistant message       │ │
    └────────────────────┬───────────────────────────┘ │
-                        │  approval_required? → AWAITING (resume_approved_tool later)
-                        ▼  ask_user? → AWAITING (resume on user answer)
+                        │  approval_required? → PendingInterrupt(approval) → AWAITING
+                        ▼  ask_user? → PendingInterrupt(question) → AWAITING
+                           (resume(resolutions={id: InterruptResolution(...)}))
                   (recurse) stream next assistant message
 ```
 
@@ -256,15 +275,15 @@ protocore (чистое ядро, ноль импортов вверх)
   (хост привязывает её).
 - **Hooks/events** срабатывают в каждой точке жизненного цикла (UserPromptSubmit, pre/post
   tool, pre/post compact), и каждая дельта провайдера становится `TurnEvent`.
-  Когда `typed_hooks_enabled` включён, `correctness_bind.fire_typed_hook`
-  запускает `before_run` / `transform_context` / `before_compact` /
-  `after_compact`. `before_tool` / `after_tool` также требуют
-  `intent_settlement_enabled`. `transform_context` срабатывает, но его
-  `rewrite` к истории не применяется.
-- **Intent settlement + usage ledger** (оба выключены по умолчанию): когда
-  `intent_settlement_enabled` включён, **каждый** диспетчеризуемый инструмент
-  коммитит `IntentRecord` (never-replay vs safe по `intent_never_replay_tools`);
-  прерванные never-replay намерения помечаются в начале хода. Usage-строки для
+  Когда `typed_hooks_enabled` включён, `correctness_bind.fire_lifecycle`
+  испускает каждую координату, через которую проходит цикл, а `transform` на
+  `context_transform` применяется к контексту хода. Один тумблер управляет всем
+  швом; ни одна координата не спрятана за вторым, посторонним.
+- **Intent settlement + usage ledger**: **каждый** диспетчеризуемый инструмент
+  коммитит `IntentRecord` до вызова, безусловно, а ход открывается закрытием
+  записей, оставленных прогоном, который остановился на лету.
+  `intent_settlement_enabled` (выключен по умолчанию) гейтит поверх этого
+  только события восстановления и строку журнала. Usage-строки для
   `inference` / `retry` / `compaction` / `abort` / `fail` идут через
   `commit_usage`, когда `usage_ledger_enabled` включён; строка вида **tool**
   пишется только на пути intent-settlement.
@@ -279,32 +298,40 @@ protocore (чистое ядро, ноль импортов вверх)
 По одной строке на каждую технологию ядра. **Wired into loop?** = на технологию ссылается основной
 рантайм-цикл (`query.py` / `query_engine.py`); подсистемы, подключённые только
 адаптером хоста, помечены соответственно. **RC toggle(s) + default** фиксирует
-управляющее поле (поля) `RuntimeConstants` и его безопасный/выключенный default.
+управляющее поле (поля) `LoopConstants` и его безопасный/выключенный default.
 
 | Technology | Core files | RC toggle(s) + default | Wired into loop? | Tested? |
 |---|---|---|---|---|
-| ReAct loop / orchestrator / query engine | `runtime/query.py`, `runtime/query_engine.py`, `runtime/loop_state.py`, `runtime/loop_strategies.py` | n/a (always on); `run_mode` = `"direct"`; recovery branches RC-gated | Yes | Yes |
-| Lean tool surface | `contracts/lean_tool_surface.py`, `tools/decorator.py` | `tool_surface_profile` = `"legacy"` | Yes | Yes |
+| ReAct loop / orchestrator / query engine | `runtime/query.py`, `runtime/query_engine.py`, `runtime/loop_state.py`, `runtime/loop_strategies.py` | n/a (always on); recovery branches RC-gated | Yes | Yes |
 | Tool dispatch + gating | `runtime/tool_dispatch.py`, `runtime/tool_permission.py` | gate always on; consecutive-error cap RC | Yes | Yes |
-| Tool retrieval / pool / registry | `runtime/tool_registry.py`, `runtime/tool_retrieval.py`, `runtime/tool_pool.py` | `tool_retrieval_top_k` (clip threshold) | Yes (registry/retrieval); `tool_pool` **no** | Yes |
-| Tool preconditions (three systems) | `runtime/tool_preconditions.py`, `contracts/tool_action_preconditions.py`, `runtime/run_tool_preconditions.py` | `tool_preconditions_enabled` = `False`; `tool_action_preconditions_mode` = `"off"`; run-level `QueryEngineConfig.tool_preconditions` empty | DAG + run-level forcer: Yes; action **spec**: host-only | Yes |
-| Universal resilience layer | `contracts/resilience.py`, `runtime/resilience.py` | `resilience_enabled` = `False`; `resilience_transport_max_attempts` = `1` | Ledger/band: Yes; transport wrapper: host-only | Yes |
+| Tool retrieval / registry | `runtime/tool_registry.py`, `runtime/tool_retrieval.py` | `tool_retrieval_top_k` (clip threshold) | Yes | Yes |
+| Tool preconditions | `runtime/tool_preconditions.py`, `runtime/run_tool_preconditions.py` | `tool_preconditions_enabled` = `False`; run-level `QueryEngineConfig.tool_preconditions` empty | DAG + run-level forcer: Yes | Yes |
+| Turn policies | `contracts/turn_policy.py`, `runtime/turn_policies/*` | каждая политика читает свои поля RC; ПОРЯДОК принадлежит ядру (`TURN_POLICY_ORDER`) | Yes — драйвер опрашивает реестр на 14 координатах | Yes |
+| Tool roles + argument spellings | `contracts/tool_roles.py`, `runtime/child_capabilities.py` | нет — карта приходит как `QueryEngineConfig.tool_roles`, её объявляет хост при регистрации инструментов | Yes | Yes |
+| Constants registry | `contracts/config.py` | сама система (`ConstantSpec` / `ConstantGroup` / `IConstantsRegistry`) | Объявление и разрешение имён — на стороне хоста; цикл читает снимок | Yes |
+| Snapshot schema + upcasters | `contracts/snapshot.py` | нет — схема не ручка | Yes (каждый `snapshot()` / `resume_from_snapshot()`) | Yes |
+| Interrupts (approval / question / external call) | `contracts/interrupt.py`, `runtime/query.py::resume_interrupts` | нет — припаркованный вызов не opt-in | Yes | Yes |
+| Session work pool (фоновые команды + дочерние прогоны) | `contracts/background.py` | в ядре нет; пул инъецируется | Yes (`ensure_session_attached`, `drain_wakes`) | Yes |
+| Request manifest | `contracts/observability.py`, `runtime/query.py::build_llm_request` | нет — прогон записывает, когда привязан `QueryEngineConfig.request_manifest_sink` | Yes, когда приёмник привязан | Yes |
+| Conformance suites | `protocore/conformance/*` | n/a (пакет времени тестов, `protocore[testing]`) | No — хост гоняет их против собственных адаптеров | Yes |
+| Universal resilience layer | `contracts/resilience.py`, `runtime/resilience.py` | `resilience_enabled` = `False`; the transport attempt count is a host knob | Ledger/band: Yes; transport wrapper: host-only | Yes |
+| Failure classification | `contracts/resilience.py::IResilienceClassifier`, `runtime/error_kinds.py` | нет — классификатор приходит как `QueryEngineConfig.resilience_classifier`; если он не привязан, ни одна формулировка не распознаётся | Yes | Yes |
 | Run wind-down (soft stop) | `runtime/soft_stop.py` | `soft_stop_enabled` = `True`, `soft_stop_max_turns` = `3` | Yes | Yes |
-| Attempt ledger + adaptive safety band | `contracts/attempt_ledger.py`, `runtime/adaptive_safety_band.py` | band wired via per-call output budget | Yes | Yes |
-| Finalization gate + contract | `runtime/finalization_gate.py`, `runtime/finalization_contract.py` | `terminal_tool_nudge_enabled` (`False`), `finalize_prose_gate_enabled` | Yes | Yes |
-| Terminal-answer validation + references/grounding | `contracts/terminal_answer_validation.py`, `contracts/references.py`, `runtime/terminal_payload_normalize.py` | `terminal_answer_validation_enabled`, `observed_ref_normalize_enabled`, normalize toggles (all `False`) | Yes | Yes |
-| IMemory subsystem | `contracts/memory.py`, `tools/memory.py` | `memory_enabled` = `False`, `memory_auto_recall_enabled` = `False` | Host-wired (tools held by core contract) | Yes |
-| IWorkspace + read-dedup cache | `contracts/workspace.py`, `runtime/read_dedup_cache.py` | `workspace_enabled` = `True` | **No** (host-wired) | Yes |
-| Context management / two-tier compaction / session memory | `runtime/context/manager.py`, `runtime/context/compaction.py`, `runtime/context/budgets.py`, `runtime/context/session_memory.py`, `runtime/compact_checkpoint.py` | ratios in RC; `compaction_manual_enabled` = `False` | Compaction + `/compact`: Yes; session-memory fold: host-wired | Yes |
-| Token counting / language profiles | `runtime/token_counting.py` | `chars_per_token_*` ratios in RC | Yes | Yes |
-| Prompt caching | `runtime/prompt_caching.py` | `prompt_cache_wire_enabled` = `True` (kill-switch) | Yes (hints in core; wire translation the host) | Yes |
+| Attempt ledger + adaptive safety band | `contracts/attempt_ledger.py`, полоса на стороне хоста | band wired via per-call output budget | Yes | Yes |
+| Finalization gate + contract | на стороне хоста | `terminal_tool_nudge_enabled` (`False`), `finalize_prose_gate_enabled` | Yes | Yes |
+| Terminal-answer validation + references/grounding | на стороне хоста (ядро несёт собранные прогоном свидетельства, `contracts/evidence.py`) | host knobs (validation and reference normalisation are both driven from the host's own model) | Yes | Yes |
+| IMemory subsystem | `contracts/memory.py`, `tools/memory.py` | `memory_enabled` = `False`; auto-recall is a host knob | Host-wired (tools held by core contract) | Yes |
+| Token counting | `runtime/token_counting.py` (+ опциональный оценщик `protocore-native`) | `chars_per_token_*` ratios in RC; `PROTOCORE_DISABLE_NATIVE` принудительно оставляет чисто-питоновый путь | Yes | Yes |
+| IWorkspace + read-dedup cache | `contracts/workspace.py`, кэш на стороне хоста | n/a (no snapshot toggle; the host owns the surface) | **No** (host-wired) | Yes |
+| Context management / three-tier compaction / session memory | `runtime/context/manager.py`, `runtime/context/compaction.py`, `runtime/context/budgets.py`, `runtime/context/session_memory.py`, `runtime/compact_checkpoint.py` | ratios in RC; `compaction_manual_enabled` = `False` | Compaction + `/compact`: Yes; session-memory fold: host-wired | Yes |
+| Prompt caching | `runtime/prompt_caching.py` | wire translation gated by a host kill-switch | Yes (hints in core; wire translation the host) | Yes |
 | Skills routing / surfacing | `runtime/skill_index.py`, `contracts/skills.py` | data-driven (empty store = no block); `skills_hot_reload_enabled` = `False` | Yes (`_ensure_run_skill_catalog`); `list_files`/`load_file` host-only | Yes |
-| Hooks (pluggy) + typed hooks + injection / context_bootstrap | `hooks/manager.py`, `hooks/specs.py`, `runtime/typed_hooks.py`, `runtime/correctness_bind.py` | `judge_failure_mode`, `context_bootstrap_enabled` = `False`, `typed_hooks_enabled` = `False` | Core pluggy manager: exported but **the host `IHookManager` drives the loop**; typed `PUBLISHED_HOOKS` default-off; `before_tool`/`after_tool` also need `intent_settlement_enabled` | Yes |
+| Шов жизненного цикла + injection / context_bootstrap | `contracts/middleware.py`, `hooks/manager.py`, `runtime/correctness_bind.py` | `typed_hooks_enabled` = `False`; режим отказа judge и context bootstrap — ручки хоста | Один шов, пять видов регистрации, один список координат (`HookEvent`); `decide`/`transform`/`around` падают закрыто, `observe`/`notify` изолированы | Да |
 | Events / observability / streaming | `events.py`, `runtime/events/*`, `runtime/llm/delta_bridge.py`, `runtime/telemetry.py` | `telemetry_spans_enabled` = `False` | Yes | Yes |
-| Intent / usage ledger / session tree / lanes | `runtime/intent.py`, `runtime/usage_ledger.py`, `runtime/session_tree.py`, `runtime/lanes.py` | `intent_settlement_enabled`, `usage_ledger_enabled`, `session_tree_enabled`, `lanes_enabled` (all `False`) | Intent + ledger: Yes when on; tree/lanes: host-invoked | Yes |
+| Intent / usage ledger / session tree / lanes | `runtime/intent.py`, `runtime/usage_ledger.py`, ветвление сессии на стороне хоста, `runtime/lanes.py` | `intent_settlement_enabled`, `usage_ledger_enabled`, `lanes_enabled` (all `False`); the session tree is a host knob | Intent + ledger: Yes when on; tree/lanes: host-invoked | Yes |
 | Live control + run work budget | `runtime/live_control.py`, `runtime/run_work_budget.py` | `steer_follow_up_enabled` = `False`; tree token/run caps | Yes | Yes |
 | Safety (shell policy + chain parser) | `safety/shell.py`, `runtime/chain_parser.py` | policy stack via `register_policy` | Yes | Yes |
-| RuntimeConstants system | `contracts/runtime_constants.py`, `runtime/runtime_constants.py`, `constants.py` | the system itself | Yes | Yes |
+| LoopConstants system | `contracts/runtime_constants.py`, `runtime/runtime_constants.py`, `constants.py` | the system itself | Yes | Yes |
 
 Сквозной факт: **большинство новых возможностей выключены по умолчанию** и не
 задействованы на тенанте по умолчанию, поэтому их *включённые* пути покрываются модульными
@@ -314,6 +341,13 @@ protocore (чистое ядро, ноль импортов вверх)
 ---
 
 ## Секции по технологиям
+
+Ниже — подробный разбор тех строк инвентаризации, которым мало одной строки.
+Строки, которых он не разворачивает — retrieval, DAG предусловий, обёртка
+устойчивости, attempt ledger, память, workspace, двухъярусная компакция, счёт
+токенов и кэширование промпта, — ведут себя ровно так, как файлы, названные в
+таблице, и повторять их здесь — верный способ получить второе описание,
+расходящееся с первым.
 
 ### ReAct loop / orchestrator / query engine / loop state
 
@@ -360,32 +394,123 @@ protocore (чистое ядро, ноль импортов вверх)
     добавляет пользовательское сообщение (или продолжает по уже существующей
     истории, заканчивающейся user-сообщением), увеличивает `turn_count`,
     сбрасывает состояние хода, ставит часы запуска, сохраняет снимок начала
-    хода, привязывает `_current_turn_task`, затем итерирует `_query_raw` (не
-    `query()`). Снимок конца хода попадает в `finally`.
-- `runtime/query.py` (11517 строк) — `query(engine)` — **синхронная** функция.
-  Это сознательно не асинхронный генератор: она вызывает
-  `_reset_per_turn_state()` в точке вызова и **возвращает**
-  `_projected_turn_events`, который итерирует `_query_raw` и применяет
-  публичную границу доставки. Ход, прогнанный через `query()`, не имеет
-  межподовой точки возобновления и не привязывает `_current_turn_task`.
-  `_query_raw` реализует жизненный цикл хода: stop check → resume прерванных
-  намерений → типизированный `before_run` → опциональный `/compact` через
+    хода, привязывает `_current_turn_task`, затем итерирует `_query_raw`.
+    Снимок конца хода попадает в `finally`. И привязка ручки, и этот
+    заключительный снимок приходят из `driving_turn()` — области, внутри
+    которой идёт любой публичный драйв, так что два обязательства, делающие
+    драйв прерываемым и поднимаемым, принадлежат одному месту.
+- `contracts/interrupt.py` — то, чего ждёт приостановленный прогон, как
+  значение, а не как защёлка. `PendingInterrupt(interrupt_id, kind,
+  tool_call_id, tool_name, payload, created_at_ms, expires_at_ms)` несёт одно
+  ожидание; `InterruptKind` говорит, какое из трёх это (`approval` — вызов,
+  припаркованный на воротах и НЕ исполнявшийся; `question` — вызов, который
+  успел спросить, и ответ на вопрос и есть его результат; `external_call` —
+  результат придёт другим путём), и вид решает, какие резолюции допустимы.
+  Движок держит столько ожиданий, сколько открыто, в порядке парковки, и пишет
+  их в снимок; `LoopState.AWAITING` без единого записанного ожидания
+  отвергается на переходе (`loop_state.assert_awaiting_is_witnessed`): это
+  прогон, который останавливается, не назвав, что могло бы его поднять.
+  `InterruptResolution` — одно решение (`approve`, опционально с
+  `updated_input` — исправленными аргументами, с которыми вызов и будет
+  действительно исполнен и записан; `deny`; `answer`; `abandon`), а
+  `plan_resolution` отвергает карту, которая называет незакрытое ожидание,
+  отвечает решением, не подходящим виду, или оставляет открытое прерывание без
+  решения, не сказав об этом явно.
+- **Идемпотентность кода до прерывания.** Припаркованный вызов возобновляется
+  ровно там, где остановился: ничто до прерывания не переисполняется, поэтому
+  работа между началом хода и парковкой не повторяется. Чего возобновлённый
+  прогон делать не должен — переиздавать сам припаркованный вызов, и это
+  закрывает durable-запись намерения (`runtime/intent.py`): запись в
+  `PENDING_APPROVAL` — вызов, который не исполнялся, запись в
+  `PAUSED_ASK_USER` — вызов, ответ на который ещё должен прийти, а
+  `intent_never_replay_tools` называет инструменты, повтор которых недопустим
+  при любой записи. Это одна гарантия с двух сторон: прерывание говорит, чего
+  ждут, намерение — что с этим позволено сделать.
+- `runtime/query.py` — `resume(engine, snapshot, *, approved_tool_call=None,
+  message=None, abandon_approval=False, resolutions=None,
+  allow_partial_resolution=False)` — публичная точка подъёма: она строго
+  восстанавливает снимок (схема, режим доставки и привязка идентичности
+  проверяются до первой мутации), а затем ведёт карту резолюций, одобренный
+  вызов, пришедшее сообщение или простой перезапуск прерванного хода — то, что
+  описали аргументы вызывающей стороны. `resolutions` — общая форма и
+  единственная, которой выражается батч: несколько припаркованных вместе
+  вызовов отвечаются ОДНИМ драйвом, каждый своим решением, и их результаты
+  ложатся в том порядке, в котором их просила модель. Прогон с чем-либо
+  припаркованным отвергает простой перезапуск; `abandon_approval=True`
+  закрывает каждый припаркованный вызов как неотвеченный.
+  `resume_interrupts` — тот же драйв отдельно, для вызывающей стороны, которая
+  уже восстановила прогон. `resume_approved_tool` исполняет один вызов,
+  удержанный на одобрении: сверенный с durable ожидающим вызовом и
+  идемпотентный на повторе; оба тоже идут внутри `driving_turn()`. `_query_raw` реализует жизненный цикл хода: stop check → resume прерванных
+  намерений → координата `run_start` → опциональный `/compact` через
   `CompactCheckpoint` → compaction check → UserPromptSubmit hook → build
   context → `select_strategy(run_mode).prepare_turn` →
   `_stream_one_assistant_message` (рекурсивно на tool_use) → dispatch →
   finalize. Восстановление шире набора 413 / max-output / thinking-trap /
   empty-nudge / idle-watchdog: ход также возобновляет прерванные намерения,
-  стреляет типизированный `before_run`, обрабатывает `/compact` через
+  стреляет координату `run_start`, обрабатывает `/compact` через
   `CompactCheckpoint` и привязывает usage/hooks через
-  `runtime/correctness_bind.py` (`commit_usage`, `fire_typed_hook`,
+  `runtime/correctness_bind.py` (`commit_usage`, `fire_lifecycle`,
   `mark_intent_recovery`, `persist_correctness`). Более старые ветви
   восстановления остаются модель-агностичными и закрытыми RC-гейтами.
 - `runtime/loop_strategies.py` — `select_strategy(run_mode)` — единственная
   точка ветвления. `DirectStrategy` не вносит pre-action шага (auto-tool
-  цикл). `DeepStrategy` запускает принудительный инструмент `Plan` (нативный
-  `tool_choice` + CoT, ограниченный `reasoning_effort`), эмитирует ровно одно
+  цикл). `DeepStrategy` запускает принудительный инструмент планирования
+  (`extra["forced_tool_choice"]` в запросе, CoT ограничен `reasoning_effort`),
+  эмитирует ровно одно
   событие `REASONING_STEP`, затем общий цикл ассистента ведёт реальное
   действие с полной поверхностью.
+- `runtime/query.py::build_llm_request` — единственный сборщик, через который
+  проходит каждый вызов провайдера: поток действий, plan-вызов глубокого
+  режима, его fallback на prompted-JSON и оба суммаризатора компакции. Он
+  фиксирует три вещи, которые эти четыре пути раньше решали порознь: модель в
+  силе (живое переопределение, когда оно задано), принудительный инструмент
+  (один слот, `extra["forced_tool_choice"]`, несущий ИМЯ инструмента, чтобы
+  адаптер отрисовал его в собственный формат провода) и температуру (указана в
+  каждом запросе).
+- `runtime/context/compaction.py` — три прохода по транскрипту, по порядку,
+  каждый берёт то, что не смог взять предыдущий.
+  **Tier 1** заменяет вышедший за бюджет результат инструмента плейсхолдером,
+  а байты кладёт в blob-хранилище; содержимое восстановимо, а превью говорит,
+  что именно было сброшено. **Tier 2** суммаризует старые ходы через
+  compaction-LLM — по одному атомарному юниту: ассистентский ход `tool_use` и
+  отвечающие ему результаты стоят или падают вместе, чтобы ни одна пара не
+  осталась без половины. Ход, написанный оператором, не суммаризуется никогда:
+  инструкция коротка, поэтому её пересказ почти ничего не освобождает, и она
+  конкретна, поэтому пересказ — это переписывание: «убери поле model-name из
+  заголовка» превращается в «пользователь просил правки», и дальше прогон
+  действует уже по этому. **Tier 3** сворачивает то, что оставил Tier 2: за
+  длинную сессию по одному саммари на пакет инструментов плюс каждое
+  сообщение оператора становятся всем окном, и ни один нижний проход не может
+  снять с них ни байта. Каждый непрерывный отрезок таких сообщений длиной не
+  меньше `compaction_fold_min_messages` и весом не меньше
+  `compaction_fold_min_tokens` становится одним сводным саммари, в котором
+  инструкции оператора сохраняются точными цитатами; ход-задача и
+  `compaction_fold_keep_operator_turns` последних инструкций остаются
+  дословно, а seed-ход прошлого прогона не сворачивается никогда (свёртка
+  сняла бы тег, который и разделяет прогоны). Свёртка — такое же саммари, как
+  любое другое, поэтому более поздняя свёртка поглотит её, когда её
+  окрестность снова разрастётся.
+
+  Оба суммаризатора собирают запрос через `build_llm_request`, пишут его в
+  манифест запросов и получают два одинаковых правила, от которых зависит
+  ценность саммари: сохранять каждый идентификатор — пути, id, порты, URL,
+  числа, коды ошибок — дословно, а не подставлять правдоподобное значение, и
+  называть исход, за которым нет результата инструмента или подтверждения,
+  НЕИЗВЕСТНЫМ, а не выполненным или невыполненным. Обе инструкции — шаблоны
+  (`compaction_turn_summary`, `compaction_fold_summary`), а не литералы, так
+  что оператору, работающему на другом языке, есть куда положить перевод.
+
+  Стоимость одного прохода ограничена по всем осям: юнит меньше
+  `compaction_summary_min_unit_tokens` не отправляется вовсе (суммаризатор
+  пишет две-три фразы независимо от входа, поэтому ниже некоторого размера
+  вызов тратится на то, чтобы узнать, что саммари не меньше оригинала),
+  словарный бюджет в промпте масштабируется от размера юнита, а не задан
+  фиксированным числом предложений, вызовы уходят по
+  `compaction_summariser_parallelism` за раз, а не цепочкой, пока прогон
+  стоит в `COMPACTING`, и свёртка берёт не больше
+  `compaction_fold_max_spans_per_pass` отрезков за проход. Саммари, которое
+  вернулось не меньше заменяемого, отбрасывается, а не фиксируется.
 - `runtime/loop_state.py` — `LoopState` — это чистая машина из 7 состояний:
   `PENDING → RUNNING → {AWAITING | COMPACTING} → {COMPLETED | FAILED |
   CANCELLED}`. `assert_transition()` обеспечивает таблицу легальных рёбер;
@@ -395,22 +520,27 @@ protocore (чистое ядро, ноль импортов вверх)
 
 **Как вызывается/подключается.** Исполнитель хоста конструирует `QueryEngine` при
 допуске рана, затем обычно `async for evt in engine.run(message)` на каждый ход
-(или `async for evt in query(engine)` после того, как вызывающий уже засеял
-историю). Каждый `TurnEvent` пробрасывается в SSE-мост. Цикл — единственный
+(или `async for evt in resume(engine, snapshot)`, когда он поднимает прогон).
+Каждый `TurnEvent` пробрасывается в SSE-мост. Цикл — единственный
 потребитель любой другой подсистемы.
 
 **Конфигурируемость через RC.** `max_turns_per_run`, `agent_max_seconds` (дедлайн по
 настенным часам; `<= 0` = инертен), таймауты idle/stall watchdog и каждый
 переключатель восстановления — это поля RC. `model_name` обязателен (нет вшитого default).
-`agent_loop_default_mode` — тенантный default для `run_mode`.
+Режим прогона не является полем снимка: его несёт `QueryEngineConfig.run_mode`
+на каждый прогон, по умолчанию `"direct"`, так что хост, которому нужен
+тенантный default, объявляет эту ручку в собственной группе констант и
+передаёт разрешённое значение внутрь.
 
 **Протокол расширения.** **Не** редактируйте структуру цикла. Кастомизируйте через (а)
-хуки (включая типизированные `PUBLISHED_HOOKS`), (б) инъецированные через
-`QueryEngineConfig` колбэки/наблюдатели/`run_mode`/`tool_preconditions`/`provider_chain`,
-(в) переключатели RC, (г) `system_prompt_sections`.
+регистрации на шве жизненного цикла, (б) политику хода, подставленную по имени
+в `QueryEngine.turn_policies`, (в) инъецированные через `QueryEngineConfig`
+колбэки и наблюдатели — `run_mode`, `tool_preconditions`, `provider_chain`,
+`tool_roles`, `resilience_classifier`, `request_manifest_sink`,
+(г) переключатели RC, (д) `system_prompt_sections`.
 
 **Заметки о терминальной классификации.** Стоит выделить три поведения терминальной
-классификации: (1) `query()` перепроверяет `stop_requested` после стриминга и
+классификации: (1) цикл перепроверяет `stop_requested` после стриминга и
 маршрутизирует отменённый ран в CANCELLED (а не в чистый end-turn); (2)
 `_synthesize_missing_tool_results` вызывается на каждой контрольной точке teardown, так что
 персистированный снимок всегда валиден по парности (см. секцию *Починка парности tool_use /
@@ -419,467 +549,145 @@ tool_result*); (3) выход по `max_turns`
 `stop_reason=max_turns` на проводе и трактуется как класс ошибки/неуспеха,
 а не как чистый `COMPLETED`.
 
-### Lean tool surface
+### Политики хода — где живёт продуктовое решение о ходе
 
-**Что и зачем.** Маленький, универсальный пул инструментов, обращённый к агенту, чтобы
-способная модель сама компоновала операции вместо заполнения дюжины кастомных типизированных схем.
-Структурное разделение `read` против `read_silent` — доминирующий рычаг grounding, закодированный
-здесь как контракт, чтобы любой бэкенд реализовывал ту же дисциплину.
-
-**Ключевые классы/файлы.** `contracts/lean_tool_surface.py` определяет ровно **семь
-канонических глаголов**: `exec`, `read`, `read_silent`, `write`, `find`, `search`,
-`answer` (константы `LEAN_TOOL_*`). `GROUNDING_TRACKED_TOOLS` — это frozenset
-`{read}` — `read` записывает свой путь как наблюдаемое свидетельство; `read_silent`
-возвращает идентичное содержимое, но *не* записывается, позволяя модели просматривать
-без засорения её набора цитат. `exec` — это **запускатель зарегистрированных бинарей**
-(`{path, args, stdin}`), явно **не** `/bin/sh`. Поле `outcome` глагола `answer` —
-это **строка свободной формы**, чьи допустимые значения определяются собственным
-answer-контрактом бэкенда — ядро владеет только *формой* поля.
-`tools/decorator.py` предоставляет декоратор `@tool`, который выводит
-`ToolDefinition` (name, description, JSON-Schema params, флаг approval,
-category) из сигнатуры функции + докстринга.
-
-**Как вызывается/подключается.** Ядро владеет только *контрактами и именами* — оно не регистрирует
-здесь конкретный `Tool`. Хост привязывает каждое имя к бэкенду (адаптер ConnectRPC,
-K8s-песочница, …). Выбор профиля управляется RC через
-`select_tool_surface_profile(...)`.
-
-**Конфигурируемость через RC.** `tool_surface_profile` (`"legacy"` | `"lean"`, по умолчанию
-`"legacy"`) плюс по-инструментные флаги `tool_surface_*_enabled`.
-
-**Протокол расширения.** Реализуйте ABC `Tool` (`contracts/tools.py`) или используйте
-`@tool`; зарегистрируйте в `IToolRegistry`. Принимайте канонические видимые агенту
-имена ради кросс-бэкендной единообразности.
-
-### Tool dispatch + gating
-
-**Что и зачем.** Выполняет один вызов инструмента, переводя каждый сбой в
-блок `tool_result(success=false)`, чтобы модель могла восстановиться следующим ходом — ран
-никогда не падает жёстко на ошибке инструмента.
-
-**Ключевые классы/файлы.** `runtime/tool_dispatch.py`:
-
-- `ToolDispatcher.dispatch(...)` — единственная точка входа диспетчеризации. Стадии:
-  (1) **registry lookup** — `unknown_tool`, если имя не зарегистрировано;
-  (2) **schema / JSON validation** — инвариант byte-cap / JSON-сериализуемости
-  на входном словаре; (3) **`ToolPermissionGate.check(...)`** (4 стадии,
-  см. секцию *Permission gate*) — хук `pre_tool_use` И ЕСТЬ финальная стадия
-  `hook` гейта, **а не** отдельный pre-gate-шаг; (4) **preconditions**
-  (DAG; см. секцию *Tool preconditions*) — замаскированный инструмент замыкается накоротко,
-  проверяется **после** гейта; (5) выполнение `tool.invoke(ctx)`;
-  (6) **post_tool_use hook**.
-- `DispatchOutcome` (frozen) — `success`, `content`, `is_error`, `error_kind`,
-  `approval_required`/`approval_token` (→ цикл переходит в AWAITING),
-  `ask_user_required`/`ask_user_payload` (human-in-the-loop), `duration_ms`,
-  `metadata`.
-- `DispatchErrorKind` — `validation | permission | execution | timeout |
-  rate_limit | unknown_tool | consecutive_error_cap`. Последний — это страж:
-  как только серия идентичных подряд ошибок на ран превышает
-  `tool_dispatch_consecutive_error_cap`, диспетчер переписывает сбой
-  в этот вид.
-- Инструмент может прикрепить машиночитаемый словарь **`structured_error`** (напр.
-  `{"finalization_recommended": True, "reason": ...}`) к выброшенному исключению;
-  except-ветвь диспетчеризации пробрасывает его в `DispatchOutcome.metadata`, и
-  цикл показывает модели подсказку о финализации.
-
-#### Permission gate
-
-`runtime/tool_permission.py` — `ToolPermissionGate.check(...)` возвращает
-`ToolPermissionDecision` (значение `ToolPermissionOutcome` из `allow` / `deny` /
-`require_approval`, опциональные переписанные args, опциональный approval-токен), разрешаемое
-по четырём `PermissionStage` в порядке: `whitelist` → `safety_policy` →
-`rate_limit` → `hook`. (`default` — это no-op-значение ALLOW, которое несёт решение,
-когда ни одна стадия не возражает, а не отдельная стадия конвейера.) Стадия `whitelist`
-обеспечивает тенантную `ToolVisibilityPolicy` (и опциональный scope субагента); стадия
-`rate_limit` — это no-op-шов в ядре, в который хост встраивает
-Redis-бакет через `register_policy`; стадия `hook` срабатывает
-`pre_tool_use` последней и является точкой переопределения с наивысшим рычагом. Политики безопасности
-реализуют `IToolSafetyPolicy` (`applies_to(side_effect_class)` + `evaluate(...)`):
-
-- `ShellSafetyPolicyAdapter` — оборачивает `DefaultShellSafetyPolicy` (единственная политика
-  в стеке по умолчанию; инспектирует `arguments['command']`).
-- `HttpDnsAllowlistPolicy`, `WorkspacePathPolicy` — доступны, но **не** в
-  стеке по умолчанию; хост регистрирует их через `register_policy` (core API
-  остаётся замороженным).
-
-**RC/расширение.** Гейт всегда включён; новые политики регистрируются в рантайме. Хук
-`pre_tool_use` — точка с наивысшим рычагом для гейта LLM-как-политика.
-
-### Tool retrieval / pool / registry / 3-layer surface
-
-**Что и зачем.** Держит список инструментов для LLM маленьким и релевантным для меньших локальных
-моделей, сохраняя при этом стабильный байтовый порядок ради переиспользования KV-prefix-кэша.
+**Что и зачем.** Драйвер одного хода ассистента делает две разные работы. Одна —
+**механика**: открыть поток, перевести дельты в события, диспетчеризовать вызовы,
+о которых попросила модель, закрыть раунд. Вторая — **политика**: решить, что
+прогон исчерпал бюджет, что пустой ответ заслуживает ещё одной попытки, что
+недописанный файл надо запечатать прежде, чем прогону позволят закончиться.
+Механика одинакова для любого прогона; политика — продуктовое мнение, и каждое
+мнение, когда-либо добавленное в цикл, добавлялось выращиванием ветки внутри
+него. Шов политик хода это прекращает: политика — объект, она объявляет
+координаты, на которых её надо спрашивать, и отвечает событиями плюс одной
+директивой.
 
 **Ключевые классы/файлы.**
 
-- `runtime/tool_registry.py` — `ToolRegistry(IToolRegistry)`. Его
-  `compute_effective_surface(tenant_id, policy, query, top_k)` — это **3-слойный
-  фильтр**, вызываемый циклом на шаге 4:
-  1. **Policy** — `ToolVisibilityPolicy` (visible / blocked / pinned).
-  2. **Clipping** — если `top_k is None` или видимый набор ≤ `top_k`, вернуть его
-     отсортированным по имени (без retrieval).
-  3. **Progressive discovery** — иначе BM25-ранжирование по `query`; запинённые инструменты
-     всегда включены; top-K по баллу. Финальный порядок всегда **name ASC**
-     (cache-stable), хотя порядок retrieval управляет отбором.
-- `runtime/tool_retrieval.py` — мультиязычный BM25: `retrieve_tools`,
-  `bm25_score`, `compute_idf`/`compute_avgdl`, `build_candidate`,
-  `reduce_query`.
-- `runtime/tool_pool.py` — `assemble_tool_pool` / `assemble_tool_pool_from_concrete`.
-  **Заметка:** это параллельный ассемблер, который **не подключён** в цикл
-  (цикл использует `compute_effective_surface`); у него есть вызывающие только в тестах +
-  реэкспорт.
+- `contracts/turn_policy.py` — `ITurnPolicy` (`name`, `coordinates`, на которых
+  она регистрируется, и один `apply(turn)`, который выдаёт события для
+  проброса и пишет дальнейшее в `turn.outcome`), `TurnContext`, `ITurnState`
+  (намеренно узкий структурный вид прогона, который политике позволено читать и
+  менять: политика, которой нужно что-то, не названное там, лезет во внутренности
+  цикла, и ревью, добавляющее имя, — то самое место, где это будет замечено),
+  `TurnFlags` (ход-локальное состояние, которое политики делят с циклом; раньше
+  это были голые локальные переменные одной очень длинной функции),
+  `TurnCoordinate` (`turn_start`, `turn_budget`, `empty_model_turn`,
+  `output_truncated`, `stream_failed`, `turn_end`, `stream_settled`,
+  `tool_calls_ready`, `finish_nudge`, `answer_floor`, `voluntary_finish`,
+  `terminal_tool_finish`, `iteration_end`, `cancel_checkpoint`),
+  `TurnDirective` (`proceed` / `restart_turn` / `end_turn`) и
+  `TurnPolicyOutcome`.
+- `runtime/turn_policies/` — по модулю на решение: `longfile.py`,
+  `run_ceilings.py`, `empty_model_turn.py`, `truncated_tool_call.py`,
+  `output_cap.py`, `terminal_nudge.py`, `answer_floor.py`,
+  `empty_completion.py`, `terminal_tool_finish.py`, `compaction.py`,
+  `repeat_guard.py`, `sibling_walk.py`, `provider_failure.py`,
+  `cancellation.py`.
+- `runtime/turn_policies/__init__.py` — `TurnPolicyRegistry` и
+  `TURN_POLICY_ORDER`.
 
-**Конфигурируемость через RC.** `tool_retrieval_top_k` — порог отсечения, передаваемый
-циклом.
+**Порядок принадлежит ядру.** `TURN_POLICY_ORDER` объявляет его один раз, и имя,
+отсутствующее в этом кортеже, отвергается при построении
+(`UnknownTurnPolicyError`), а не молча уезжает в конец. Порядок важен там, где две
+политики встречаются: незапечатанный файл запечатывается **до** проверки, дал ли
+ход ответ, потому что запечатывание ответ и производит, — а порядок, взятый из
+того списка, который случайно собрал хост, сделал бы это совпадением. Реестр
+опрашивает по порядку все политики, зарегистрированные на координате, и
+останавливается на первой, ответившей чем-либо, кроме `proceed`: за политикой,
+уведшей ход в другое место, никогда не идёт та, что считает, будто этого не
+было. Шов, который не может исполнить директиву, говорит об этом
+(`UnsupportedTurnDirectiveError`), а не роняет её молча.
 
-**Протокол расширения.** Регистрируйте `ToolDefinition` в реестре; задавайте
-видимость/пин через `ToolVisibilityPolicy`.
+**Как подключается.** `QueryEngine.turn_policies` равен `None` для собственного
+набора ядра. Хост или тест, ставящий свой набор, присваивает его туда, на
+прогон, и набор **сливается по имени**, а не подставляется вместо: политика
+вытесняет политику ядра с тем же именем, а всякая граница, которую никто не
+назвал, остаётся на месте. `runtime/error_kinds.py::INTERNAL_ERROR_KIND`
+читается с обеих сторон этого шва — потому он и отдельный модуль: у «цикл
+упал» не должно быть второго написания на стороне политики.
 
-### Tool preconditions (DAG + action spec + run-level forcer)
+### Снимок прогона: версия схемы и upcaster-ы
 
-**Что и зачем.** Три различных механизма обеспечивают «этот инструмент ещё нельзя
-запускать» или «этот инструмент должен выполниться первым». Они никогда не
-взаимодействуют.
+**Что и зачем.** Снимок пишет один процесс, а читает другой, и они не обязаны
+быть одной сборкой. Читатель, который молча принимает непонятный ему payload, не
+падает — он поднимает прогон с потерянными полями, сброшенными защёлками и
+заново налитыми бюджетами, и ничто ниже по течению не отличит это от прогона, у
+которого их честно не было. Отказ всплывает гораздо позже — агентом, который
+переделывает уже сделанное или тратит уже потраченное.
 
-**Ключевые классы/файлы.**
+**Ключевые имена (`contracts/snapshot.py`).** `SNAPSHOT_SCHEMA_KEY` — где в
+payload лежит версия; `SNAPSHOT_SCHEMA_VERSION` — то, что пишет эта сборка.
+Payload вообще без поля версии читается как версия 1: версия 1 — ровно та форма,
+поверх которой поле и появилось. Всё, чего сборка не узнаёт, отвергается через
+`SnapshotSchemaError`, и отказ здесь — восстановимый исход: прогон остаётся там,
+где был, и оператор видит почему.
 
-1. **Per-tool DAG** (`runtime/tool_preconditions.py`, гейтится
-   `tool_preconditions_enabled`, по умолчанию `False`) —
-   `check_preconditions`, `resolve_precondition`, `record_satisfaction`,
-   `compute_masked_tools`, `load_satisfied_set`/`store_satisfied_set`
-   (удовлетворённый набор гоняется туда-обратно через helper-bag движка, так
-   что он переживает snapshot/resume). Инструмент, требующий предшествующего
-   наблюдения, **маскируется**, пока его `ToolDefinition.preconditions` не
-   удовлетворены (напр. `FinalizeFile` после `AppendFile`). Диспетчер
-   замыкает замаскированный инструмент накоротко **после** permission gate.
-2. **Action-precondition spec** (`contracts/tool_action_preconditions.py`) —
-   типизированная спецификация правил со строковой нагрузкой
-   (`ToolActionPreconditionRule`/`Spec`/`Predicate`, включая
-   `PREDICATE_KIND_DOC_OBSERVED`). Подключена только как RC-типы + вычислитель
-   хост внутри `run` инструмента — никакой код цикла ядра не читает
-   спецификацию напрямую. Гейтится `tool_action_preconditions_enabled` (по
-   умолчанию `False`) и `tool_action_preconditions_mode`
-   (`off | shadow | block`, по умолчанию `off`).
-3. **Run-level forcer** (`runtime/run_tool_preconditions.py` +
-   `QueryEngineConfig.tool_preconditions`) — упорядоченный кортеж записей
-   `ToolPrecondition`, которые этот ран **должен** вызвать, прежде чем агент
-   свободен отвечать. Пока запись outstanding, цикл называет её инструмент в
-   `LLMRequest.extra['forced_tool_choice']`, так что нативный `tool_choice`
-   провайдера — а не формулировка промпта — решает, что модель вызовет первой.
-   Пустой кортеж (default) делает каждую точку входа no-op. Прогресс — индекс
-   в кортеж (дубликаты осмысленны); попытки ограничены
-   `run_tool_precondition_max_attempts`. Исчерпание **валит** ран, называя
-   инструмент. Это ПРИНУЖДАЕТ инструмент, который модель не выбирала; DAG
-   БЛОКИРУЕТ инструмент, который модель уже выбрала.
+**Upcaster-ы.** Более старый payload не отвергается там, где его можно поднять
+вперёд: по одному зарегистрированному `SnapshotUpcaster` на версию, каждый читает
+форму на версию ниже и дописывает то, что эта версия принесла. Версия без шага —
+отказ, потому что пропуск оставляет её поля незаполненными: то же тихое
+полу-восстановление. Два ключа payload названы модулем, а не переписаны у каждого
+читателя: `RUN_SCOPED_STATE_SNAPSHOT_KEY` (накопленный журнал работы дерева и
+ёмкость его бюджета параллелизма — два разрешения, которые поднятому прогону
+нельзя выдать второй раз) и `PENDING_INTERRUPTS_SNAPSHOT_KEY`.
 
-**Как подключается.** Помощники DAG потребляются путём диспетчеризации.
-Декларативная action spec — только хост. Run-level forcer потребляется
-`_query_raw` / `_stream_one_assistant_message`, и его счётчики
-(`_tool_precondition_index`, `_tool_precondition_calls`,
-`_tool_precondition_attempts`, `_tool_precondition_last_error`) живут на
-`snapshot()`.
+**RunScopedState.** `contracts/run_state.py` держит межвызовные разрешения
+прогона — счётчики серий, которые ведёт диспетчер, журнал работы дерева, событие
+отмены, локи, удовлетворённые предусловия — одним типизированным объектом вместо
+нетипизированного словаря, протянутого через `ToolContext.metadata` под
+согласованной строкой. Поле, которое переехало, — это ошибка типов у читателя; хост,
+подключающий собственные ячейки, держит их в `RunScopedState.host`, одном
+непрозрачном отсеке, так что ядру не нужно знать, что хост туда кладёт.
+`RunScopedState.to_snapshot()` называет ровно два долговечных разрешения, а
+`apply_snapshot()` возвращает их обратно; живые объекты (`asyncio.Event`,
+семафор, лок) по природе процесс-локальны и пересобираются тем, кто подключает
+поднятый прогон. `ToolContext` сужен под это: `tenant_id`, `run_id`,
+`session_id`, `work_scope`, опциональный `evidence`, опциональный `run_state` и
+`metadata` на всё остальное.
 
-**Конфигурируемость через RC.** `tool_preconditions_enabled` (по умолчанию `False`);
-`tool_action_preconditions_mode` (`off | shadow | block`, по умолчанию `off`);
-`run_tool_precondition_max_entries` / `run_tool_precondition_max_calls` /
-`run_tool_precondition_max_attempts` ограничивают forcer.
+### Диспетчеризация: роли, канонический результат и починка парности
 
-### Universal resilience layer
+**Роли, а не имена.** Рантайму приходится знать ВИД вызова — произвёл ли он
+байты на диске, закрывает ли он обязательство перечитать файл, должен ли гейт
+разрешений провести для него проверку безопасности шелла. Раньше это было
+сравнение с ИМЕНЕМ инструмента, написанным внутри ядра, — то есть допущение,
+что всякая установка называет свои инструменты так же, как первая.
+`contracts/tool_roles.py` это заменяет: `ToolRole` — способность
+(`reads_path`, `writes_path`, `appends_path`, `edits_path`, `finalizes_path`,
+`searches_workspace`, `runs_shell`, `fetches_url`, `delegates_work`,
+`records_plan`, `discovers_tools`, `asks_user`, `never_delegated`), а
+`ToolRoleMap` — приходящая как `QueryEngineConfig.tool_roles` декларация хоста
+о том, какие из ЕГО имён какие роли несут, вместе с написаниями аргументов
+(`ToolArgumentSlot`): в каком ключе лежит команда шелла, в каком — тело записи,
+в каком — ответ терминального инструмента. Роль, которой карта не упоминает, —
+способность, которой у этой установки нет, и функция, которой она нужна,
+говорит об этом предупреждением, а не тихо становится инертной.
+`runtime/child_capabilities.py::narrow_child_capabilities` читает ту же карту,
+чтобы вычислить, что позволено делегированному прогону: только сужение,
+никогда расширение, и применяется дважды — когда разрешается каталог ребёнка и
+на каждом его вызове, — чтобы объявленная поверхность и гейт не могли
+разойтись.
 
-**Что и зачем.** Универсальный слой **classify-then-act**, покрывающий как вызовы LLM-
-провайдера, так и транспорт инструментов/VM, обобщающий собственную
-форензику транспортных штормов Protocore. Базовая философия: классифицировать сбой в маленькую
-нейтральную таксономию, затем выбрать маленькое нейтральное действие восстановления; бюджетировать ретраи, чтобы
-сбоящий хост гасился, а не усиливался; никогда не повышать дедлайн; для мутирующих
-операций — classify-don't-retry + read-back (без слепого переотправления).
+**Одно значение, три адресата.** `ToolResult.content` — каноническое значение,
+полное, каким бы большим оно ни было, а проекции стоят рядом, а не вместо него.
+`model_projection` — то, что транскрипт несёт вместо содержимого, когда целиком
+оно там неуместно (`model_content` — свойство, из которого строится каждый
+`ToolResultBlock`, так что инструмент, не назвавший проекцию, ничего не
+теряет); `ui_payload` едет на событии результата и в транскрипт не попадает
+вовсе, поэтому целая отрисованная таблица не стоит токенов и не может изменить
+решение модели; `canonical_ref` называет блоб, из которого значение можно
+достать целиком, когда транскрипт его больше не держит. Инструмент, который
+обслуживает всех троих одной строкой, — причина, по которой усечение
+транскрипта раньше уничтожало свидетельства: усекать было нечего, кроме
+единственной копии.
 
-**Ключевые классы/файлы.**
+**Durable-намерение до вызова.** Каждый диспетчеризуемый вызов коммитит
+`IntentRecord` (`runtime/intent.py`) ДО того, как инструмент тронут, с
+зарезервированными id результата — см.
+[Intent, usage ledger, …](#intent-usage-ledger-session-tree-lanes-typed-hooks-telemetry-live-control-run-work-budget).
 
-- `contracts/resilience.py` — контракты:
-  - `ResilienceErrorClass` (таксономия): `transient_retryable`, `rate_limited`,
-    плюс классы structural/deterministic/auth/billing/context-overflow/timeout-rebuild.
-  - `ResilienceAction` (набор стратегий) + `ResilienceDecision` (один вердикт).
-  - `RetryBudgetState` — чистая модель token-bucket.
-  - `IToolTransport` / `TransportCallSpec` — инъецируемый транспортный хук
-    (хост привязывает свой конкретный транспорт).
-  - `ToolTransportError` (несёт опциональный `retry_after_seconds`),
-    `ToolTransportTimeout`, `ToolTransportRetryBudgetExhausted`
-    (`finalization_recommended=True`).
-- `runtime/resilience.py` — рантайм: `ResiliencePolicy.decide(...)`,
-  `classify_transport_error`, `transport_retry_after_seconds`,
-  `decorrelated_jitter_backoff`, `TokenBucketRetryBudget` (принимает инъецированную
-  блокировку — без состояния модуля), `deadline_finalization_reserve_ok`,
-  `_maybe_rebuild_transport` (хук перестроения) и
-  обёртка `resilient_transport_call`.
-
-**Как подключается.** **Транспортная обёртка** — это контракт, которым владеет ядро, потребляемый
-через границу слоем resilience хост (закрыт гейтом
-`resilience_enabled`); у него нет вызывающего внутри `protocore/runtime/`.
-**AdaptiveSafetyBand** и **AttemptLedger** (см. секцию *Attempt ledger + adaptive
-safety band*) *действительно* подключены в цикл.
-
-**Конфигурируемость через RC.** `resilience_enabled` (по умолчанию `False`),
-`resilience_transport_max_attempts` (по умолчанию `1`, т.е. single-shot), backoff
-base/cap/jitter ratios, параметры token-bucket, секунды deadline-reserve.
-
-**Протокол расширения.** Реализуйте `IToolTransport` (и опционально хук
-`rebuild()`); отобразите ошибки своего wire-формата на `ResilienceErrorClass`;
-прикрепляйте `retry_after_seconds`, когда хост сообщает о сбросе. Политика учитывает
-`retry_after_seconds`, а `_maybe_rebuild_transport` предоставляет опциональный
-хук перестроения транспорта.
-
-### Attempt ledger + adaptive safety band
-
-**Что и зачем.** **Attempt ledger** записывает, что (суб)агент заявил, что
-произведёт, и что было фактически верифицировано, чтобы финализация могла решить честный
-исход. **Adaptive safety band** вычитает откалиброванный запас дрейфа
-из по-вызовного бюджета вывода, чтобы `prompt + max_tokens` оставался под
-окном провайдера, даже когда локальный оценщик токенов ошибается (напр., раздувание
-Cyrillic-in-JSON-escape).
-
-**Ключевые классы/файлы.**
-
-- `contracts/attempt_ledger.py` — `AttemptLedger`, `DeliverableDeclaration`
-  (`path`, `kind`, `required`, `min_size_bytes?`, `sha256_expected?`),
-  `VerificationRecord` и литерал `LedgerOutcome`
-  (`completed | partial | failed | unknown` — нейтральный исход, **не**
-  какой-либо enum бэкенда). `SelfReportedStatus` (самоклассификация агента) сохраняется, но
-  ей не доверяют слепо; `RuntimeAttemptStatus` — это ортогональная
-  авто-классификация рантайма.
-- `runtime/adaptive_safety_band.py` — `AdaptiveSafetyBand`,
-  `AdaptiveBandSnapshot`, `AdaptiveBandStore` (Protocol) +
-  `NullAdaptiveBandStore`. Band — пер-`(provider, model)`; по умолчанию
-  персистентность только in-process (`NullAdaptiveBandStore`) — калибровке для
-  горизонтального масштаба нужен Redis-backed store от хоста.
-
-**Как подключается.** Band питает `max_output_tokens` в
-`_stream_one_assistant_message` (`_resolve_safety_band_value`); когда band не
-подключён, помощник возвращает 0 и поведение идентично pre-band. Ledger
-потребляется finalization gate (см. секцию *Finalization gate + contract*).
-
-### Finalization gate + contract
-
-**Что и зачем.** Закрывает брешь финализации: (суб)агент, который успешно записал
-видимый пользователю артефакт, но исчерпал итерации, не вызвав свой
-терминальный инструмент, иначе был бы оценён как "failed", и лидер извинился бы,
-хотя артефакт уже на диске. Гейт **верифицирует** заявленные deliverables
-(stat каждый в workspace, записывает `VerificationRecord`) и **решает**
-`FinalizationDecision` (шаблон success / partial / failed), который использует финальный
-ход лидера.
-
-**Ключевые классы/файлы.**
-
-- `runtime/finalization_gate.py` — `FinalizationDecision`,
-  `WorkspaceStatProtocol` / `WorkspaceStatResult` (stat-only-фасад, инъецируемый
-  оркестратором, чтобы ядро оставалось свободным от импортов workspace-рантайма) и
-  двуязычные (RU+EN) заголовки промпта финализации.
-- `runtime/finalization_contract.py` — `build_finalization_contract_block()`
-  (блок инструкций, который получает лидер) и `parse_finalization_contract`
-  (разобрать заявленные deliverables обратно).
-
-**Как подключается.** Гейт подключён в терминальный путь цикла. **Парсер**
-контракта подключён на стороне хоста (не в `query.py`).
-
-**Конфигурируемость через RC.** `terminal_tool_nudge_enabled`,
-`finalize_prose_gate_enabled`, `pre_terminal_self_verify_enabled`,
-`pre_dispatch_terminal_verify_enabled`, `terminal_candidate_preserve_enabled`,
-`resilience_post_tool_empty_nudge_enabled`, `finalization_contract_persona_enabled`
-— все по умолчанию `False`.
-
-### Terminal-answer validation + references / grounding + payload normalize
-
-**Что и зачем.** Детерминированная, слепая к рубрике дисциплина grounding: цитаты
-терминального `answer` должны быть подмножеством того, что было фактически `read`, сравниваемые по
-**канонической форме**, так что несовпадение flat-vs-branded путей — не ложное вето.
-
-**Ключевые классы/файлы.**
-
-- `contracts/references.py` — `normalize_ref(...)`: чистая, только-stdlib,
-  RFC-3986-уровня **проекция для сравнения** (канонизация path/percent, снятие
-  кавычек, опциональное снятие sublocator/extension). Она **идемпотентна** и
-  **поведенчески нейтральна** — она может только *убрать* ложное вето, но никогда добавить его,
-  и она никогда не мутирует выпущенную/сохранённую моделью ссылку (она канонизирует только
-  ключ принадлежности). Она намеренно **не** делает HTML-entity-decode.
-- `contracts/terminal_answer_validation.py` — спецификация правил в виде данных:
-  `TerminalAnswerRefRule`, `TerminalAnswerValidationSpec`,
-  `TerminalAnswerValidationResult` (строко-типизирована, прямо-совместима; не держит
-  enum бэкенда как код).
-- `runtime/terminal_payload_normalize.py` — `normalize_terminal_text(...)`: чистый
-  закрытый RC-гейтом `html.unescape` текста ответа (не байт-сохраняющий —
-  корректно выключен по умолчанию).
-
-**Как подключается.** Потребляется на терминальном ходе (post-submit-валидация и, с
-триггером self-verify от хоста, pre-dispatch). Нижняя граница размера
-`min_size_bytes` на deliverable сегодня никогда не задаётся шаблоном лидера (латентна).
-
-**Конфигурируемость через RC.** `terminal_answer_validation_enabled`,
-`observed_ref_normalize_enabled`, `terminal_answer_entity_normalize_enabled`,
-`finalization_accept_inline_artifact_when_substantive` — все по умолчанию `False`.
-
-### IMemory (scoped, FTS/BM25, idempotent, drift-guard, injection-scan seam)
-
-**Что и зачем.** Greenfield-универсальная **типизированная, осознающая scope, ранжируемая по
-retrieval память** фактов, которые агент усваивает и переиспользует — возможность, отличная от
-транскриптов сессий, blob-ов, общего поискового индекса и todo.
-
-**Ключевые классы/файлы.** `contracts/memory.py`:
-
-- `IMemory` (Protocol) — контракт; ядро никогда не импортирует реализацию.
-- `MemoryScope` — `global | user | project | session | agent | custom`; адрес
-  записи — это `(tenant_id, scope, scope_key)`. **Самый изолированный
-  default — `session`**; полная грамматика управляется RC, а не зашита в код.
-  `DEFAULT_RECALL_SCOPES` — это веер recall по умолчанию.
-- `MemoryRecord` (с зарезервированным `embedding` под апгрейд hybrid-vector v2),
-  `MemoryWriteDecision`/`MemoryWriteResult` (двухстадийная идемпотентная запись
-  сообщает CREATE / MERGE / SKIP, так что рантайм никогда не пишет молча дважды),
-  `MemoryHit`, `ScopeRef` и ошибки (`MemoryConflictError` для оптимистичного
-  drift-guard; `MemoryStoreUnavailableError` **нефатальна** — медленная/сбойная
-  операция памяти деградирует до "нет памяти в этот ход").
-- `tools/memory.py` — обращённые к агенту инструменты памяти.
-
-Контракт документирует, что `text` записи — это **недоверенный ввод** и ДОЛЖЕН
-сканироваться на prompt-injection при записи *и* перед инъекцией — шов —
-`IMemoryContentScanner` (хост наполняет его; ограда `<memory-context>`
-— это defense-in-depth, а не единственный контроль).
-
-**Как подключается.** Память **подключена со стороны хоста** (`build_memory_tools`,
-`_maybe_run_memory_auto_recall`, `PgMemoryStore`, admin API), закрыта RC-гейтами.
-Цикл не вызывает инструменты напрямую — память это контракт ядра, удерживаемый
-инструментами.
-
-**RC/расширение.** `memory_enabled` + `memory_auto_recall_enabled` (оба по умолчанию
-`False`); scope-ы recall, бюджет и политика управляются RC. Реализуйте `IMemory`
-(v1: Postgres FTS/BM25 — `tsvector` + `ts_rank` / `pg_trgm`; BM25 обязателен для
-точных SKU/ID/путей); апгрейд hybrid-vector + decay/reinforce + rerank — это
-неломающая drop-in-замена.
-
-### IWorkspace + read-dedup cache
-
-**Что и зачем.** Scoped по сессии/задаче, поисковое, атомарное, привязанное к жизненному циклу
-**локальное черновое рабочее пространство**: агент сбрасывает промежуточные данные (результирующий
-набор SQL, обнаруженную схему, вывод `jq`, заметки) один раз и пере-читает/ищет в них много
-раз, не перезапрашивая ненадёжный удалённый ресурс — рычаг стабильности (dump-once /
-re-read-many), а не просто эргономика.
-
-**Ключевые классы/файлы.** `contracts/workspace.py`:
-
-- `IWorkspace` (Protocol). `WorkspaceScope` — `session | task | project`
-  (чистое подмножество `MemoryScope` ради одной согласованной модели scoping); по умолчанию
-  `session`. `WorkspaceLifecycle` — `scratch` (GC-eligible) | `durable`.
-  `WorkspaceUnit` (типизированный манифест + ограниченное тело + `version` + зарезервированный
-  `embedding`), `WorkspaceWriteOutcome` (CREATED / REPLACED — атомарно, идемпотентно
-  пер-`path`), `WorkspaceHit` и ошибки (`WorkspaceConflictError` на оптимистичном
-  version-drift-guard; `WorkspaceStoreUnavailableError` нефатальна). Поиск использует
-  **ту же форму FTS/BM25**, что и `IMemory`.
-- Конкретные инструменты Write/Read/Search/List и их фабрика `build_workspace_tools` —
-  **только в хосте**; ядро поставляет лишь контракт `IWorkspace` выше, без `tools/workspace.py`.
-- `runtime/read_dedup_cache.py` — `ReadDedupCache` + `make_dedup_key` /
-  `make_capability_fingerprint` / `tool_key`: процесс-локальный read-dedup-кэш,
-  ключёванный на `tenant/session/agent/path/content_hash`, так что повторный `read`
-  того же пути замыкается накоротко.
-
-**Как подключается.** **Не подключён в основном цикле** — `ReadDedupCache` и
-`clear_scope` упоминаются только в своём определяющем модуле + тестах, а
-конкретная фабрика инструментов — только в хосте (ядро её не импортирует).
-По замыслу адаптер *хост* инстанцирует store, строит инструменты рабочего
-пространства (`build_workspace_tools`), инъецирует метаданные scope/quota/enabled,
-подключает dedup-кэш в путь чтения и вызывает `clear_scope` при teardown в конце
-сессии.
-
-**RC/расширение.** `workspace_enabled` (по умолчанию `True` — подсистема доступна
-backend/admin workspace API и метаданным диспетчеризации; хост по
-умолчанию не выставляет устаревшие LLM-инструменты Workspace*, когда обычные
-файловые инструменты покрывают те же операции), `workspace_scope` (по
-умолчанию `"session"`), `workspace_search_enabled` (по умолчанию `True`),
-по-scope-ные мягкие лимиты. Реализуйте `IWorkspace` (референс расширяет
-существующий по-сессионный байтовый store и добавляет манифест Postgres
-FTS/BM25).
-
-**Страж оптимистичной записи.** `WorkspaceWriteTool` прокидывает `expected_version` —
-`workspace_read` показывает `version` юнита, а `workspace_write` учитывает его на
-REPLACE (выбрасывая `WorkspaceConflictError` на дрейфе, показанный как нефатальный
-корректирующий результат), задействуя drift-guard контракта с поверхности агента.
-
-### Context management / two-tier compaction / session memory / budgets / token counting / prompt caching / strip-thinking
-
-**Что и зачем.** Держит промпт под окном контекста провайдера на протяжении длинного
-многоходового рана, сохраняя при этом cache-дружественные префиксы.
-
-**Ключевые классы/файлы.**
-
-- `runtime/context/manager.py` — `ContextManager`. `build_context(...)`
-  собирает слоистый бандл (`ContextBundle`: system sections, tools,
-  возможно-скомпакченные сообщения, активный язык, бюджеты), а `run_compaction(...)`
-  ведёт каскад. Без состояния между вызовами в части сборки (читает RC свежим —
-  без кэша модуля); состояние компакции живёт на движке.
-  `estimate_history_tokens` делегирует единственному исчерпывающему-по-`ContentBlock`
-  оценщику `estimate_message_tokens` (покрывает `TextBlock`/`ThinkingBlock`/
-  `ToolUseBlock`/`ToolResultBlock`/`ImageRefBlock` **плюс**
-  `Message.reasoning_content` и сериализованный catch-all, так что ни один блок никогда не
-  считается молча как 0). `detect_active_language` выбирает RU против EN по
-  доле кириллицы.
-- `runtime/context/compaction.py` — **двухъярусный каскад** (в этом модуле нет
-  яруса 3):
-  - **Tier 1** (`run_tier1_truncation`) — усечь / blob-нуть негабаритные tool-
-    результаты (свыше `tool_result_truncation_threshold`), заменяя тело
-    плейсхолдером компакции + blob-ссылкой.
-  - **Tier 2** (`run_tier2_summarisation`) — заменить целые старые не-системные ходы
-    системным резюме, сохраняя последние N ходов.
-  - Исчерпание выбрасывает `CompactionExhaustedError` → цикл переходит в
-    FAILED.
-- `runtime/compact_checkpoint.py` — операторский `/compact` (и соответствующий
-  host compact POST) строит `CompactCheckpoint`, сквозь который следующий
-  LLM-запрос не читает (`build_checkpoint` / `apply_checkpoint`). Гейтится
-  `compaction_manual_enabled` (по умолчанию `False`). Это **не** третий ярус
-  компакции — это checkpoint с удерживаемым хвостом, а не шаг каскада.
-- `runtime/context/session_memory.py` — межзапусковый fold + реестр артефактов.
-  `fold_run` обновляет `SessionMemory` (бегущее резюме + `ArtifactLedger`
-  `path`/`content` file-writing tool-call) из сообщений одного завершённого
-  рана; `build_seed` собирает эту память плюс недавний сырой хвост для
-  следующего рана. Ядро не вызывает клиент модели — хост инъецирует уже
-  вычисленный текст резюме. В более старых документах безымянно; это
-  персистентное итеративное резюме, отличное от внутриходового каскада
-  Tier 1/2.
-- `runtime/context/budgets.py` — `derive_budgets(rc)`: **единственный источник
-  истины** для производных бюджетов (триггер компакции, порог tool-результата,
-  по-секционные бюджеты, остаток истории), все производные от
-  `model_context_window × ratio`. Чистая + детерминированная между подами.
-- `runtime/token_counting.py` — `LanguageProfile`
-  (`latin` / `cyrillic_prose` / `cyrillic_in_json_escape` / `cjk` / `json_struct`),
-  `detect_profile`, `chars_per_token`, `estimate_tokens` — мультиязычные,
-  управляемые RC-ratio.
-- `runtime/prompt_caching.py` — `apply_system_and_3(messages)`: чистая
-  стратегия точек разрыва `system_and_3` (≤ 4 `CacheBreakpoint`: system на индексе 0
-  + последние 3 не-системных сообщения). Производит только **подсказки** размещения.
-- `json_utils.py` — `strip_thinking` / `strip_thinking_tokens` и устойчивые
-  потоковые JSON-парсеры, используемые для восстановления структурированных нагрузок из шумного
-  вывода модели.
-
-**Как подключается.** Компакция выполняется на шаге 2 `_query_raw`
-(`needs_compaction()` — единственный pre-flight-гейт) и реактивно на ошибке
-context-window-exceeded. Ручной `/compact` обрабатывается раньше в той же
-функции, когда `compaction_manual_enabled` включён и последний пользовательский
-текст начинается с `/compact`. Session-memory fold/seed подключён со стороны
-хост (ядро только считает). Подсказки prompt-cache вычисляются один раз на
-вызов провайдера в `_stream_one_assistant_message` и оседают в
-`LLMRequest.extra["cache_breakpoints"]`.
-
-**Подключение prompt-cache.** `prompt_cache_wire_enabled` (RC, **по умолчанию `True`**,
-kill-switch) управляет переводом `cache_breakpoints` в маркеры `cache_control`
-у OpenAI-совместимого клиента хост; ядро всегда выпускает
-подсказки, а адаптеры, не распознающие ключ, игнорируют его.
-
-**Конфигурируемость через RC.** `compaction_trigger_ratio`, `tool_result_truncation_ratio`,
-по-секционные ratio, `compaction_keep_recent_turns`,
-`compaction_manual_enabled` (по умолчанию `False`), ratio `chars_per_token_*`,
-`llm_output_max_tokens_ratio`, `prompt_cache_wire_enabled`.
-
-> Заметка: отдельного модуля `compaction_thresholds.py` нет — единственный живой
-> derive-путь — это `budgets.py::derive_budgets`.
-
-### Починка парности tool_use / tool_result
-
-**Что и зачем.** Anthropic / OpenAI / vLLM все отклоняют запрос, чей ассистентский
+**Починка парности (`runtime/query.py`).** Anthropic / OpenAI / vLLM все отклоняют запрос, чей ассистентский
 `tool_use` не имеет парного `tool_result` (или осиротевший `tool_result`, или
 дублирующиеся id) с HTTP 400. Парность должна гарантироваться на wire-границе
 как defense-in-depth — а не предполагаться корректной от вышестоящих мутаторов (компакция,
@@ -903,8 +711,7 @@ resume-from-partial-batch, усечение по max_tokens, teardown).
 **Как подключается.** `_repair_outbound_tool_pairing` выполняется на каждом исходящем запросе;
 `_synthesize_missing_tool_results` выполняется на всех путях аномального выхода.
 
-**RC.** `tool_result_pairing_repair_placeholder`,
-`tool_result_interrupted_placeholder`.
+**Шаблоны промптов.** `tool_result_pairing_repair`, `tool_result_interrupted`.
 
 ### Skills routing / surfacing
 
@@ -948,51 +755,54 @@ Layer-3, с потолком `max_skills_per_run` (по умолчанию 4). �
 пересобирает каталог на каждый вызов `_ensure_run_skill_catalog`. Реализуйте
 `ISkillStore`; ranker реализовывать не нужно.
 
-### Hooks (pluggy) + injection / scratchpad + context_bootstrap
+### Шов жизненного цикла + injection / scratchpad + context_bootstrap
 
-**Что и зачем.** Шов расширяемости: deny/modify/observe в каждой точке жизненного
-цикла, не трогая цикл. Плюс опциональный turn-1 **context bootstrap**,
-который читает собственные contract/readme-документы окружения и предваряет замороженным
-ориентирующим сообщением `<environment_context>`.
+**Что и зачем.** Один шов расширения: наблюдать, решать, преобразовывать или
+оборачивать поведение в любой координате прогона, не трогая цикл. Плюс
+необязательный **context bootstrap** первого хода, который читает
+контракт/readme окружения и добавляет замороженное ориентирующее сообщение
+`<environment_context>`.
 
-**Ключевые классы/файлы.** `hooks/specs.py` — `AgentHookSpecs`: **8 pluggy
-hookspec-ов** (`pre_tool_use`, `post_tool_use`, `user_prompt_submit`,
-`session_start`, `session_end`, `pre_compact`, `post_compact`, `file_changed`).
-`hooks/manager.py` — `HookManager` (in-process pluggy-реестр + агрегатор).
-`contracts/hooks.py` — межподовый контракт `IHookManager`, `HookResult`,
-`HookActionKind`, `HookSpec`.
-`runtime/typed_hooks.py` — `PUBLISHED_HOOKS` (`before_run`, `before_tool`,
-`after_tool`, `transform_context`, `before_compact`, `after_compact`) плюс
-`HookRegistry` / `dispatch_hook`. Хост реэкспортирует этот опубликованный
-набор (например, маршрут session-correctness перечисляет `PUBLISHED_HOOKS`).
-`runtime/correctness_bind.py` — клей, который стреляет типизированные хуки и
-коммитит usage из `_query_raw`.
+**Ключевые классы/файлы.** `contracts/middleware.py` — контракт:
+`RegistrationKind` (`observe` / `decide` / `transform` / `around` / `notify`),
+`LifecycleVerdict`, `LifecycleContext`, `LifecycleDecision`,
+`LifecycleOutcome`, `LifecycleScope`, `LifecycleDisposer` и протокол
+`ILifecycleRegistry`. `contracts/types.py::HookEvent` — единственный список
+координат. `hooks/manager.py` — `HookManager`, внутрипроцессная реализация:
+порядок (приоритет, затем порядок регистрации), таймаут на регистрацию,
+политика исключений и отмена, которая никогда не читается как вердикт.
+`contracts/hooks.py` — внепроцессный контракт `IHookManager`, `HookResult`,
+`HookActionKind`, `HookSpec`. `runtime/correctness_bind.py::fire_lifecycle` —
+единственный вход цикла в шов.
 
-**Как подключается (важно).** **Pluggy-`HookManager` ядра экспортируется, но не
-ведёт цикл.** `engine.hooks` цикла типизирован `IHookManager` и
-вызывает **3-аргументный** `invoke(event, payload, tenant_id)` — продакшен-хуки выполняются через
-адаптер `IHookManager` хоста. Pluggy-менеджер конструируется в основном
-в тестах. Также отметьте брешь в контракте: `HookEvent` перечисляет 10 событий, но
-`AgentHookSpecs` объявляет только 8 (нет `subagent_start`/`subagent_stop`), так что эти
-два никогда не могут сработать через pluggy-менеджер ядра.
+**Как подключено.** Реестр приходит в движок при конструировании
+(`QueryEngine(..., lifecycle_hooks=...)`) и работает при включённом
+`typed_hooks_enabled` — один тумблер на весь шов, ни одна координата не спрятана
+за чужим. `_drive_turn` и диспетчер инструментов испускают `run_start`,
+`turn_start`, `context_transform`, `request_prepare`, `response_received`,
+`request_error`, `turn_end`, `pre_tool_use`, `tool_execute`, `post_tool_use`,
+`pre_compact`,
+`compaction_commit`, `compaction_rollback`, `post_compact` и `run_finalize`.
+`transform` на `context_transform` **применяется**: запрос к провайдеру этого
+хода пересобирается из того, что вернула цепочка.
 
-Типизированные хуки — **вторая** боевая поверхность: когда
-`typed_hooks_enabled` включён и задан `engine.typed_hook_registry`,
-`fire_typed_hook` запускает соответствующий опубликованный обработчик.
-Выключено по умолчанию — нет реестра, no-op allow.
-`before_run`, `transform_context`, `before_compact` и `after_compact`
-срабатывают от одного этого флага. `before_tool` и `after_tool` вложены
-в ветку диспетчеризации `intent_settlement_enabled` — они не бегут, если
-включён только флаг типизированных хуков. `transform_context` срабатывает
-(и может быть выдан `hook_fired`), но его исход `rewrite` к истории
-**не** применяется.
+`IHookManager` хоста — тот же шов, до которого дотягиваются из другого процесса
+(HTTP-эндпойнт или модель-судья). Цикл ведёт его на гейте разрешений
+(`runtime/tool_permission.py`) и вокруг диспетча (`runtime/tool_dispatch.py`),
+отображая `HookActionKind` на те же вердикты.
 
-**RC/расширение.** `judge_failure_mode` (хук LLM-судьи fail-open/closed),
-`judge_timeout_ms`; `context_bootstrap_enabled` (по умолчанию `False`),
-`context_bootstrap_docs`, `context_bootstrap_tree_depth`;
-`typed_hooks_enabled` (по умолчанию `False`), `typed_hooks_timeout_ms`.
-Зарегистрируйте реализацию `IHookManager` (хост), pluggy-`hookimpl`-ы
-или обработчики на `HookRegistry` для опубликованных типизированных имён.
+**Политика исключений и почему она разная.** `decide`, `transform` и `around`
+падают **закрыто**: обработчик, который бросил, вышел за `timeout_s` или
+ответил не решением, даёт `deny` с именем владельца. Стадия, существующая
+чтобы сказать, можно ли, при аварии не сказала «да». `observe` и `notify`
+падают **изолированно**: отказ логируется и попадает в
+`LifecycleOutcome.failures`, а вердикт, полезная нагрузка и соседние
+регистрации остаются нетронутыми.
+
+**RC/расширение.** `typed_hooks_enabled` (по умолчанию `False`). Режим отказа и
+дедлайн judge-хука, настройки context bootstrap читает окружающий слой и
+объявляет у себя. Расширяют регистрацией на шве с владельцем, скоупом и
+диспозером либо реализацией `IHookManager` в хосте.
 
 ### Events / observability / streaming
 
@@ -1014,18 +824,41 @@ hookspec-ов** (`pre_tool_use`, `post_tool_use`, `user_prompt_submit`,
   `follow_up_queued`, `queue_update`), live-control
   `model_changed`/`thinking_changed` и события верификации кандидата
   (`candidate_ready`, `verification_started`, `verification_reported`,
-  `repair_requested`, `release_decided`, `candidate_released`). Каждое значение —
-  строка `event:`, показываемая SSE-клиентам.
+  `repair_requested`, `release_decided`, `candidate_released`) и
+  `interrupt_parked` — оно выдаётся всякий раз, когда прогон записывает то, чего
+  ждёт, и несёт id прерывания, его вид и вызов инструмента: хост узнаёт, НА ЧЁМ
+  прогон остановился, в момент остановки, а не вычитывая снапшот. Каждое
+  значение — строка `event:`, показываемая SSE-клиентам.
+  События транспорта инструментов (`tool_transport_starting`,
+  `tool_transport_ready`, `tool_transport_failed`, `tool_transport_teardown`)
+  сообщают, что путь наружу к инструменту поднимается, готов, отказал и
+  сворачивается; каждое несёт один и тот же ключ payload, называющий, о каком
+  транспорте речь, так что хост соотносит их без разбора текста.
 - `runtime/events/envelope.py` — `TurnEvent` (замороженный wire-envelope).
 - `runtime/llm/delta_bridge.py` — переводит поток провайдера в
   `ProviderDelta` → `TurnEvent` (`_normalise_finish_reason`, `is_block_end`,
   …).
-- `contracts/observability.py` — `CacheObserverProtocol` (опциональный
-  сток hit-rate prompt-cache, инъецируемый через `QueryEngineConfig.cache_observer`).
+- `contracts/observability.py` — два опциональных стока.
+  `CacheObserverProtocol` — сток hit-rate prompt-cache, инъецируемый через
+  `QueryEngineConfig.cache_observer`. `IRequestManifestSink` отвечает на другой
+  вопрос — не «как отработал этот вызов», а «что именно было отправлено».
+  Запрос к провайдеру собирается из истории, контрольной точки компакции,
+  починки парности, поверхности инструментов и действующих констант, и до
+  появления `RequestManifest` он существовал только в кадре стека, который его
+  и отправил: ничто долговечное не могло сказать, странно ли себя вёл прогон
+  из-за другого запроса или из-за другого ответа на тот же, и ничто не могло
+  переиграть записанный прогон, не заплатив за токены снова. Ядро строит
+  манифест, считает его id — SHA-256 по его же канонической сериализации, так
+  что id известен до того, как хост что-либо записал, и снимок может
+  адресовать манифест по id, а не носить его целиком, — и отдаёт приёмнику.
+  Где он хранится и как долго — решение хоста: у ядра нет ни хранилища, ни
+  политики хранения, и заводить их посреди прогона — ровно то обязательство,
+  которого цикл на себя брать не должен.
 
-**Как подключается.** `query()` выдаёт `TurnEvent`-ы повсюду; usage-дельта питает
-cache observer. Стоки трейсинга/observability инъецируются через
-границу.
+**Как подключается.** Цикл выдаёт `TurnEvent`-ы повсюду; usage-дельта питает
+cache observer, а `build_llm_request` питает приёмник манифестов, когда
+привязан `QueryEngineConfig.request_manifest_sink`. Стоки
+трейсинга/observability инъецируются через границу.
 
 ### Safety (shell policy + chain parser + path isolation + approvals)
 
@@ -1051,7 +884,7 @@ cache observer. Стоки трейсинга/observability инъецируют
 > `WorkspacePathPolicy` не в стеке по умолчанию — хост должен зарегистрировать
 > их через `register_policy`.
 
-### RuntimeConstants system
+### LoopConstants system
 
 **Что и зачем.** Единственный механизм для настраиваемых значений — **никаких inline
 magic numbers**. Каждое настраиваемое значение — это поле на замороженном Pydantic-снимке, безопасное
@@ -1059,24 +892,86 @@ magic numbers**. Каждое настраиваемое значение — э
 
 **Ключевые классы/файлы.**
 
-- `contracts/runtime_constants.py` (7423 строки) — `RuntimeConstants`
+- `contracts/runtime_constants.py` — `LoopConstants`
   (`model_config = ConfigDict(frozen=True, extra="forbid")`) и
-  Protocol `RuntimeConstantsProvider` (`async get(tenant_id) -> RuntimeConstants`).
+  Protocol `RuntimeConstantsProvider` (`async get(tenant_id) -> LoopConstants`).
   `extra="forbid"` означает, что **core и хост должны деплоиться парно** (неизвестное
   поле отклоняется). Снимок включает выключенные по умолчанию поверхности
-  `intent_settlement_enabled`, `usage_ledger_enabled`,
-  `session_tree_enabled`, `lanes_enabled`, `typed_hooks_enabled`,
-  `telemetry_spans_enabled` (и `compaction_manual_enabled`,
-  `steer_follow_up_enabled`). `workspace_enabled` по умолчанию `True`.
+  `intent_settlement_enabled`, `usage_ledger_enabled`, `lanes_enabled`,
+  `typed_hooks_enabled`, `telemetry_spans_enabled` (и
+  `compaction_manual_enabled`, `steer_follow_up_enabled`).
 - `runtime/runtime_constants.py` — `StaticRuntimeConstantsProvider` +
   `default_runtime_constants(**overrides)` (тесты + in-memory smoke-рантайм;
   продакшен-поды поставляют Postgres-backed провайдер с Redis-кэшем).
 - `constants.py` (~70 строк) — лимиты безопасности по памяти на уровне модуля (`MAX_ARTIFACTS`,
   `MAX_TOOL_CALL_ARGUMENT_BYTES`, `PROTOCOL_VERSION`, `DEFAULT_MODEL`, …).
 
-**Правило 3 правок.** Добавление настраиваемого значения: (1) Pydantic-поле ядра (default
-safe/off) + (2) identity-запись в хосте `_FIELD_MAP` + (3) seed в каталоге
-миграций. Страница Constants в дашборде после этого рендерит переключатель бесплатно.
+- `contracts/config.py` — реестр, одной из групп которого снимок и является.
+  `ConstantSpec` — дескриптор одной ручки: её вид на проводе (`kind`),
+  `default`, обращённое к оператору `description`, границы (`minimum` /
+  `maximum`, `allowed_values`, `zero_means_unlimited`) и видимость —
+  `editable`, `editable=False` (строка показывается, но запись отвергается)
+  либо `not_a_lever="<причина>"` (строки нет вовсе: значение, которое система
+  выводит или которым владеет сама, и появление которого в редакторе было бы
+  приглашением сломать инсталляцию). `ConstantGroup` — набор спецификаций с
+  одним `owner` и одним `key`; `group_from_model` отражает объявляющую модель в
+  группу, чтобы никто не писал руками список из сотен имён, расходящийся с
+  моделью на первом же добавленном поле, а `build_loop_group` делает это для
+  самого `LoopConstants`. `IConstantsRegistry` — сторона объявления:
+  `declare`, fail-closed `resolve` (имя, которого не объявила ни одна группа,
+  бросает исключение, а не разрешается в default), `defaults`, `coerce` и
+  `repair`. `ICoreConstantsProvider` — то, как цикл спрашивает снимок,
+  действующий для области.
+
+**Настраиваемая поверхность — набор групп, а не одна плоская модель.** Каждую
+группу объявляет тот слой, который её значения действительно читает: пороги
+самого цикла — группа ядра, а всякая ручка, которую читает окружающий слой,
+объявляется этим слоем, в его собственной модели, через то же отражение
+`group_from_model`. Имя, заявленное двумя **владеющими** группами, отвергается
+(`DuplicateConstantError`); имя, заявленное владеющей группой и
+`provisional`-группой — заглушкой, которую слой держит, пока передаёт владение,
+— достаётся владельцу, и вытеснение фиксируется. Поэтому ручка,
+управляющая аутентификацией, хранением сессий или транспортом к провайдеру,
+**не** является полем `LoopConstants`, и искать её там бесполезно.
+
+**Добавление настраиваемого значения.** Добавьте поле в ту модель, чей слой его
+читает, с безопасным default-ом, границами и `description`. Больше ядру о нём
+знать нечего: группа отражается из модели, и каталог оператора подхватывает
+поле оттуда.
+
+### Пул работы сессии и делегированные прогоны
+
+**Что и зачем.** Один пул, два вида работы. Команда, запущенная в фоне, и
+дочерний прогон, запущенный делегированием, со стороны цикла — одно и то же:
+единица работы с адресом, статусом, способом её дождаться и способом её
+остановить. Раньше это были два механизма — команда была записью пула с id, а
+дочерний прогон был вызовом функции, который блокировал вызывающего на всё своё
+время и адреса не имел вовсе. Никто не мог спросить дочерний прогон, как далеко
+он продвинулся, никто не мог его остановить, а родитель, ждавший его, держал
+свой ход и своё место в бюджете дерева весь потомковый прогон.
+
+**Ключевые имена (`contracts/background.py`).** `IWorkPool` расширяет
+`IBackgroundTaskPool`; `TaskRecord.kind` различает виды (`command` / `agent`), и
+ручка субагента — это просто `WorkHandle` над записью вида `agent`. `AgentRef`
+говорит, какого агента запись вида `agent` исполняет и каким прогоном.
+`BACKGROUND_TERMINAL_STATUSES` — множество статусов, из которых запись больше
+никогда ничего не сообщит.
+
+**Почему это не состояние прогона.** Фоновая задача переживает прогон, который её
+запустил: команду породил один прогон, прогон закончился, и сказать об окончании
+надо тому прогону, который жив в этот момент. Поэтому пул — коллаборатор,
+инъецируемый хостом, и на холодном старте (свежий процесс поднимает сессию,
+чьи задачи породил уже исчезнувший процесс) хост обязан вернуть ещё работающие
+команды сессии в руки нового пула прежде, чем цикл его о чём-нибудь спросит.
+`ensure_session_attached` — то место, где цикл спрашивает, случилось ли это;
+пул, ответивший `False`, получает явное событие на прогоне, а не пустой список
+пробуждений, который читается ровно как сессия, в которой ничего не работает.
+
+**Сужение ребёнка.** `SubagentDef` — определение ребёнка, а
+`runtime/child_capabilities.py::narrow_child_capabilities` вычисляет, что ему
+позволено, из его родителя и ни из чего больше: ни инструмента, ни разрешения,
+ни шага глубины больше, чем было у родителя, — прогон, способный расшириться по
+пути вниз, сделал бы всякую границу выше себя рекомендательной.
 
 ### Intent, usage ledger, session tree, lanes, typed hooks, telemetry, live control, run work budget
 
@@ -1084,18 +979,22 @@ safe/off) + (2) identity-запись в хосте `_FIELD_MAP` + (3) seed в �
 пока соответствующее поле RC не скажет иное.
 
 - `runtime/intent.py` — `IntentRecord` / `commit_intent` / `settle_intent` /
-  `resume_open_intents` / `replay_policy_for`. Когда
-  `intent_settlement_enabled` включён, **каждый** диспетчеризуемый вызов
-  инструмента коммитит `IntentRecord` с зарезервированными result id до
-  `ToolDispatcher.dispatch`. `replay_policy_for` ставит `replay="never"`,
-  когда имя инструмента в `intent_never_replay_tools` (по умолчанию
-  `Write,Edit,Bash,Finalize,AppendFile`); любое другое имя — `"safe"`.
-  Краш mid-flight: never-replay намерения становятся `interrupted`
-  (синтетическая ошибка, без реплея); safe остаются `open`.
-  `should_skip_never_replay` коротко замыкает возобновлённый interrupted
-  never-replay вызов. Поле снимка: `open_intents`.
-  `before_tool` / `after_tool` живут в той же ветке
-  `if intent_settlement_enabled`.
+  `orphaned_intents` / `unknown_outcome_text` / `replay_policy_for` /
+  `repeat_is_safe_for`. **Каждый** диспетчеризуемый вызов инструмента коммитит
+  `IntentRecord` с зарезервированными result id до того, как инструмент
+  тронут, безусловно; запись несёт жизненный цикл `state`
+  (`RESERVED|PENDING_APPROVAL|DISPATCHED|PAUSED_ASK_USER|SETTLED`), а преамбула
+  хода закрывает то, что оставил остановившийся прогон. Краш mid-flight
+  сообщается как исход, который не был зафиксирован, — никогда как отказ,
+  потому что отказ приглашает повторить побочный эффект, который, возможно, уже
+  случился, — а вызов на гейте, вызов в ожидании ответа пользователя и просто
+  зарезервированный не сообщаются вовсе: ни один из них не исполнялся.
+  `intent_repeat_safe_tools` (по умолчанию `Read,Grep,Glob,ToolSearch`)
+  определяет, какие вызовы не платят за запись долговечности и получают мягкий
+  текст; `intent_never_replay_tools` (по умолчанию
+  `Write,Edit,Bash,Finalize,AppendFile`) задаёт `replay`.
+  `intent_settlement_enabled` гейтит только события восстановления и строку
+  журнала. Поле снимка: `open_intents`.
 - `runtime/usage_ledger.py` — append-only список `UsageRow`. Когда
   `usage_ledger_enabled` включён, `correctness_bind.commit_usage` дописывает
   строку. `_query_raw` пишет `inference` / `retry` / `compaction` /
@@ -1103,16 +1002,16 @@ safe/off) + (2) identity-запись в хосте `_FIELD_MAP` + (3) seed в �
   на пути intent-settlement (тот же блок `if intent_settlement_enabled`,
   который settle-ит намерение). Неудачная попытка плюс её retry — две
   строки. Поле снимка: `usage_rows`.
-- `runtime/session_tree.py` — `fork_session` / `clone_session` копируют путь
-  истории в новую `SessionBranch`, не мутируя источник. Гейтится
-  `session_tree_enabled`; clone требует settled-источник;
-  `session_tree_max_copy_messages` ограничивает копию.
+- Ветвление сессии (на стороне хоста) копирует путь истории в новую ветку,
+  не мутируя источник. Гейтится настройкой хоста; clone требует
+  settled-источник, а вторая настройка хоста ограничивает объём копии.
 - `runtime/lanes.py` — именованные lanes над общей историей. Main всегда
   существует; дополнительные берут эксклюзивные блокировки (`acquire_lane` /
   `release_lane`). Гейтится `lanes_enabled`; `lanes_max_per_session` включает
   main.
-- `runtime/typed_hooks.py` — `PUBLISHED_HOOKS` + `HookRegistry`. См. секцию
-  [Hooks](#hooks-pluggy--injection--scratchpad--context_bootstrap).
+- `contracts/middleware.py` + `hooks/manager.py` — шов жизненного цикла и его
+  внутрипроцессный диспетчер. См.
+  [шов жизненного цикла](#шов-жизненного-цикла--injection--scratchpad--context_bootstrap).
 - `runtime/telemetry.py` — spans низкой кардинальности (`run` / `turn` / `step` /
   `tool` / `compact` / `hook`). Гейтится `telemetry_spans_enabled`.
   Высококардинальные id остаются атрибутами; `is_prometheus_safe_label`
@@ -1121,7 +1020,7 @@ safe/off) + (2) identity-запись в хосте `_FIELD_MAP` + (3) seed в �
   прерванное намерение.
 - `runtime/correctness_bind.py` — клей, чтобы intent, ledger, типизированные
   хуки и recovery выполнялись внутри `_query_raw` (`commit_usage`,
-  `fire_typed_hook`, `mark_intent_recovery`, `persist_correctness`).
+  `fire_lifecycle`, `mark_intent_recovery`, `persist_correctness`).
 - `runtime/live_control.py` — очереди steer / follow-up (`QueuedPrompt`,
   `enqueue`, `place_items`), живые переопределения model/thinking и settled-
   помощник. Гейтится `steer_follow_up_enabled` (по умолчанию `False`).
@@ -1144,26 +1043,34 @@ safe/off) + (2) identity-запись в хосте `_FIELD_MAP` + (3) seed в �
 |---|---|---|
 | `ILLMProvider` | `contracts/llm.py` | LLM completions: `stream_with_tools`, `complete_structured`, `complete_text` и `count_tokens`; универсальный LiteLLM/OpenAI-совместимый адаптер (OpenRouter / vLLM / OpenAI). |
 | `IProviderChain` | `contracts/llm.py` | Упорядоченные оставшиеся провайдеры плюс односторонний курсор `advance()`. Внедряется на `QueryEngine(..., provider_chain=...)` для mid-stream failover; `None` оставляет существующее восстановление нетронутым. |
-| `RuntimeConstantsProvider` | `contracts/runtime_constants.py` | Per-tenant `RuntimeConstants` backed by Postgres + Redis cache. |
+| `RuntimeConstantsProvider` | `contracts/runtime_constants.py` | Per-tenant `LoopConstants` backed by Postgres + Redis cache. |
 | `ISessionStore` | `contracts/session.py` | Session/transcript persistence (Postgres). |
 | `IRunStore` | `contracts/run.py` | Run record create/list/read (Postgres + Redis hot record). |
 | `IToolRegistry` | `contracts/tool_registry.py` | The concrete `ToolRegistry` is in core; the host registers concrete `Tool`s + visibility policy. |
-| `Tool` (ABC) / `@tool` | `contracts/tools.py`, `tools/decorator.py` | Concrete tool implementations (sandbox-backed exec/file tools, the lean verbs). |
+| `Tool` (ABC) / `@tool` | `contracts/tools.py`, `tools/decorator.py` | Concrete tool implementations (sandbox-backed exec/file tools). |
 | `IToolTransport` | `contracts/resilience.py` | The tool/VM transport (e.g. ConnectRPC) the resilience wrapper wraps; optional `rebuild()` hook. |
-| `IMemory` | `contracts/memory.py` | `PgMemoryStore` (Postgres FTS/BM25, two-stage idempotent write, drift-guard) + an `IMemoryContentScanner`. |
+| `IMemory` | `contracts/memory.py` | Долговечное хранилище фактов со скоупами и лексическим recall-ом, двухфазной идемпотентной записью и drift-guard, плюс `IMemoryContentScanner`. |
 | `IWorkspace` | `contracts/workspace.py` | Durable byte store + Postgres FTS/BM25 manifest, atomic write, per-scope GC. |
 | `ISkillStore` | `contracts/skills.py` | Хранение и поиск skill-бандлов **и** многофайловые `list_files` / `load_file` (`SkillFileRef`). Цикл каталогизирует через `list` / `list_enabled_subset` и грузит тела через `load` / `list_subset`; `list_files` / `load_file` — файловый API хоста. Рендерер каталога живёт в ядре, `runtime/skill_index.py`. |
-| `IHookManager` | `contracts/hooks.py` | Боевой 3-аргументный диспетчер хуков (именно он ведёт цикл, а не pluggy `HookManager`). Типизированные `PUBLISHED_HOOKS` — отдельная выключенная по умолчанию поверхность в `runtime/typed_hooks.py`. |
+| `IHookManager` | `contracts/hooks.py` | 3-аргументный диспетчер хуков, чей исполнитель вне процесса; цикл ведёт его на гейте разрешений и вокруг диспетча инструмента. |
+| `ILifecycleRegistry` | `contracts/middleware.py` | Единственный шов жизненного цикла — у регистрации есть владелец, скоуп и идемпотентный диспозер. По умолчанию выключен тумблером `typed_hooks_enabled`. |
 | `IEventStream` | `contracts/events.py` | Cross-pod durable event stream (Redis Streams) for SSE reconnect/replay. |
 | `IBlobStore` | `contracts/blob.py` | Content-addressed blob storage (S3) used by Tier-1 compaction. |
 | `ISearchIndex` | `contracts/search.py` | Generic lexical search index. |
 | `ITodoStorage` | `contracts/todo.py` | Per-session todo persistence. |
 | `IAgentDispatch` | `contracts/agent_dispatch.py` | Subagent dispatch/lookup. |
 | `IPromptTemplateProvider` | `contracts/prompts.py` | System-prompt template rendering. |
+| `IWorkPool` / `IBackgroundTaskPool` | `contracts/background.py` | Пул работы сессии: фоновые команды и делегированные дочерние прогоны в одном адресном пространстве, с `ensure_session_attached` на холодном старте. |
+| `IConstantsRegistry` / `ICoreConstantsProvider` | `contracts/config.py` | Объявление собственных групп констант хоста, fail-closed разрешение имён и снимок `LoopConstants` на область, который читает цикл. |
+| `IResilienceClassifier` | `contracts/resilience.py` | Вердикт о том, к какому нейтральному классу отказа относится сообщение. Ядро читает текст отказа, который не оно писало, и не должно учиться его узнавать; непривязанный классификатор означает, что ни одна формулировка не распознаётся, — и это нейтральное поведение. |
+| `IRequestManifestSink` | `contracts/observability.py` | Где хранится `RequestManifest` и как долго. |
+| `IDelegationTool` | `contracts/agent_dispatch.py` | Форма инструмента, через который запускается делегированный прогон. |
+| `IRunToolErrorCounter` | `contracts/run.py` | Долговечный счёт ошибок инструментов на прогон, переживающий смену процесса. |
+| `ITurnPolicy` | `contracts/turn_policy.py` | Продуктовое решение о ходе, подставляемое в набор ядра по имени. |
 | `IToolSafetyPolicy` | `runtime/tool_permission.py` | Extra permission policies (`HttpDnsAllowlistPolicy`, `WorkspacePathPolicy`) registered via `register_policy`. |
-| Hook specs (pluggy) | `hooks/specs.py` | In-process `hookimpl`s for the 8 spec events (when using the pluggy path). |
+| `ToolRoleMap` | `contracts/tool_roles.py` | Какие имена инструментов хоста несут какие `ToolRole`, и написания аргументов, которые к ним прилагаются. Передаётся как `QueryEngineConfig.tool_roles`. |
+| Координаты жизненного цикла | `contracts/types.py::HookEvent` | Единственный список точек, которые может назвать регистрация. |
 | `CacheObserverProtocol` | `contracts/observability.py` | Prompt-cache hit-rate sink injected via `QueryEngineConfig.cache_observer`. |
-| `WorkspaceStatProtocol` | `runtime/finalization_gate.py` | Stat-only workspace facade for the finalization gate. |
 | Self-verify trigger callables | `runtime/query_engine.py` | `pre_terminal_self_verify_trigger` / `pre_dispatch_terminal_verify_trigger` on `QueryEngineConfig`. |
 
 ---
@@ -1174,30 +1081,40 @@ safe/off) + (2) identity-запись в хосте `_FIELD_MAP` + (3) seed в �
   (`protocore_*`). Добавляйте
   поведение через контракты / адаптеры / RC, а не импортом вверх. Страж:
   `tests/test_core_import_boundary.py`.
-- **Никаких inline magic numbers.** Каждое настраиваемое значение — это поле `RuntimeConstants`
-  (frozen, `extra="forbid"`) или лимит из `constants.py`. Код рантайма читает из
-  снимка RC, а не из зашитого литерала. Добавление одного — это правило 3 правок
-  (поле ядра + хост `_FIELD_MAP` + seed миграции).
+- **Никаких inline magic numbers.** Каждое настраиваемое значение, которое читает
+  цикл, — это поле `LoopConstants` (frozen, `extra="forbid"`) или лимит из
+  `constants.py`. Код рантайма читает из снимка RC, а не из зашитого литерала.
+  Ручку, которую читает окружающий слой, объявляет этот слой, в собственной
+  группе констант (`contracts/config.py`).
 - **Безопасно при горизонтальном масштабировании.** Никаких словарей на уровне модуля, никаких удерживаемых модулем блокировок, никакой
   in-memory-авторитетности на уровне пода. Состояние, влияющее на корректность, живёт пер-ран на
   `QueryEngine` (snapshot/resume); эфемерное межподовое состояние — это Redis, долговременное
   состояние — это Postgres (оба инъецируются через границу). Token-bucket и
   adaptive band принимают инъецированные блокировки/store-ы, а не состояние модуля.
-- **Стриминг обязателен.** `query()` возвращает асинхронный итератор; каждая дельта
+- **Стриминг обязателен.** Любой драйв — асинхронный итератор; каждая дельта
   провайдера пробрасывается немедленно как `TurnEvent`. Не буферизуйте целый ход
   перед выпуском.
 - **Никакой обратной совместимости.** Dev-версия проекта — ломайте свободно, удаляйте
   мёртвый код, никаких migration shim. (Поэтому `compaction_thresholds.py` был удалён
-  начисто, как только `budgets.py` поглотил его.)
+  начисто, как только `budgets.py` поглотил его.) Единственное исключение — снимок
+  прогона: он пересекает не релизы, а сборки, поэтому объявляет версию схемы и либо
+  поднимается upcaster-ом, либо отвергается — но никогда не читается наполовину
+  (`contracts/snapshot.py`).
 - **Используйте модели `Message`, а не сырые dict-ы.** Все сообщения текут как Pydantic-
   объединение `Message` / `ContentBlock` из `contracts/types.py`.
-- **Не модифицируйте структуру цикла.** Кастомизируйте через хуки, инъекцию
-  `QueryEngineConfig`, переключатели RC или `system_prompt_sections`.
+- **Не модифицируйте структуру цикла.** Кастомизируйте через регистрацию на шве
+  жизненного цикла, политику хода, инъекцию `QueryEngineConfig`, переключатели RC
+  или `system_prompt_sections`.
+- **Хост доказывает свои адаптеры, а не ждёт, пока это сделает прогон.**
+  В `protocore.conformance.SUITES` по одному набору на контракт; хост привязывает
+  каждый к своему адаптеру и узнаёт в собственном прогоне тестов, что форма — та
+  самая, которую вызовет ядро. Ставится как `pip install "protocore[testing]"`.
 - **Продакшен-логирование = WARNING.** Используйте `logger.warning(...)` для
   операционно значимых событий; более низкие уровни оставьте для локальной
   отладки.
 
 Команды репозитория: `uv sync --extra dev`, `uv run pytest .`, `uv run ruff check .`,
-`uv run mypy protocore`.
+`uv run mypy --strict` (никогда с путём: путь заменяет настроенный список файлов
+и молча выбрасывает дерево тестов).
 
 > Перевод английского оригинала `docs/architecture.md` (коммит `54b6543`). При изменении оригинала обновите перевод.

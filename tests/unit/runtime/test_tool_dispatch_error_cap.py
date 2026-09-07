@@ -2,9 +2,9 @@
 
 The leader can retry an IDENTICAL failed tool call up to 200 times in
 pathological runs (e.g. Write storms).
-The dispatcher tracks a per-run streak on the helper bag and rewrites the
+The dispatcher tracks a per-run streak on the run's state and rewrites the
 error to ``DispatchErrorKind.consecutive_error_cap`` once the streak exceeds
-``RuntimeConstants.tool_dispatch_consecutive_error_cap`` (default 4 = up to
+``LoopConstants.tool_dispatch_consecutive_error_cap`` (default 4 = up to
 3 retries; 4th identical (tool, signature) is intercepted).
 """
 from __future__ import annotations
@@ -13,7 +13,12 @@ from typing import Any
 
 import pytest
 
-from protocore.contracts.runtime_constants import RuntimeConstants
+from protocore.contracts.resilience import (
+    TRANSPORT_DOWN_ERROR_CLASSES,
+    ResilienceErrorClass,
+)
+from protocore.contracts.run_state import RunScopedState
+from protocore.contracts.runtime_constants import LoopConstants
 from protocore.contracts.tool_registry import ToolVisibilityPolicy
 from protocore.contracts.tools import ToolContext
 from protocore.contracts.types import ToolCall
@@ -22,10 +27,11 @@ from protocore.runtime.tool_dispatch import (
     DispatchErrorKind,
     DispatchOutcome,
     ToolDispatcher,
-    consume_sandbox_down_injection_signal,
+    consume_transport_down_injection_signal,
 )
 from protocore.runtime.tool_permission import ToolPermissionGate
 from protocore.runtime.tool_registry import ToolRegistry
+from tests._fixtures.tool_roles import CONVENTIONAL_TOOL_ROLES
 
 from ._tool_fixtures import MockTool
 
@@ -34,33 +40,55 @@ from ._tool_fixtures import MockTool
 # ----------------------------------------------------------------------
 
 
-def _build_dispatcher(tools: list[MockTool]) -> ToolDispatcher:
+class _FixedClassifier:
+    """A host that returns one verdict for every failure it is shown.
+
+    Stands in for the real thing on purpose: the runtime under test must act
+    on the verdict alone, so the double reads no wording at all.
+    """
+
+    def __init__(self, verdict: ResilienceErrorClass | None) -> None:
+        self._verdict = verdict
+
+    def classify_error_text(
+        self, message: str, *, tool_name: str | None = None
+    ) -> ResilienceErrorClass | None:
+        return self._verdict
+
+
+#: A host that calls every failure one of the transport being down.
+_DOWN = _FixedClassifier(ResilienceErrorClass.transient_retryable)
+
+
+def _build_dispatcher(
+    tools: list[MockTool], classifier: Any | None = None
+) -> ToolDispatcher:
     """Construct a dispatcher with no hook manager / counter — pure dispatch."""
     return ToolDispatcher(
         registry=ToolRegistry(tools),
-        permission_gate=ToolPermissionGate(),
+        permission_gate=ToolPermissionGate(roles=CONVENTIONAL_TOOL_ROLES),
+        resilience_classifier=classifier,
     )
 
 
-def _make_helpers_ctx(
+def _make_run_ctx(
     *,
     run_id: str = "run-cap-1",
-    helpers: dict[str, Any] | None = None,
-) -> tuple[ToolContext, dict[str, Any]]:
-    """Build a :class:`ToolContext` that exposes a per-run mutable helpers bag.
+    rc: Any | None = None,
+) -> tuple[ToolContext, RunScopedState]:
+    """Build a :class:`ToolContext` carrying a fresh run state.
 
-    The dispatcher reads + writes the streak cell at
-    ``helpers["tool_dispatch.consecutive_error_state"]``; the returned dict is
-    the same object the dispatcher mutates, so tests can inspect it directly.
+    The dispatcher reads and writes its streaks on that state; the returned
+    object is the same one the dispatcher mutates, so tests inspect it directly.
     """
-    bag: dict[str, Any] = dict(helpers) if helpers else {}
+    state = RunScopedState(rc=rc)
     ctx = ToolContext(
         tenant_id="tenant-cap",
         run_id=run_id,
         session_id="sess-cap",
-        metadata={"protocore.helpers": bag},
+        run_state=state,
     )
-    return ctx, bag
+    return ctx, state
 
 
 async def _drain(
@@ -98,7 +126,7 @@ async def test_first_three_identical_errors_return_original_kind() -> None:
     """
     tool = MockTool(tool_name="Boom", raise_exception=RuntimeError("kaboom"))
     dispatcher = _build_dispatcher([tool])
-    ctx, _ = _make_helpers_ctx()
+    ctx, _ = _make_run_ctx()
 
     for attempt in range(3):
         _events, outcome = await _drain(
@@ -129,7 +157,7 @@ async def test_fourth_identical_error_rewrites_to_consecutive_error_cap() -> Non
     """
     tool = MockTool(tool_name="Boom", raise_exception=RuntimeError("kaboom"))
     dispatcher = _build_dispatcher([tool])
-    ctx, _ = _make_helpers_ctx()
+    ctx, _ = _make_run_ctx()
 
     last_outcome: DispatchOutcome | None = None
     last_events: list[TurnEvent] = []
@@ -172,7 +200,7 @@ async def test_different_error_signature_resets_counter() -> None:
     # Same tool name — the registry only keeps the last-registered instance,
     # so we switch the tool out between batches.
     dispatcher_boom = _build_dispatcher([boom])
-    ctx, bag = _make_helpers_ctx()
+    ctx, state = _make_run_ctx()
 
     for _ in range(3):
         _events, outcome = await _drain(
@@ -191,8 +219,8 @@ async def test_different_error_signature_resets_counter() -> None:
     assert outcome.error_kind is DispatchErrorKind.execution
     assert "other failure" in outcome.content
     # The streak cell now tracks the new signature with count=1.
-    state = bag["tool_dispatch.consecutive_error_state"]
-    assert state["count"] == 1
+    assert state.consecutive_error is not None
+    assert state.consecutive_error.count == 1
 
     # Back to the original error; the streak restarts (count was reset by the
     # signature change). At cap=4 we get 3 fresh attempts before any rewrite.
@@ -223,7 +251,7 @@ async def test_switching_tool_resets_counter_with_identical_message() -> None:
     tool_a = MockTool(tool_name="ToolA", raise_exception=RuntimeError("same error"))
     tool_b = MockTool(tool_name="ToolB", raise_exception=RuntimeError("same error"))
     dispatcher = _build_dispatcher([tool_a, tool_b])
-    ctx, bag = _make_helpers_ctx()
+    ctx, state = _make_run_ctx()
 
     for _ in range(3):
         _events, outcome = await _drain(
@@ -240,9 +268,9 @@ async def test_switching_tool_resets_counter_with_identical_message() -> None:
         ctx=ctx,
     )
     assert outcome.error_kind is DispatchErrorKind.execution
-    state = bag["tool_dispatch.consecutive_error_state"]
-    assert state["tool_name"] == "ToolA" or state["tool_name"] == "ToolB"
-    assert state["count"] == 1
+    assert state.consecutive_error is not None
+    assert state.consecutive_error.tool_name in ("ToolA", "ToolB")
+    assert state.consecutive_error.count == 1
 
     # Back to ToolA — fresh streak, NOT carrying the earlier count of 3.
     _events, outcome = await _drain(
@@ -251,9 +279,9 @@ async def test_switching_tool_resets_counter_with_identical_message() -> None:
         ctx=ctx,
     )
     assert outcome.error_kind is DispatchErrorKind.execution
-    state = bag["tool_dispatch.consecutive_error_state"]
-    assert state["tool_name"] == "ToolA"
-    assert state["count"] == 1
+    assert state.consecutive_error is not None
+    assert state.consecutive_error.tool_name == "ToolA"
+    assert state.consecutive_error.count == 1
 
 
 # ----------------------------------------------------------------------
@@ -263,16 +291,16 @@ async def test_switching_tool_resets_counter_with_identical_message() -> None:
 
 @pytest.mark.asyncio
 async def test_rc_override_lowers_cap() -> None:
-    """Operator override via ``RuntimeConstants(tool_dispatch_consecutive_error_cap=2)``
+    """Operator override via ``LoopConstants(tool_dispatch_consecutive_error_cap=2)``
     triggers the cap rewrite on the 2nd identical error.
 
     The dispatcher reads the RC snapshot via ``helpers["rc"]`` — same plumbing
-    used by ``executor_main`` for ``max_ask_user_calls_per_run``.
+    used by the host for ``max_ask_user_calls_per_run``.
     """
-    rc = RuntimeConstants(tool_dispatch_consecutive_error_cap=2)
+    rc = LoopConstants(tool_dispatch_consecutive_error_cap=2)
     tool = MockTool(tool_name="Boom", raise_exception=RuntimeError("kaboom"))
     dispatcher = _build_dispatcher([tool])
-    ctx, _ = _make_helpers_ctx(helpers={"rc": rc})
+    ctx, _ = _make_run_ctx(rc=rc)
 
     # 1st call: original kind.
     _events, outcome = await _drain(
@@ -297,10 +325,10 @@ async def test_rc_override_raises_cap() -> None:
     """RC cap=6 means the 5th identical error is still original; the 6th is
     rewritten. Tests that the upper-bound override path is honoured.
     """
-    rc = RuntimeConstants(tool_dispatch_consecutive_error_cap=6)
+    rc = LoopConstants(tool_dispatch_consecutive_error_cap=6)
     tool = MockTool(tool_name="Boom", raise_exception=RuntimeError("kaboom"))
     dispatcher = _build_dispatcher([tool])
-    ctx, _ = _make_helpers_ctx(helpers={"rc": rc})
+    ctx, _ = _make_run_ctx(rc=rc)
 
     for attempt in range(5):
         _events, outcome = await _drain(
@@ -336,7 +364,7 @@ async def test_successful_call_resets_streak() -> None:
     """
     boom = MockTool(tool_name="Mix", raise_exception=RuntimeError("kaboom"))
     ok = MockTool(tool_name="Mix", response_content="ok-result")
-    ctx, bag = _make_helpers_ctx()
+    ctx, state = _make_run_ctx()
 
     dispatcher_boom = _build_dispatcher([boom])
     for _ in range(3):
@@ -354,7 +382,7 @@ async def test_successful_call_resets_streak() -> None:
         ctx=ctx,
     )
     assert outcome.success is True
-    assert "tool_dispatch.consecutive_error_state" not in bag
+    assert state.consecutive_error is None
 
     # Failures resume at a fresh count=1.
     dispatcher_boom_again = _build_dispatcher([boom])
@@ -364,14 +392,14 @@ async def test_successful_call_resets_streak() -> None:
         ctx=ctx,
     )
     assert outcome.error_kind is DispatchErrorKind.execution
-    state = bag["tool_dispatch.consecutive_error_state"]
-    assert state["count"] == 1
+    assert state.consecutive_error is not None
+    assert state.consecutive_error.count == 1
 
 
 @pytest.mark.asyncio
-async def test_dispatch_without_helpers_bag_skips_cap() -> None:
-    """Legacy dispatch paths (no helper bag wired) must never raise — the
-    cap is best-effort and silently no-ops when state cannot be persisted.
+async def test_dispatch_without_run_state_skips_cap() -> None:
+    """A call outside a run must never raise — the cap is per-run, and there is
+    no run for it to be a cap on.
     """
     tool = MockTool(tool_name="Boom", raise_exception=RuntimeError("kaboom"))
     dispatcher = _build_dispatcher([tool])
@@ -391,23 +419,23 @@ async def test_dispatch_without_helpers_bag_skips_cap() -> None:
 
 
 # ----------------------------------------------------------------------
-# Cross-run isolation — distinct helper bags do not share state
+# Cross-run isolation — distinct run states do not share streaks
 # ----------------------------------------------------------------------
 
 
 @pytest.mark.asyncio
 async def test_consecutive_error_state_is_per_run_isolated() -> None:
-    """Two runs with distinct helper bags accumulate independent streaks.
+    """Two runs with distinct states accumulate independent streaks.
 
-    Helper bags are built per run by ``service_runtime.build_helper_bag``; the
-    dispatcher only ever mutates the bag passed in via ``ctx.metadata``, so
+    A run's state is composed per run by the host; the
+    dispatcher only ever mutates the one passed in on the context, so
     concurrent runs cannot collide.
     """
     tool = MockTool(tool_name="Boom", raise_exception=RuntimeError("kaboom"))
     dispatcher = _build_dispatcher([tool])
 
-    ctx_a, _ = _make_helpers_ctx(run_id="run-a")
-    ctx_b, _ = _make_helpers_ctx(run_id="run-b")
+    ctx_a, _ = _make_run_ctx(run_id="run-a")
+    ctx_b, _ = _make_run_ctx(run_id="run-b")
 
     # Drive run A to the cap.
     for _ in range(3):
@@ -441,7 +469,7 @@ async def test_soft_is_error_path_participates_in_cap() -> None:
         response_is_error=True,
     )
     dispatcher = _build_dispatcher([tool])
-    ctx, _ = _make_helpers_ctx()
+    ctx, _ = _make_run_ctx()
 
     last_outcome: DispatchOutcome | None = None
     for _ in range(4):
@@ -459,138 +487,208 @@ async def test_soft_is_error_path_participates_in_cap() -> None:
 # Broadened signature normalisation
 # ----------------------------------------------------------------------
 #
-# These tests exercise :meth:`ToolDispatcher._error_signature` directly
-# (pure function) — they verify the canonical sandbox-down / Bash-cmd-missing
-# patterns collapse to a fixed signature regardless of surrounding text, and
-# that quoted content + absolute file paths are stripped before hashing.
+# These tests exercise :meth:`ToolDispatcher._error_signature` directly (a pure
+# function). They verify that the canonical transport-down / shell-cmd-missing
+# collapses give a fixed signature regardless of surrounding text, and that
+# quoted content and absolute file paths are stripped before hashing.
+#
+# The messages here are invented on purpose. The runtime is not supposed to
+# recognise any wording: what a failing transport says belongs to the host that
+# owns it, and the host answers for it through
+# :class:`~protocore.contracts.resilience.IResilienceClassifier`. So the double
+# below classifies by a marker no real system emits, which is exactly the
+# property under test — no wording is privileged, only the verdict is.
 
 
-def test_sandbox_unreachable_collapses_to_canonical() -> None:
-    """All four sandbox-unreachable wordings collapse to the same canonical
- ``<tool>:SANDBOX_DOWN`` signature. Without this collapse, varying Bash
- command shapes against a dead sandbox each produce a fresh signature and
- the consecutive-error cap never fires.
+def test_a_classified_transport_failure_collapses_to_canonical() -> None:
+    """Four differently-worded failures the host calls transport-down collapse
+ to the same ``<tool>:TRANSPORT_DOWN`` signature. Without the collapse,
+ varying argument shapes against a dead transport each produce a fresh
+ signature and the consecutive-error cap never fires.
  """
-    sig1 = ToolDispatcher._error_signature(
-        DispatchErrorKind.execution,
-        "SandboxUnreachable: pod xyz not ready",
-        "Bash",
-    )
-    sig2 = ToolDispatcher._error_signature(
-        DispatchErrorKind.execution,
-        "tool 'Bash' execution failed: supervisor 502 connection refused",
-        "Bash",
-    )
-    sig3 = ToolDispatcher._error_signature(
-        DispatchErrorKind.execution,
-        "exec failed: pod not ready (after retries)",
-        "Bash",
-    )
-    sig4 = ToolDispatcher._error_signature(
-        DispatchErrorKind.execution,
-        "sandbox session not active for this run",
-        "Bash",
-    )
-    assert sig1 == sig2 == sig3 == sig4 == "Bash:SANDBOX_DOWN"
+    sigs = {
+        ToolDispatcher._error_signature(
+            DispatchErrorKind.execution, message, "Bash", classifier=_DOWN
+        )
+        for message in (
+            "the far side is gone: instance nine never came up",
+            "tool 'Bash' failed: gateway said 502 while connecting",
+            "start failed: the machine was not ready in time",
+            "no session is open on the far side for this run",
+        )
+    }
+    assert sigs == {"Bash:TRANSPORT_DOWN"}
 
 
-def test_bash_command_not_found_canonical() -> None:
+def test_every_transport_down_class_collapses_the_same_way() -> None:
+    """Being told the way out is down is one streak, whichever of the neutral
+    classes says so. A run does not get three separate counters for an
+    unreachable host, a pushed-back one and one whose socket is dead — all
+    three mean the same thing to a model that must find another route.
+    """
+    sigs = {
+        ToolDispatcher._error_signature(
+            DispatchErrorKind.execution,
+            f"the far side is gone ({verdict.value})",
+            "Bash",
+            classifier=_FixedClassifier(verdict),
+        )
+        for verdict in TRANSPORT_DOWN_ERROR_CLASSES
+    }
+    assert sigs == {"Bash:TRANSPORT_DOWN"}
+
+
+def test_a_class_that_is_not_the_transport_being_down_is_hashed() -> None:
+    """A deterministic refusal is the call's own fault and keeps its own
+    signature: folding it into the transport streak would tell the model to
+    work around an outage that is not happening.
+    """
+    signature = ToolDispatcher._error_signature(
+        DispatchErrorKind.execution,
+        "that argument is not allowed here",
+        "Bash",
+        classifier=_FixedClassifier(ResilienceErrorClass.deterministic_abort),
+    )
+    assert signature != "Bash:TRANSPORT_DOWN"
+
+
+def test_with_no_classifier_bound_nothing_is_transport_down() -> None:
+    """The runtime recognises no wording of its own. A host that binds no
+    classifier gets failures told apart by their text, and never a
+    transport-down streak — which is the only honest default, since the
+    runtime cannot know what any of these messages mean.
+    """
+    signature = ToolDispatcher._error_signature(
+        DispatchErrorKind.execution,
+        "the far side is gone: instance nine never came up",
+        "Bash",
+    )
+    assert signature != "Bash:TRANSPORT_DOWN"
+
+
+def test_a_classifier_that_raises_is_not_a_dispatch_failure() -> None:
+    """A broken classifier costs one collapsed signature, not the tool call.
+    The failure being classified is already an error being surfaced to the
+    model; a second one raised while explaining it must not replace it.
+    """
+
+    class _Broken:
+        def classify_error_text(
+            self, message: str, *, tool_name: str | None = None
+        ) -> ResilienceErrorClass | None:
+            raise RuntimeError("classifier is broken")
+
+    signature = ToolDispatcher._error_signature(
+        DispatchErrorKind.execution,
+        "the far side is gone",
+        "Bash",
+        classifier=_Broken(),
+    )
+    assert signature != "Bash:TRANSPORT_DOWN"
+
+
+def test_the_classifier_is_told_which_tool_failed() -> None:
+    """Which tool produced the message is part of the question: one host can
+    put different transports behind different tools.
+    """
+    seen: list[tuple[str, str | None]] = []
+
+    class _Recording:
+        def classify_error_text(
+            self, message: str, *, tool_name: str | None = None
+        ) -> ResilienceErrorClass | None:
+            seen.append((message, tool_name))
+            return None
+
+    ToolDispatcher._error_signature(
+        DispatchErrorKind.execution, "some failure", "Write", classifier=_Recording()
+    )
+    assert seen == [("some failure", "Write")]
+
+
+def test_shell_command_not_found_canonical() -> None:
     """Two ``command not found`` shells (different prefix) produce the same
-    canonical ``Bash:BASH_CMD_MISSING`` signature.
+    canonical ``<tool>:SHELL_CMD_MISSING`` signature.
     """
     sig1 = ToolDispatcher._error_signature(
         DispatchErrorKind.execution,
         "/bin/bash: nonexistent: command not found",
         "Bash",
+        roles=CONVENTIONAL_TOOL_ROLES,
     )
     sig2 = ToolDispatcher._error_signature(
         DispatchErrorKind.execution,
         "bash: foo: command not found",
         "Bash",
+        roles=CONVENTIONAL_TOOL_ROLES,
     )
-    assert sig1 == sig2 == "Bash:BASH_CMD_MISSING"
+    assert sig1 == sig2 == "Bash:SHELL_CMD_MISSING"
 
 
-def test_bash_cmd_missing_only_applies_to_bash_tool() -> None:
-    """A ``command not found`` error from a non-Bash tool falls back to the
-    normal hashing path — the canonical signature is Bash-specific because
-    that's the only tool with shell-style command lookup semantics.
+def test_cmd_missing_only_applies_to_a_tool_that_runs_a_shell() -> None:
+    """The same text from a tool with no shell role falls back to hashing.
+
+    Which tool runs a command line is the host's statement, not a name the
+    dispatcher recognises: an installation whose shell tool is called
+    something else keeps the canonical collapse, and a tool that merely
+    quotes the phrase does not acquire it.
     """
-    bash_sig = ToolDispatcher._error_signature(
+    shell_sig = ToolDispatcher._error_signature(
         DispatchErrorKind.execution,
         "bash: foo: command not found",
         "Bash",
+        roles=CONVENTIONAL_TOOL_ROLES,
     )
     other_sig = ToolDispatcher._error_signature(
         DispatchErrorKind.execution,
         "bash: foo: command not found",
         "OtherTool",
+        roles=CONVENTIONAL_TOOL_ROLES,
     )
-    assert bash_sig == "Bash:BASH_CMD_MISSING"
-    assert other_sig != "OtherTool:BASH_CMD_MISSING"
-    assert other_sig != "Bash:BASH_CMD_MISSING"
+    assert shell_sig == "Bash:SHELL_CMD_MISSING"
+    assert other_sig != "OtherTool:SHELL_CMD_MISSING"
+    assert other_sig != "Bash:SHELL_CMD_MISSING"
 
 
-def test_sandbox_down_applies_to_any_tool() -> None:
-    """Sandbox-unreachable can surface from any sandboxed tool (Bash, Write,
-    Read, …) — the canonical signature is keyed by tool but the pattern fires
-    regardless of which tool surfaced the failure.
+def test_transport_down_applies_to_any_tool() -> None:
+    """A dead transport can surface from any tool that reaches through it. The
+    canonical signature is keyed by tool, but nothing about the tool decides
+    whether the collapse happens — the host's verdict does.
     """
     bash_sig = ToolDispatcher._error_signature(
-        DispatchErrorKind.execution,
-        "SandboxUnreachable",
-        "Bash",
+        DispatchErrorKind.execution, "the far side is gone", "Bash", classifier=_DOWN
     )
     write_sig = ToolDispatcher._error_signature(
-        DispatchErrorKind.execution,
-        "SandboxUnreachable",
-        "Write",
+        DispatchErrorKind.execution, "the far side is gone", "Write", classifier=_DOWN
     )
-    assert bash_sig == "Bash:SANDBOX_DOWN"
-    assert write_sig == "Write:SANDBOX_DOWN"
+    assert bash_sig == "Bash:TRANSPORT_DOWN"
+    assert write_sig == "Write:TRANSPORT_DOWN"
 
 
 def test_quoted_content_stripped_before_hash() -> None:
-    """Different quoted strings inside an otherwise-identical error shape
-    collapse to the same hashed signature — single, double and back-tick
-    quoting all participate.
-    """
-    sig_single = ToolDispatcher._error_signature(
-        DispatchErrorKind.execution,
-        "ls: 'file_abc.txt' not found",
-        "Bash",
+    """Three errors differing only in quoted content hash identically."""
+    sig1 = ToolDispatcher._error_signature(
+        DispatchErrorKind.execution, "grep: 'foo' not found", "Bash"
     )
     sig_other_single = ToolDispatcher._error_signature(
-        DispatchErrorKind.execution,
-        "ls: 'file_xyz_completely_different.txt' not found",
-        "Bash",
+        DispatchErrorKind.execution, "grep: 'bar-baz' not found", "Bash"
     )
     sig_double = ToolDispatcher._error_signature(
-        DispatchErrorKind.execution,
-        'ls: "another_name.txt" not found',
-        "Bash",
+        DispatchErrorKind.execution, 'grep: "qux" not found', "Bash"
     )
     sig_backtick = ToolDispatcher._error_signature(
-        DispatchErrorKind.execution,
-        "ls: `yet_another.txt` not found",
-        "Bash",
+        DispatchErrorKind.execution, "grep: `quux` not found", "Bash"
     )
-    assert sig_single == sig_other_single == sig_double == sig_backtick
+    assert sig1 == sig_other_single == sig_double == sig_backtick
 
 
 def test_paths_stripped_before_hash() -> None:
-    """Different absolute file paths inside an otherwise-identical error
-    shape collapse to the same hashed signature.
-    """
+    """Errors differing only in an absolute path hash identically."""
     sig1 = ToolDispatcher._error_signature(
-        DispatchErrorKind.execution,
-        "No such file: /workspace/foo.py",
-        "Read",
+        DispatchErrorKind.execution, "No such file: /tmp/a.txt", "Read"
     )
     sig2 = ToolDispatcher._error_signature(
-        DispatchErrorKind.execution,
-        "No such file: /workspace/bar.py",
-        "Read",
+        DispatchErrorKind.execution, "No such file: /var/log/b.log", "Read"
     )
     sig3 = ToolDispatcher._error_signature(
         DispatchErrorKind.execution,
@@ -606,55 +704,46 @@ def test_distinct_logical_errors_keep_distinct_signatures() -> None:
     distinct, so the cap does not falsely conflate them.
     """
     not_found = ToolDispatcher._error_signature(
-        DispatchErrorKind.execution,
-        "ls: 'foo.txt' not found",
-        "Bash",
+        DispatchErrorKind.execution, "ls: 'foo.txt' not found", "Bash"
     )
     permission = ToolDispatcher._error_signature(
-        DispatchErrorKind.execution,
-        "ls: 'foo.txt' permission denied",
-        "Bash",
+        DispatchErrorKind.execution, "ls: 'foo.txt' permission denied", "Bash"
     )
     assert not_found != permission
 
 
-def test_canonical_pattern_takes_precedence_over_hashing() -> None:
-    """Even when a sandbox-down message embeds varying quoted content,
-    the canonical signature wins — the hash path is never reached.
+def test_canonical_verdict_takes_precedence_over_hashing() -> None:
+    """Even when a transport-down message embeds varying quoted content, the
+    canonical signature wins — the hash path is never reached.
     """
     sig_varied_a = ToolDispatcher._error_signature(
         DispatchErrorKind.execution,
-        "SandboxUnreachable: 'python3 -c \"x=1\"' returned 503",
+        "the far side is gone: 'python3 -c \"x=1\"' returned 503",
         "Bash",
+        classifier=_DOWN,
     )
     sig_varied_b = ToolDispatcher._error_signature(
         DispatchErrorKind.execution,
-        "SandboxUnreachable: 'cat > /tmp/foo.txt' returned 502",
+        "the far side is gone: 'cat > /tmp/foo.txt' returned 502",
         "Bash",
+        classifier=_DOWN,
     )
-    assert sig_varied_a == sig_varied_b == "Bash:SANDBOX_DOWN"
+    assert sig_varied_a == sig_varied_b == "Bash:TRANSPORT_DOWN"
 
 
 @pytest.mark.asyncio
-async def test_varied_bash_command_errors_collapse_under_cap() -> None:
-    """End-to-end check: a Bash tool that raises sandbox-unreachable failures
- with VARYING command shapes still trips the consecutive-error cap on the
- 4th call. Before this change each varying command produced a fresh
- signature and the cap never fired.
+async def test_varied_tool_arguments_collapse_under_cap() -> None:
+    """End-to-end: a tool that fails with a transport-down verdict under
+ VARYING argument shapes still trips the consecutive-error cap on the 4th
+ call. Without the collapse each varying argument produces a fresh
+ signature and the cap never fires.
 
  Drives the dispatcher's exception path (``except Exception`` branch in
- :meth:`ToolDispatcher.dispatch`) which already invokes
+ :meth:`ToolDispatcher.dispatch`), which invokes
  ``_apply_consecutive_error_cap`` via ``DispatchErrorKind.execution``.
  """
     invocation_counter = {"n": 0}
 
-    def _bump(_args: dict[str, Any]) -> None:
-        invocation_counter["n"] += 1
-
-    # MockTool's ``raise_exception`` is captured once; we want a distinct
-    # message every call so the un-normalised hash would change. Use the
-    # ``on_invoke`` hook to bump a counter, then build the raised message
-    # off the counter via a custom subclass.
     from protocore.contracts.tools import Tool as _Tool
     from protocore.contracts.types import (
         ToolDefinition as _ToolDefinition,
@@ -663,7 +752,7 @@ async def test_varied_bash_command_errors_collapse_under_cap() -> None:
         ToolParameterSchema as _ToolParameterSchema,
     )
 
-    class _VaryingSandboxDownTool(_Tool):
+    class _VaryingFailureTool(_Tool):
         @property
         def name(self) -> str:  # type: ignore[override]
             return "Bash"
@@ -672,7 +761,7 @@ async def test_varied_bash_command_errors_collapse_under_cap() -> None:
         def definition(self) -> _ToolDefinition:  # type: ignore[override]
             return _ToolDefinition(
                 name="Bash",
-                description="varying sandbox-down test tool",
+                description="a tool whose transport is down",
                 parameters=_ToolParameterSchema(properties={"v": {"type": "string"}}),
             )
 
@@ -686,12 +775,11 @@ async def test_varied_bash_command_errors_collapse_under_cap() -> None:
             varied = f"python3 -c 'x = {n} * 2'"
             path = f"/workspace/file_{n}.py"
             raise RuntimeError(
-                f"SandboxUnreachable: pod not ready while running "
-                f"'{varied}' against {path}"
+                f"the far side is gone while running '{varied}' against {path}"
             )
 
-    dispatcher = _build_dispatcher([_VaryingSandboxDownTool()])  # type: ignore[list-item]
-    ctx, _ = _make_helpers_ctx()
+    dispatcher = _build_dispatcher([_VaryingFailureTool()])  # type: ignore[list-item]
+    ctx, _ = _make_run_ctx()
 
     last_outcome: DispatchOutcome | None = None
     for _ in range(4):
@@ -702,576 +790,238 @@ async def test_varied_bash_command_errors_collapse_under_cap() -> None:
         )
     assert last_outcome is not None
     assert last_outcome.error_kind is DispatchErrorKind.consecutive_error_cap, (
-        f"varied-shape sandbox-unreachable storm must still trip the cap "
-        f"after canonical signature collapse; got {last_outcome.error_kind}"
+        f"a varied-shape storm against a dead transport must still trip the "
+        f"cap after the canonical collapse; got {last_outcome.error_kind}"
     )
-    # The original sandbox-down phrase must still appear in the surfaced
-    # content so the model can reason about the underlying cause.
-    assert "SandboxUnreachable" in last_outcome.content
+    # The original wording must still reach the model, so it can reason about
+    # what actually went wrong rather than only about the cap.
+    assert "the far side is gone" in last_outcome.content
 
 
 # ----------------------------------------------------------------------
-# Production-wording regex coverage
-# ----------------------------------------------------------------------
-#
-# The original `supervisor 5\d\d` literal pattern misses every actual
-# production sandbox-down message because the supervisor RPC always inserts
-# descriptive context between `supervisor` and the status code.
-# Each test below names the component that emits its wording, so the regex
-# stays in sync with the surface a host actually raises through.
-
-
-def test_supervisor_returned_5xx_matches() -> None:
-    """Emit site: the sandbox RPC client emits
-    → ``f"supervisor /exec returned {resp.status_code}"``,
-    raised as :class:`SupervisorUnreachableError`, wrapped by
-    the sandbox dispatcher → ``f"supervisor auth failed: {exc}"`` or by the
-    bare bubble-up, then wrapped once more by the Bash tool →
-    ``"sandbox dispatch failed: {exc}"``."""
-    sig = ToolDispatcher._error_signature(
-        DispatchErrorKind.execution,
-        "sandbox dispatch failed: supervisor /exec returned 502 Bad Gateway",
-        "Bash",
-    )
-    assert sig == "Bash:SANDBOX_DOWN"
-
-
-def test_supervisor_bind_returned_5xx_matches() -> None:
-    """Emit site: the sandbox RPC client emits
-    → ``f"supervisor /bind returned {resp.status_code}"``.
-    """
-    sig = ToolDispatcher._error_signature(
-        DispatchErrorKind.execution,
-        "sandbox dispatch failed: supervisor /bind returned 503",
-        "Bash",
-    )
-    assert sig == "Bash:SANDBOX_DOWN"
-
-
-def test_supervisor_at_url_unreachable() -> None:
-    """Emit site: the sandbox RPC client →
-    ``f"supervisor at {self.base_url} unreachable: {exc}"`` (transport-level
-    httpx connect / read / network error)."""
-    sig = ToolDispatcher._error_signature(
-        DispatchErrorKind.execution,
-        "supervisor at https://sandbox.local unreachable: connection timeout",
-        "Bash",
-    )
-    assert sig == "Bash:SANDBOX_DOWN"
-
-
-def test_supervisor_unreachable_after_respawn() -> None:
-    """Emit site: the sandbox dispatcher → ``f"supervisor unreachable after respawn: {exc2}"``
-    (raised on the second :class:`SupervisorUnreachableError` after a hot-pod
-    respawn)."""
-    sig = ToolDispatcher._error_signature(
-        DispatchErrorKind.execution,
-        "supervisor unreachable after respawn: 3 attempts failed",
-        "Bash",
-    )
-    assert sig == "Bash:SANDBOX_DOWN"
-
-
-def test_supervisor_auth_failed() -> None:
-    """Emit site: the sandbox dispatcher → ``f"supervisor auth failed: {exc}"`` (raised on
-    :class:`SupervisorAuthError`, i.e. 401 from the supervisor /exec call)."""
-    sig = ToolDispatcher._error_signature(
-        DispatchErrorKind.execution,
-        "supervisor auth failed: 401 Unauthorized",
-        "Bash",
-    )
-    assert sig == "Bash:SANDBOX_DOWN"
-
-
-def test_supervisor_timed_out() -> None:
-    """Emit site: the sandbox RPC client → ``f"supervisor /exec timed out at
-    {self.base_url}"`` (exec_read_timeout exceeded)."""
-    sig = ToolDispatcher._error_signature(
-        DispatchErrorKind.execution,
-        "supervisor /exec timed out at https://pod.local",
-        "Bash",
-    )
-    assert sig == "Bash:SANDBOX_DOWN"
-
-
-def test_supervisor_rejected_auth() -> None:
-    """Emit site: the sandbox RPC client → ``"supervisor rejected auth header
-    at /exec"`` / ``"supervisor rejected /bind auth"`` (raised as
-    :class:`SupervisorAuthError` on 401)."""
-    sig = ToolDispatcher._error_signature(
-        DispatchErrorKind.execution,
-        "supervisor rejected auth header at /exec",
-        "Bash",
-    )
-    assert sig == "Bash:SANDBOX_DOWN"
-
-
-def test_supervisor_unexpected_status() -> None:
-    """Emit site: the sandbox RPC client →
-    ``f"supervisor /exec unexpected {resp.status_code}: ..."``."""
-    sig = ToolDispatcher._error_signature(
-        DispatchErrorKind.execution,
-        "supervisor /exec unexpected 418: 'teapot'",
-        "Bash",
-    )
-    assert sig == "Bash:SANDBOX_DOWN"
-
-
-def test_sandbox_provision_failed() -> None:
-    """Emit site: the sandbox dispatcher → ``f"sandbox provision failed: {safe_message}"``
-    (raised on ``k8s_client.create_pod`` failure)."""
-    sig = ToolDispatcher._error_signature(
-        DispatchErrorKind.execution,
-        "sandbox provision failed: quota exceeded",
-        "Bash",
-    )
-    assert sig == "Bash:SANDBOX_DOWN"
-
-
-def test_sandbox_readiness_failed() -> None:
-    """Emit site: the sandbox dispatcher →
-    ``f"sandbox readiness failed after pod create: {safe_message}"`` (pod
-    failed to become ready within ``cold_start_budget_seconds``)."""
-    sig = ToolDispatcher._error_signature(
-        DispatchErrorKind.execution,
-        "sandbox readiness failed after pod create: 30s timeout",
-        "Bash",
-    )
-    assert sig == "Bash:SANDBOX_DOWN"
-
-
-def test_sandbox_registration_failed() -> None:
-    """Emit site: the sandbox dispatcher → ``f"sandbox registration failed after pod
-    create: {safe_message}"`` (Redis register failure post-pod-create)."""
-    sig = ToolDispatcher._error_signature(
-        DispatchErrorKind.execution,
-        "sandbox registration failed after pod create: redis connection lost",
-        "Bash",
-    )
-    assert sig == "Bash:SANDBOX_DOWN"
-
-
-def test_sandbox_cache_update_failed() -> None:
-    """Emit site: the sandbox dispatcher → ``f"sandbox cache update failed after pod
-    create: {safe_message}"`` (supervisor URL cache write failure)."""
-    sig = ToolDispatcher._error_signature(
-        DispatchErrorKind.execution,
-        "sandbox cache update failed after pod create: x",
-        "Bash",
-    )
-    assert sig == "Bash:SANDBOX_DOWN"
-
-
-def test_tenant_namespace_provision_failed() -> None:
-    """Emit site: the sandbox dispatcher → ``f"tenant namespace provision failed:
-    {safe_message}"`` (raised when the K8s namespace bootstrap fails)."""
-    sig = ToolDispatcher._error_signature(
-        DispatchErrorKind.execution,
-        "tenant namespace provision failed: api server unreachable",
-        "Bash",
-    )
-    assert sig == "Bash:SANDBOX_DOWN"
-
-
-def test_sandbox_dispatch_failed_outer_wrapper() -> None:
-    """Emit site: the Bash tool → ``raise
-    ToolInvocationError(f"sandbox dispatch failed: {exc}") from exc``. This is
-    the outermost wrapper the dispatcher actually sees; alone it should still
-    canonicalise so the cap fires even if upstream phrasing changes."""
-    sig = ToolDispatcher._error_signature(
-        DispatchErrorKind.execution,
-        "sandbox dispatch failed: something we don't enumerate",
-        "Bash",
-    )
-    assert sig == "Bash:SANDBOX_DOWN"
-
-
-def test_multiple_supervisor_errors_collapse_to_same_signature() -> None:
-    """All real production sandbox-down emit sites collapse to one signature.
-
-    This is the load-bearing assertion the R8 review demanded: without it, the
-    The consecutive-error cap never fires on
-    ``err-ru-002-subagent-crash`` without this, because each varying
-    supervisor wording produces a fresh signature.
-    """
-    msgs = [
-        "supervisor /exec returned 502",
-        "supervisor /bind returned 503",
-        "supervisor at https://sandbox.local unreachable: timeout",
-        "supervisor unreachable after respawn",
-        "supervisor auth failed: 401",
-        "supervisor rejected auth header at /exec",
-        "supervisor /exec timed out at https://x.local",
-        "supervisor /exec unexpected 418: teapot",
-        "sandbox provision failed: quota",
-        "sandbox readiness failed after pod create",
-        "sandbox registration failed after pod create",
-        "sandbox cache update failed after pod create",
-        "tenant namespace provision failed: api down",
-        "sandbox dispatch failed: opaque downstream",
-    ]
-    sigs = {
-        ToolDispatcher._error_signature(DispatchErrorKind.execution, m, "Bash")
-        for m in msgs
-    }
-    assert sigs == {"Bash:SANDBOX_DOWN"}, sigs
-
-
-def test_production_sandbox_dispatch_phrasings_collapse() -> None:
-    """Real bash.py wrapper + sandbox dispatcher + supervisor_rpc phrasings
-    all collapse to the canonical SANDBOX_DOWN signature.
-
-    Without this, the literal ``supervisor 5\\d\\d`` pattern misses the actual
-    production wording the dispatcher receives (the bash tool wraps every
-    supervisor/dispatcher error in ``"sandbox dispatch failed: ..."`` before
-    raising :class:`ToolInvocationError`).
-    """
-    msgs = [
-        "sandbox dispatch failed: sandbox provision failed: supervisor /exec returned 502",
-        "sandbox dispatch failed: supervisor unreachable after respawn: foo",
-        "sandbox dispatch failed: supervisor auth failed: rejected",
-        "sandbox dispatch failed: supervisor at https://pod.local unreachable: timed out",
-        "sandbox dispatch failed: sandbox readiness failed after pod create: pod did not become ready",
-    ]
-    sigs = {
-        ToolDispatcher._error_signature(DispatchErrorKind.execution, m, "Bash")
-        for m in msgs
-    }
-    assert sigs == {"Bash:SANDBOX_DOWN"}, sigs
-
-
-def test_non_sandbox_errors_do_not_match_canonical() -> None:
-    """Regression guard: ordinary tool failures must NOT collapse into the
-    sandbox-down canonical signature, otherwise the cap would fire on unrelated
-    error streaks and starve genuine retries."""
-    msgs = [
-        "tool 'Read' failed: file not found",
-        "ls: permission denied",
-        "SQL query failed: syntax error near 'SELECT'",
-        "validation error: missing field 'path'",
-    ]
-    for m in msgs:
-        sig = ToolDispatcher._error_signature(
-            DispatchErrorKind.execution, m, "Bash"
-        )
-        assert sig != "Bash:SANDBOX_DOWN", (
-            f"non-sandbox message wrongly collapsed to SANDBOX_DOWN: {m!r}"
-        )
-
-
-# ----------------------------------------------------------------------
-# Rotating supervisor URL collapse
+# Address rotation collapses on the hash path
 # ----------------------------------------------------------------------
 #
-# Eval showed 38-46 Bash errors per run, each one carrying a fresh
-# supervisor IP (``10.0.0.1``, ``10.0.0.2``, …). The canonical
-# SANDBOX_DOWN pattern catches most via ``supervisor (at <url> )?unreachable``,
-# but defence-in-depth requires the hash path also collapse rotating URLs
-# in case a future emit site bypasses the canonical match. These tests exercise both the
-# canonical-match path (which still wins) and the hash path (post-URL strip).
+# A host that restarts the thing behind a tool commonly brings it back at a
+# fresh address, and each failure then embeds a different one. The classifier
+# normally collapses those failures before the hash is ever reached; these
+# tests pin what happens when it returns no verdict, so a single outage does
+# not read as a stream of distinct errors.
 
 
-def test_supervisor_rotating_ips_collapse() -> None:
-    """Rotating supervisor IPs must collapse to the same signature.
-
- Three identical-shape error strings with three different
- ``10.0.0.x:9292`` supervisor URLs must all hash to the same canonical
- SANDBOX_DOWN signature. The canonical-match wins because the
- ``supervisor at <url> unreachable`` pattern fires; this test pins
- the production wording verbatim.
- """
-    sig1 = ToolDispatcher._error_signature(
-        DispatchErrorKind.execution,
-        "supervisor at http://10.0.0.1:9292 unreachable: All connection attempts failed",
-        "Bash",
-    )
-    sig2 = ToolDispatcher._error_signature(
-        DispatchErrorKind.execution,
-        "supervisor at http://10.0.0.2:9292 unreachable: All connection attempts failed",
-        "Bash",
-    )
-    sig3 = ToolDispatcher._error_signature(
-        DispatchErrorKind.execution,
-        "supervisor at http://10.0.0.5:9292 unreachable: All connection attempts failed",
-        "Bash",
-    )
-    assert sig1 == sig2 == sig3
-    # Should be SANDBOX_DOWN canonical.
-    assert sig1 == "Bash:SANDBOX_DOWN"
+def test_rotating_addresses_collapse_on_the_hash_path() -> None:
+    sigs = {
+        ToolDispatcher._error_signature(
+            DispatchErrorKind.execution,
+            f"cannot reach http://10.0.0.{n}:9292: all connection attempts failed",
+            "Bash",
+        )
+        for n in (1, 2, 3)
+    }
+    assert len(sigs) == 1
 
 
-def test_supervisor_unreachable_after_respawn_multi_ip() -> None:
-    """Real production message with multiple rotating supervisor URLs.
-
- ``coding-en-004-async-rate-limit__seed1.json`` tool_calls
- error_summary embedded EIGHT distinct supervisor IPs in a single error
- message (``10.0.0.1``, ``.2``, ``.3``, ``.4``, ``.5``,
- ``.248``, ``.251``, ``.254``). The whole block must canonicalise to a
- single signature — Cluster B forensic root-cause.
- """
-    msg = (
-        "sandbox dispatch failed: supervisor unreachable after respawn:\n"
-        "    supervisor at http://10.0.0.1:9292 unreachable: All connection attempts failed\n"
-        "    supervisor at http://10.0.0.2:9292 unreachable: All connection attempts failed\n"
-        "    supervisor at http://10.0.0.3:9292 unreachable: All connection attempts failed"
-    )
-    sig = ToolDispatcher._error_signature(
-        DispatchErrorKind.execution, msg, "Bash"
-    )
-    assert sig == "Bash:SANDBOX_DOWN"
+def test_url_normalisation_in_normalize_text() -> None:
+    """Directly on :meth:`_normalize_error_text`: URLs collapse to ``<url>``."""
+    a = ToolDispatcher._normalize_error_text("cannot reach http://10.0.0.1:9292")
+    b = ToolDispatcher._normalize_error_text("cannot reach http://10.0.0.2:9292")
+    c = ToolDispatcher._normalize_error_text("cannot reach https://10.1.2.3:8443")
+    assert a == b == c
+    assert "<url>" in a
 
 
-def test_supervisor_url_normalisation_in_normalize_text() -> None:
-    """Direct unit test on :meth:`_normalize_error_text` — URLs collapse to
-    ``<SUPERVISOR_URL>`` placeholder regardless of IP.
-
-    Verifies the order matters: URL stripping runs before quoted-content +
-    file-path normalisation, so a URL embedded in a quoted string still
-    collapses correctly when the canonical pattern misses.
+def test_url_collapse_is_not_limited_to_one_address_family() -> None:
+    """A transport that lives at a public name rotates just as a private one
+    does, and the collapse must not be the runtime knowing which addresses a
+    particular host happens to use.
     """
-    a = ToolDispatcher._normalize_error_text(
-        "connect http://10.0.0.1:9292 failed"
-    )
-    b = ToolDispatcher._normalize_error_text(
-        "connect http://10.0.0.2:9292 failed"
-    )
-    c = ToolDispatcher._normalize_error_text(
-        "connect http://10.0.0.5:31337 failed"
-    )
-    assert a == b == c == "connect <SUPERVISOR_URL> failed"
-
-
-def test_supervisor_url_https_variant_collapses() -> None:
-    """HTTPS supervisor URLs also collapse (case-insensitive scheme match)."""
-    a = ToolDispatcher._normalize_error_text("supervisor at https://10.0.0.1:9292 unreachable")
-    b = ToolDispatcher._normalize_error_text("supervisor at https://10.0.0.2:9292 unreachable")
-    # Note: "supervisor" stays, "https://...:..." collapses
+    a = ToolDispatcher._normalize_error_text("cannot reach https://one.example:443/x")
+    b = ToolDispatcher._normalize_error_text("cannot reach https://two.example:443/y")
     assert a == b
-    assert "<SUPERVISOR_URL>" in a
-
-
-def test_non_rfc1918_urls_not_collapsed_by_supervisor_pattern() -> None:
-    """Pattern is intentionally narrow to private 10.x supervisor IPs; public
-    DNS-style hostnames must not match the supervisor regex.
-
-    We test the supervisor pattern in isolation rather than the full
-    normaliser because the broader normaliser also strips file-path-shaped
-    suffixes (``/x``, ``/y``) which would otherwise collapse the two
-    examples below for unrelated reasons. The narrow assertion is that the
-    supervisor URL marker NEVER appears for public DNS-style URLs.
-    """
-    from protocore.runtime.tool_dispatch import _SUPERVISOR_URL_PATTERN
-
-    assert not _SUPERVISOR_URL_PATTERN.search("fetch http://example.com:80/x failed")
-    assert not _SUPERVISOR_URL_PATTERN.search("fetch http://api.local:443/y failed")
-    # The full normaliser also leaves no SUPERVISOR_URL marker for these.
-    assert "<SUPERVISOR_URL>" not in ToolDispatcher._normalize_error_text(
-        "fetch http://example.com:80/x failed"
-    )
 
 
 # ----------------------------------------------------------------------
-# SANDBOX_DOWN injection signal
+# Transport-down injection signal
 # ----------------------------------------------------------------------
 #
-# The dispatcher posts a one-shot ``True`` flag on the helper bag at
-# ``tool_dispatch.sandbox_down_injection_pending`` when the
-# SANDBOX_DOWN canonical-signature streak reaches the RC threshold
-# (default 3). The host executor loop consumes the flag and appends
-# a synthetic user-role message instructing the agent to switch to inline
-# (Write-only) strategy. Tests cover the consumer contract.
+# The dispatcher raises a one-shot flag on the run's state when the
+# transport-down canonical-signature streak reaches the RC threshold
+# (default 3). The loop above consumes the flag and appends a synthetic
+# user-role message telling the agent to reach its goal another way. These
+# tests cover the consumer contract.
+
+
+def _down_tool() -> MockTool:
+    return MockTool(
+        tool_name="Bash",
+        raise_exception=RuntimeError("the far side is gone"),
+    )
 
 
 @pytest.mark.asyncio
-async def test_sandbox_down_signals_inline_strategy_after_threshold() -> None:
-    """Three consecutive SANDBOX_DOWN errors arm the injection signal on the
-    helper bag.
+async def test_transport_down_signals_after_threshold() -> None:
+    """Three consecutive transport-down verdicts raise the injection signal.
 
     Uses the default threshold (3) — the first two failures do not arm; the
     third one sets the flag exactly once. The fourth keeps the counter
     climbing for telemetry but the flag stays consumed (no re-arm).
     """
-    tool = MockTool(
-        tool_name="Bash",
-        raise_exception=RuntimeError("supervisor at http://10.0.0.1:9292 unreachable"),
-    )
-    dispatcher = _build_dispatcher([tool])
-    ctx, bag = _make_helpers_ctx()
+    dispatcher = _build_dispatcher([_down_tool()], classifier=_DOWN)
+    ctx, state = _make_run_ctx()
 
-    # First failure — counter=1, no signal yet.
     await _drain(dispatcher, tool_call=ToolCall(name="Bash", arguments={}), ctx=ctx)
-    assert bag.get("tool_dispatch.sandbox_down_injection_pending") is None
-    state = bag.get("tool_dispatch.sandbox_down_streak")
-    assert isinstance(state, dict) and state["count"] == 1
+    assert state.transport_down_injection_pending is False
+    assert state.transport_down is not None and state.transport_down.count == 1
 
-    # Second failure — counter=2, no signal yet.
     await _drain(dispatcher, tool_call=ToolCall(name="Bash", arguments={}), ctx=ctx)
-    assert bag.get("tool_dispatch.sandbox_down_injection_pending") is None
-    state = bag.get("tool_dispatch.sandbox_down_streak")
-    assert isinstance(state, dict) and state["count"] == 2
+    assert state.transport_down_injection_pending is False
+    assert state.transport_down is not None and state.transport_down.count == 2
 
-    # Third failure — counter=3, signal armed.
     await _drain(dispatcher, tool_call=ToolCall(name="Bash", arguments={}), ctx=ctx)
-    assert bag.get("tool_dispatch.sandbox_down_injection_pending") is True
-    state = bag.get("tool_dispatch.sandbox_down_streak")
-    assert isinstance(state, dict) and state["count"] == 3
+    assert state.transport_down_injection_pending is True
+    assert state.transport_down is not None and state.transport_down.count == 3
 
-    # Consume the signal (simulating the host executor).
-    consumed = ToolDispatcher._consume_sandbox_down_injection_signal(ctx)
+    consumed = ToolDispatcher._consume_transport_down_injection_signal(ctx)
     assert consumed is True
     # Second consume in the same streak yields False (one-shot).
-    assert ToolDispatcher._consume_sandbox_down_injection_signal(ctx) is False
+    assert ToolDispatcher._consume_transport_down_injection_signal(ctx) is False
 
-    # Fourth failure — counter=4, but signal NOT re-armed until reset.
     await _drain(dispatcher, tool_call=ToolCall(name="Bash", arguments={}), ctx=ctx)
-    assert bag.get("tool_dispatch.sandbox_down_injection_pending") is None
-    state = bag.get("tool_dispatch.sandbox_down_streak")
-    assert isinstance(state, dict) and state["count"] == 4
+    assert state.transport_down_injection_pending is False
+    assert state.transport_down is not None and state.transport_down.count == 4
 
 
 @pytest.mark.asyncio
-async def test_sandbox_down_streak_resets_on_successful_call() -> None:
-    """A successful tool call between SANDBOX_DOWN failures clears the
-    counter and the pending flag so the next storm restarts at count=1.
-
-    Without this reset, a transient sandbox blip would lock the agent out
-    of Bash for the rest of the run via repeated injection nudges.
+async def test_transport_down_streak_resets_on_successful_call() -> None:
+    """A successful call between transport-down failures clears the counter
+    and the pending flag, so the next storm restarts at count=1. Without the
+    reset a brief outage would lock the model out of the tool for the rest of
+    the run through repeated nudges.
     """
-    boom = MockTool(
-        tool_name="Bash",
-        raise_exception=RuntimeError("supervisor at http://10.0.0.1:9292 unreachable"),
-    )
     ok = MockTool(tool_name="Bash", response_content="ok-result")
-    ctx, bag = _make_helpers_ctx()
+    ctx, state = _make_run_ctx()
 
-    dispatcher_boom = _build_dispatcher([boom])
+    dispatcher_down = _build_dispatcher([_down_tool()], classifier=_DOWN)
     for _ in range(3):
         await _drain(
-            dispatcher_boom, tool_call=ToolCall(name="Bash", arguments={}), ctx=ctx
+            dispatcher_down, tool_call=ToolCall(name="Bash", arguments={}), ctx=ctx
         )
-    # Signal armed by the 3rd failure.
-    assert bag.get("tool_dispatch.sandbox_down_injection_pending") is True
+    assert state.transport_down_injection_pending is True
 
-    # Successful call wipes both states.
-    dispatcher_ok = _build_dispatcher([ok])
+    dispatcher_ok = _build_dispatcher([ok], classifier=_DOWN)
     _events, outcome = await _drain(
         dispatcher_ok, tool_call=ToolCall(name="Bash", arguments={}), ctx=ctx
     )
     assert outcome.success is True
-    assert "tool_dispatch.sandbox_down_streak" not in bag
-    assert "tool_dispatch.sandbox_down_injection_pending" not in bag
+    assert state.transport_down is None
+    assert state.transport_down_injection_pending is False
 
-    # Failures resume at counter=1 — no signal yet.
-    dispatcher_boom_again = _build_dispatcher([boom])
+    dispatcher_down_again = _build_dispatcher([_down_tool()], classifier=_DOWN)
     await _drain(
-        dispatcher_boom_again, tool_call=ToolCall(name="Bash", arguments={}), ctx=ctx
+        dispatcher_down_again, tool_call=ToolCall(name="Bash", arguments={}), ctx=ctx
     )
-    state = bag.get("tool_dispatch.sandbox_down_streak")
-    assert isinstance(state, dict) and state["count"] == 1
-    assert bag.get("tool_dispatch.sandbox_down_injection_pending") is None
+    assert state.transport_down is not None and state.transport_down.count == 1
+    assert state.transport_down_injection_pending is False
 
 
 @pytest.mark.asyncio
-async def test_non_sandbox_error_breaks_sandbox_down_streak() -> None:
-    """A non-SANDBOX_DOWN error in the middle of a streak resets the
-    counter — only consecutive sandbox-down errors arm the signal.
+async def test_another_error_breaks_the_transport_down_streak() -> None:
+    """An error the host does not call transport-down resets the counter: only
+    a consecutive run of outages arms the signal.
     """
-    boom = MockTool(
-        tool_name="Bash",
-        raise_exception=RuntimeError("supervisor unreachable after respawn"),
-    )
     other = MockTool(
         tool_name="Bash",
         raise_exception=RuntimeError("validation error: missing field 'path'"),
     )
-    ctx, bag = _make_helpers_ctx()
 
-    dispatcher_boom = _build_dispatcher([boom])
+    class _OnlyTheOutage:
+        """A host that calls exactly one of these two failures an outage."""
+
+        def classify_error_text(
+            self, message: str, *, tool_name: str | None = None
+        ) -> ResilienceErrorClass | None:
+            if "the far side is gone" in message:
+                return ResilienceErrorClass.transient_retryable
+            return None
+
+    classifier = _OnlyTheOutage()
+    ctx, state = _make_run_ctx()
+
+    dispatcher_down = _build_dispatcher([_down_tool()], classifier=classifier)
     for _ in range(2):
-        await _drain(dispatcher_boom, tool_call=ToolCall(name="Bash", arguments={}), ctx=ctx)
-    state = bag.get("tool_dispatch.sandbox_down_streak")
-    assert isinstance(state, dict) and state["count"] == 2
+        await _drain(
+            dispatcher_down, tool_call=ToolCall(name="Bash", arguments={}), ctx=ctx
+        )
+    assert state.transport_down is not None and state.transport_down.count == 2
 
-    # Non-sandbox error breaks the streak.
-    dispatcher_other = _build_dispatcher([other])
+    dispatcher_other = _build_dispatcher([other], classifier=classifier)
     await _drain(dispatcher_other, tool_call=ToolCall(name="Bash", arguments={}), ctx=ctx)
-    assert "tool_dispatch.sandbox_down_streak" not in bag
+    assert state.transport_down is None
 
-    # Sandbox failures restart at 1; need 3 more to arm signal.
-    dispatcher_boom_again = _build_dispatcher([boom])
+    dispatcher_down_again = _build_dispatcher([_down_tool()], classifier=classifier)
     for _ in range(2):
-        await _drain(dispatcher_boom_again, tool_call=ToolCall(name="Bash", arguments={}), ctx=ctx)
-    assert bag.get("tool_dispatch.sandbox_down_injection_pending") is None
-    await _drain(dispatcher_boom_again, tool_call=ToolCall(name="Bash", arguments={}), ctx=ctx)
-    assert bag.get("tool_dispatch.sandbox_down_injection_pending") is True
+        await _drain(
+            dispatcher_down_again, tool_call=ToolCall(name="Bash", arguments={}), ctx=ctx
+        )
+    assert state.transport_down_injection_pending is False
+    await _drain(
+        dispatcher_down_again, tool_call=ToolCall(name="Bash", arguments={}), ctx=ctx
+    )
+    assert state.transport_down_injection_pending is True
 
 
 @pytest.mark.asyncio
-async def test_sandbox_down_threshold_rc_override() -> None:
-    """RC override ``sandbox_down_system_message_threshold=2`` fires the
-    injection signal earlier.
-    """
-    rc = RuntimeConstants(sandbox_down_system_message_threshold=2)
-    tool = MockTool(
-        tool_name="Bash",
-        raise_exception=RuntimeError("supervisor unreachable after respawn"),
-    )
-    dispatcher = _build_dispatcher([tool])
-    ctx, bag = _make_helpers_ctx(helpers={"rc": rc})
+async def test_transport_down_threshold_rc_override() -> None:
+    """An override on the threshold fires the injection signal earlier."""
+    rc = LoopConstants(sandbox_down_system_message_threshold=2)
+    dispatcher = _build_dispatcher([_down_tool()], classifier=_DOWN)
+    ctx, state = _make_run_ctx(rc=rc)
 
-    # 1st failure — no signal yet.
     await _drain(dispatcher, tool_call=ToolCall(name="Bash", arguments={}), ctx=ctx)
-    assert bag.get("tool_dispatch.sandbox_down_injection_pending") is None
+    assert state.transport_down_injection_pending is False
 
-    # 2nd failure — at threshold, signal armed.
     await _drain(dispatcher, tool_call=ToolCall(name="Bash", arguments={}), ctx=ctx)
-    assert bag.get("tool_dispatch.sandbox_down_injection_pending") is True
+    assert state.transport_down_injection_pending is True
 
 
-def test_consume_sandbox_down_injection_signal_no_bag() -> None:
-    """Defensive: a ToolContext without a helper bag returns False without
-    raising. Legacy / test contexts must not break when probing for the
-    signal.
+def test_consume_transport_down_signal_without_run_state() -> None:
+    """Defensive: a ToolContext carrying no run state returns False without
+    raising. A context built outside a run must not break when probed.
     """
     bare_ctx = ToolContext(
         tenant_id="tenant-bare",
         run_id="run-bare",
         session_id="sess-bare",
     )
-    assert ToolDispatcher._consume_sandbox_down_injection_signal(bare_ctx) is False
+    assert ToolDispatcher._consume_transport_down_injection_signal(bare_ctx) is False
 
 
 def test_public_consume_signal_helper_function() -> None:
-    """Public :func:`consume_sandbox_down_injection_signal` mirrors the
-    classmethod path. The host code calls the public helper directly
-    against the per-run helper bag (it does not hold a ToolContext).
+    """Public :func:`consume_transport_down_injection_signal` mirrors the
+    classmethod path. The loop driving a run calls the public function directly
+    against the run's state (it does not hold a ToolContext).
     """
-    bag: dict[str, Any] = {}
-    # Empty bag → no signal.
-    assert consume_sandbox_down_injection_signal(bag) is False
-    # None bag → no signal.
-    assert consume_sandbox_down_injection_signal(None) is False
-    # Armed signal → consumed once, then absent.
-    bag["tool_dispatch.sandbox_down_injection_pending"] = True
-    assert consume_sandbox_down_injection_signal(bag) is True
-    assert consume_sandbox_down_injection_signal(bag) is False
+    state = RunScopedState()
+    # Nothing raised → no signal.
+    assert consume_transport_down_injection_signal(state) is False
+    # No state at all → no signal.
+    assert consume_transport_down_injection_signal(None) is False
+    # Raised signal → consumed once, then gone.
+    state.transport_down_injection_pending = True
+    assert consume_transport_down_injection_signal(state) is True
+    assert consume_transport_down_injection_signal(state) is False
 
 
 @pytest.mark.asyncio
-async def test_generic_cap_independent_of_sandbox_down_threshold() -> None:
-    """The new SANDBOX_DOWN counter is INDEPENDENT of the generic
+async def test_generic_cap_independent_of_transport_down_threshold() -> None:
+    """The transport-down counter is INDEPENDENT of the generic
     consecutive-error cap. With default cap=4 and default threshold=3, the
     injection signal fires on the 3rd error but the cap rewrite still fires
     on the 4th (not earlier).
     """
-    tool = MockTool(
-        tool_name="Bash",
-        raise_exception=RuntimeError("supervisor unreachable after respawn"),
-    )
-    dispatcher = _build_dispatcher([tool])
-    ctx, bag = _make_helpers_ctx()
+    dispatcher = _build_dispatcher([_down_tool()], classifier=_DOWN)
+    ctx, state = _make_run_ctx()
 
-    # First 3 errors: 3rd arms signal but kind stays execution (cap=4).
     for i in range(3):
         _events, outcome = await _drain(
             dispatcher, tool_call=ToolCall(name="Bash", arguments={}), ctx=ctx
@@ -1279,324 +1029,42 @@ async def test_generic_cap_independent_of_sandbox_down_threshold() -> None:
         assert outcome.error_kind is DispatchErrorKind.execution, (
             f"attempt {i + 1}: kind must stay execution, got {outcome.error_kind}"
         )
-    assert bag.get("tool_dispatch.sandbox_down_injection_pending") is True
+    assert state.transport_down_injection_pending is True
 
-    # 4th error: cap rewrite fires (kind=consecutive_error_cap).
     _events, outcome = await _drain(
         dispatcher, tool_call=ToolCall(name="Bash", arguments={}), ctx=ctx
     )
     assert outcome.error_kind is DispatchErrorKind.consecutive_error_cap
 
 
-# ----------------------------------------------------------------------
-# typed capacity exhaustion canonicalises to SANDBOX_DOWN
-# ----------------------------------------------------------------------
-#
-# Tenant sandbox capacity exhaustion was found to be the largest residual
-# failure cluster. The pre-fix ``_SANDBOX_DOWN_PATTERNS`` regex covered every
-# supervisor/provision/readiness failure shape but did NOT recognise the
-# capacity wording emitted by ``SandboxCapacityExhausted`` (raw) or the
-# bash.py wrapper. As a result, the SANDBOX_DOWN canonical signature never
-# fired for typed admission denials, the inline-strategy nudge never fired,
-# and the model burned 4-25 Bash retries against admission saying
-# ``retry_after=5s`` until the run hit its turn budget.
-#
-# These tests pin both real emit-site phrasings to the canonical signature
-# AND end-to-end check that three capacity-blocked Bash calls arm the
-# SANDBOX_DOWN inline-strategy injection (default threshold=3) so
-# the host loop can post the "use Write without Bash" nudge.
-
-
-def test_capacity_exhausted_raw_collapses_to_sandbox_down() -> None:
-    """Raw :class:`SandboxCapacityExhausted` detail wording.
-
-    Emit site: the sandbox admission limiter
-    → ``f"sandbox capacity exhausted (tenant_id={tenant_id}, "
-        f"dimension={quota_dimension}, retry_after={retry_after_seconds}s)"``.
-
-    This phrasing is what callers of the underlying
-    :func:`AdmissionLimiter.try_reserve` would see if they unwrapped the
-    exception detail directly.
-    """
-    sig = ToolDispatcher._error_signature(
-        DispatchErrorKind.execution,
-        "sandbox capacity exhausted (tenant_id=demo, dimension=cpu, "
-        "retry_after=5s)",
-        "Bash",
-    )
-    assert sig == "Bash:SANDBOX_DOWN"
-
-
-def test_capacity_exhausted_bash_wrapper_collapses_to_sandbox_down() -> None:
-    """User-visible Bash-tool wrapper around :class:`SandboxCapacityExhausted`.
-
-    Emit site: the Bash tool →
-    ``"Sandbox temporarily unavailable, will retry. Reason: capacity
-    exhausted (dimension={dim}, retry_after={n}s)"``.
-
-    This is the phrasing the dispatcher actually sees on every typed capacity
-    denial — Bash is the only tool that surfaces capacity to the model.
-    """
-    sig = ToolDispatcher._error_signature(
-        DispatchErrorKind.execution,
-        "Sandbox temporarily unavailable, will retry. Reason: "
-        "capacity exhausted (dimension=cpu, retry_after=5s)",
-        "Bash",
-    )
-    assert sig == "Bash:SANDBOX_DOWN"
-
-
-def test_capacity_exhausted_alternate_dimension_still_collapses() -> None:
-    """Different ``dimension=`` values (cpu / memory / pods) must NOT
-    diversify the signature — capacity is capacity regardless of which
-    quota dimension is currently saturated. The canonical match wins on
-    ``capacity\\s+exhausted`` alone.
-    """
-    sig_cpu = ToolDispatcher._error_signature(
-        DispatchErrorKind.execution,
-        "Sandbox temporarily unavailable, will retry. Reason: "
-        "capacity exhausted (dimension=cpu, retry_after=5s)",
-        "Bash",
-    )
-    sig_mem = ToolDispatcher._error_signature(
-        DispatchErrorKind.execution,
-        "Sandbox temporarily unavailable, will retry. Reason: "
-        "capacity exhausted (dimension=memory, retry_after=5s)",
-        "Bash",
-    )
-    sig_pods = ToolDispatcher._error_signature(
-        DispatchErrorKind.execution,
-        "Sandbox temporarily unavailable, will retry. Reason: "
-        "capacity exhausted (dimension=pods, retry_after=5s)",
-        "Bash",
-    )
-    assert sig_cpu == sig_mem == sig_pods == "Bash:SANDBOX_DOWN"
-
-
-def test_capacity_exhausted_varying_retry_after_collapses() -> None:
-    """Different ``retry_after=`` durations must NOT diversify the signature.
-
-    Defends against the existing ``_NUMBER_RE`` hash-path masking the durations
-    only when the canonical match fails — we want the canonical match itself
-    to swallow varying retry_after seconds.
-    """
-    sigs = {
-        ToolDispatcher._error_signature(
-            DispatchErrorKind.execution,
-            f"Sandbox temporarily unavailable, will retry. Reason: "
-            f"capacity exhausted (dimension=cpu, retry_after={n}s)",
-            "Bash",
-        )
-        for n in (1, 5, 10, 30, 60)
-    }
-    assert sigs == {"Bash:SANDBOX_DOWN"}, sigs
-
-
-def test_capacity_pattern_does_not_falsely_match_unrelated_capacity() -> None:
-    """Regression guard: ``capacity\\s+exhausted`` must be specific enough that
-    unrelated 'capacity' words in tool output don't trigger SANDBOX_DOWN.
-
-    A free-form 'disk capacity exceeded' or 'engine at capacity' from a
-    different tool should NOT collapse to the sandbox-down canonical.
-    """
-    # Different phrasing — 'capacity exceeded', NOT 'capacity exhausted'.
-    sig1 = ToolDispatcher._error_signature(
-        DispatchErrorKind.execution,
-        "disk capacity exceeded: 100 GiB",
-        "Bash",
-    )
-    assert sig1 != "Bash:SANDBOX_DOWN"
-
-    # 'at capacity' — different word order, must not match.
-    sig2 = ToolDispatcher._error_signature(
-        DispatchErrorKind.execution,
-        "ML engine reports it is at capacity right now",
-        "Bash",
-    )
-    assert sig2 != "Bash:SANDBOX_DOWN"
-
-
-def test_capacity_pattern_applies_to_any_sandboxed_tool() -> None:
-    """Capacity admission denial can theoretically surface from any tool
-    that goes through ``SandboxManager.dispatch``. The canonical match keys
-    on tool name (so the cap counter is per-tool) but the pattern itself
-    fires regardless of which tool emitted the failure.
-
-    Today only Bash surfaces capacity in practice, but the regex must not
-    be Bash-specific — a future Read/Write/Edit sandbox path would surface
-    the same wrapper, and the inline-strategy nudge should still fire.
-    """
-    bash_sig = ToolDispatcher._error_signature(
-        DispatchErrorKind.execution,
-        "Sandbox temporarily unavailable, will retry. Reason: "
-        "capacity exhausted (dimension=cpu, retry_after=5s)",
-        "Bash",
-    )
-    other_sig = ToolDispatcher._error_signature(
-        DispatchErrorKind.execution,
-        "Sandbox temporarily unavailable, will retry. Reason: "
-        "capacity exhausted (dimension=cpu, retry_after=5s)",
-        "Read",
-    )
-    assert bash_sig == "Bash:SANDBOX_DOWN"
-    assert other_sig == "Read:SANDBOX_DOWN"
-
-
-def test_capacity_and_supervisor_down_collapse_to_same_canonical() -> None:
-    """Cross-cluster check: capacity-exhausted Bash retries followed by
-    supervisor-unreachable Bash retries all share the canonical
-    ``Bash:SANDBOX_DOWN`` signature so the cap streak does not split between
-    them. Important when a tenant hits capacity, supervisor crash-loops, then
-    capacity re-saturates — the model should see one continuous nudge stream,
-    not three independent ones.
-    """
-    msgs = [
-        # Capacity wrapper from bash.py.
-        "Sandbox temporarily unavailable, will retry. Reason: "
-        "capacity exhausted (dimension=cpu, retry_after=5s)",
-        # Raw capacity detail from errors.py.
-        "sandbox capacity exhausted (tenant_id=demo, dimension=memory, "
-        "retry_after=5s)",
-        # Existing supervisor-down forms (regression guards).
-        "sandbox dispatch failed: supervisor /exec returned 502",
-        "supervisor at http://10.0.0.1:9292 unreachable: "
-        "All connection attempts failed",
-        "tenant namespace provision failed: api server unreachable",
-    ]
-    sigs = {
-        ToolDispatcher._error_signature(DispatchErrorKind.execution, m, "Bash")
-        for m in msgs
-    }
-    assert sigs == {"Bash:SANDBOX_DOWN"}, sigs
-
-
 @pytest.mark.asyncio
-async def test_capacity_exhausted_arms_inline_strategy_at_threshold() -> None:
-    """to-end: three consecutive capacity-exhausted
-    Bash failures arm the SANDBOX_DOWN inline-strategy injection signal.
-
-    This is the user-visible deliverable: before the fix the bash.py
-    capacity wording never matched ``_SANDBOX_DOWN_PATTERNS`` so the
-    signature hashed to a random value, the streak counter never aligned,
-    and the inline-strategy nudge never armed even after 25+ retries.
-    After the fix, the same three retries collapse to ``Bash:SANDBOX_DOWN``
-    and the default ``sandbox_down_system_message_threshold=3`` arms the
-    signal on the 3rd capacity-blocked call.
+async def test_mixed_transport_down_classes_keep_one_streak_alive() -> None:
+    """A run that is refused for one reason and then unreachable for another
+    is one outage to the model, and must arm the nudge at the threshold rather
+    than restarting the count at each change of reason.
     """
-    tool = MockTool(
-        tool_name="Bash",
-        raise_exception=RuntimeError(
-            "Sandbox temporarily unavailable, will retry. Reason: "
-            "capacity exhausted (dimension=cpu, retry_after=5s)"
-        ),
-    )
-    dispatcher = _build_dispatcher([tool])
-    ctx, bag = _make_helpers_ctx()
 
-    # First two failures — streak builds but no signal yet.
-    for i in range(2):
-        await _drain(
-            dispatcher, tool_call=ToolCall(name="Bash", arguments={}), ctx=ctx
-        )
-        assert bag.get("tool_dispatch.sandbox_down_injection_pending") is None, (
-            f"signal armed too early at attempt {i + 1}"
-        )
+    class _Alternating:
+        def __init__(self) -> None:
+            self.calls = 0
 
-    # Third capacity-blocked failure — signal armed (threshold=3).
-    await _drain(
-        dispatcher, tool_call=ToolCall(name="Bash", arguments={}), ctx=ctx
-    )
-    assert bag.get("tool_dispatch.sandbox_down_injection_pending") is True
-    state = bag.get("tool_dispatch.sandbox_down_streak")
-    assert isinstance(state, dict) and state["count"] == 3
-    assert state["signature"] == "Bash:SANDBOX_DOWN"
+        def classify_error_text(
+            self, message: str, *, tool_name: str | None = None
+        ) -> ResilienceErrorClass | None:
+            self.calls += 1
+            return (
+                ResilienceErrorClass.rate_limited
+                if self.calls % 2
+                else ResilienceErrorClass.transient_retryable
+            )
 
+    dispatcher = _build_dispatcher([_down_tool()], classifier=_Alternating())
+    ctx, state = _make_run_ctx()
+    for _ in range(3):
+        await _drain(dispatcher, tool_call=ToolCall(name="Bash", arguments={}), ctx=ctx)
+    assert state.transport_down is not None and state.transport_down.count == 3
+    assert state.transport_down_injection_pending is True
 
-@pytest.mark.asyncio
-async def test_mixed_capacity_and_supervisor_keep_streak_alive() -> None:
-    """A run that alternates between capacity admission denial and
-    supervisor-unreachable Bash retries must NOT reset the SANDBOX_DOWN
-    streak — both surface as canonical SANDBOX_DOWN so the cap accumulates
-    correctly. The inline-strategy nudge should still arm at threshold=3.
-
-    This matches a realistic eval failure where a tenant first hits capacity,
-    spawns a fresh pod when quota releases, the new pod's supervisor isn't
-    ready yet, then capacity refills before the next attempt.
-    """
-    capacity_tool = MockTool(
-        tool_name="Bash",
-        raise_exception=RuntimeError(
-            "Sandbox temporarily unavailable, will retry. Reason: "
-            "capacity exhausted (dimension=cpu, retry_after=5s)"
-        ),
-    )
-    supervisor_tool = MockTool(
-        tool_name="Bash",
-        raise_exception=RuntimeError(
-            "supervisor at http://10.0.0.1:9292 unreachable: "
-            "All connection attempts failed"
-        ),
-    )
-    ctx, bag = _make_helpers_ctx()
-
-    # Pattern: capacity → supervisor → capacity. All collapse to the same
-    # ``Bash:SANDBOX_DOWN`` signature, so the streak hits count=3.
-    await _drain(
-        _build_dispatcher([capacity_tool]),
-        tool_call=ToolCall(name="Bash", arguments={}),
-        ctx=ctx,
-    )
-    await _drain(
-        _build_dispatcher([supervisor_tool]),
-        tool_call=ToolCall(name="Bash", arguments={}),
-        ctx=ctx,
-    )
-    await _drain(
-        _build_dispatcher([capacity_tool]),
-        tool_call=ToolCall(name="Bash", arguments={}),
-        ctx=ctx,
-    )
-
-    state = bag.get("tool_dispatch.sandbox_down_streak")
-    assert isinstance(state, dict) and state["count"] == 3, (
-        f"mixed capacity/supervisor streak must build to 3, got {state}"
-    )
-    assert bag.get("tool_dispatch.sandbox_down_injection_pending") is True
-
-
-def test_existing_supervisor_patterns_still_match() -> None:
-    """Regression guard for the original ``_SANDBOX_DOWN_PATTERNS`` set —
-    capacity wording was added later but must NOT regress any of the
-    pre-existing supervisor/provision/readiness phrasings.
-
-    Re-pins each emit site to lock in zero-regression for the existing
-    14 patterns.
-    """
-    pre_existing_msgs = [
-        "SandboxUnreachable: pod xyz not ready",
-        "supervisor /exec returned 502 Bad Gateway",
-        "supervisor /bind returned 503",
-        "supervisor /exec unexpected 418: teapot",
-        "supervisor /exec timed out at https://pod.local",
-        "supervisor at https://sandbox.local unreachable: connection timeout",
-        "supervisor auth failed: 401 Unauthorized",
-        "supervisor rejected auth header at /exec",
-        "supervisor 502 retry exhausted",
-        "sandbox provision failed: quota exceeded",
-        "sandbox readiness failed after pod create: 30s timeout",
-        "sandbox registration failed after pod create: redis connection lost",
-        "sandbox cache update failed after pod create: x",
-        "sandbox dispatch failed: opaque downstream",
-        "tenant namespace provision failed: api server unreachable",
-        "sandbox session not active for this run",
-        "exec failed: connection refused",
-        "exec failed: pod not ready",
-    ]
-    sigs = {
-        ToolDispatcher._error_signature(DispatchErrorKind.execution, m, "Bash")
-        for m in pre_existing_msgs
-    }
-    assert sigs == {"Bash:SANDBOX_DOWN"}, sigs
 
 
 # ----------------------------------------------------------------------
@@ -1626,7 +1094,7 @@ async def test_structured_error_forwarded_to_outcome_metadata() -> None:
     ``finalization_recommended`` instead of seeing only an opaque error)."""
     tool = MockTool(tool_name="Boom", raise_exception=_StructuredErrorExc())
     dispatcher = _build_dispatcher([tool])
-    ctx, _ = _make_helpers_ctx()
+    ctx, _ = _make_run_ctx()
 
     _events, outcome = await _drain(
         dispatcher, tool_call=ToolCall(name="Boom", arguments={}), ctx=ctx
@@ -1647,7 +1115,7 @@ async def test_plain_exception_has_no_structured_error_key() -> None:
     bit-identical — the new key is absent (generic, opt-in)."""
     tool = MockTool(tool_name="Boom", raise_exception=RuntimeError("kaboom"))
     dispatcher = _build_dispatcher([tool])
-    ctx, _ = _make_helpers_ctx()
+    ctx, _ = _make_run_ctx()
 
     _events, outcome = await _drain(
         dispatcher, tool_call=ToolCall(name="Boom", arguments={}), ctx=ctx

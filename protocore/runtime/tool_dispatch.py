@@ -20,13 +20,11 @@ emitting it. Concerns:
  ``tool_use_stop`` / ``tool_use_input_delta`` — those are LLM-stream
  events already produced by the assistant-message stream in
  :func:`protocore.runtime.query._stream_one_assistant_message`.
- **Does NOT emit** ``sandbox_starting`` — per
- ``,
- the sandbox adapter owns this event entirely. The adapter emits it
- only on **cold start** (with the rich payload including ``reason``,
- ``namespace``, ``pod_id``, ``sandbox_profile``); on hot-pod dispatch
- no event is emitted. The core dispatcher cannot distinguish hot from
- cold, so any emission here would be misleading double-emit noise.
+ **Does NOT emit** ``tool_transport_starting`` — the host's
+ transport owns that event entirely, and emits it only on **cold
+ start**, with a payload naming the transport and describing how it
+ was brought up. The dispatcher here cannot tell a cold start from a
+ warm one, so any emission of its own would be double-emit noise.
 * ``PostToolUse`` hook — fire-and-await; may rewrite the output.
 
 The dispatcher is **agnostic to the tool implementation** — it depends
@@ -36,7 +34,7 @@ required.
 
 Output: every dispatch yields a stream of :class:`TurnEvent` envelopes
 AND returns a final :class:`DispatchOutcome` summarising the call.
-The caller (``query``) forwards events to the SSE stream and uses the
+The caller (the turn driver) forwards events to the SSE stream and uses the
 outcome to mutate engine state (append tool result to history,
 transition to ``AWAITING`` on approval).
 """
@@ -48,20 +46,47 @@ import contextlib
 import hashlib
 import json
 import re
-from collections.abc import AsyncIterator, Callable, Iterable, Mapping, MutableMapping
+from collections.abc import (
+    AsyncIterator,
+    Awaitable,
+    Callable,
+    Iterable,
+    Mapping,
+)
 from dataclasses import dataclass
 from enum import StrEnum
 from typing import Any, Final
 
 from protocore.constants import MAX_DATA_NESTING_DEPTH
+from protocore.contracts.evidence import (
+    EvidenceProducerBinding,
+    EvidenceRecord,
+    ToolEvidenceContext,
+)
 from protocore.contracts.hooks import HookActionKind, IHookManager
+from protocore.contracts.middleware import (
+    ILifecycleRegistry,
+    LifecycleContext,
+    LifecycleVerdict,
+)
+from protocore.contracts.resilience import (
+    TRANSPORT_DOWN_ERROR_CLASSES,
+    IResilienceClassifier,
+)
 from protocore.contracts.run import IRunToolErrorCounter
+from protocore.contracts.run_state import (
+    ConsecutiveErrorStreak,
+    RunScopedState,
+    SignatureStreak,
+    ToolStreak,
+)
 from protocore.contracts.tool_registry import (
     TOOL_VISIBILITY_POLICY_METADATA_KEY,
     IToolRegistry,
     ToolVisibilityPolicy,
 )
-from protocore.contracts.tools import ToolContext, ToolPolicyDenied
+from protocore.contracts.tool_roles import EMPTY_TOOL_ROLE_MAP, ToolRole, ToolRoleMap
+from protocore.contracts.tools import ToolContext, ToolPolicyDenied, copy_metadata
 from protocore.contracts.types import (
     TOOL_RESULT_CONSECUTIVE_CAP_ELIGIBLE_METADATA_KEY,
     TOOL_RESULT_COUNT_AS_ERROR_METADATA_KEY,
@@ -69,10 +94,8 @@ from protocore.contracts.types import (
     ToolCall,
     ToolResult,
 )
-from protocore.contracts.verification import EvidenceProducerBinding, EvidenceRecord
 from protocore.logging_utils import get_logger
 from protocore.runtime.events import EventType, TurnEvent
-from protocore.runtime.run_work_budget import RUN_WORK_LEDGER_HELPER_KEY
 from protocore.runtime.tool_permission import (
     PermissionStage,
     ToolPermissionDecision,
@@ -81,13 +104,20 @@ from protocore.runtime.tool_permission import (
 )
 from protocore.runtime.tool_preconditions import (
     check_preconditions,
-    load_satisfied_set,
     record_satisfaction,
-    store_satisfied_set,
 )
 from protocore.tools.ask_user import AskUserPauseRequested
 
 _logger = get_logger(__name__)
+
+
+def _admission_deferred(ctx: ToolContext) -> bool:
+    """Whether a parallel replay, rather than this dispatch, admits evidence.
+
+    An invocation carrying no evidence context defers nothing: it produces no
+    evidence, so there is nothing for a replay to order.
+    """
+    return ctx.evidence is not None and ctx.evidence.admission_deferred
 
 
 def _metadata_flag(
@@ -109,12 +139,29 @@ def _metadata_flag(
     return default
 
 
-def _helpers_of(ctx: ToolContext) -> dict[str, Any] | None:
-    metadata = ctx.metadata or {}
-    raw = metadata.get("protocore.helpers")
-    if isinstance(raw, dict):
-        return raw
-    return None
+def _resolve_max_data_nesting_depth(ctx: ToolContext) -> int:
+    """The depth a tool-call payload may nest to before the call is refused.
+
+    Read from the run's constants where it carries them, so an operator can
+    raise it for a workload with genuinely deep payloads. A run without
+    constants falls back to the structural floor the pure contract validators
+    and JSON utilities use, which is this field's own default.
+    """
+    raw = getattr(_run_constants(ctx), "max_data_nesting_depth", None)
+    if isinstance(raw, bool) or not isinstance(raw, int) or raw <= 0:
+        return MAX_DATA_NESTING_DEPTH
+    return raw
+
+
+def _run_constants(ctx: ToolContext) -> Any | None:
+    """The constants snapshot this run resolved, when it carries one.
+
+    Duck-typed on purpose: every caller reads one named field off it with a
+    defensive default, so a run wired without constants still dispatches under
+    the module's own fallbacks rather than refusing to run.
+    """
+    state = ctx.run_state
+    return None if state is None else state.rc
 
 
 def _coerce_non_negative_int(value: Any) -> int | None:
@@ -169,27 +216,19 @@ class ToolDispatchCancelled(asyncio.CancelledError):
 
 
 def _run_cancel_event(ctx: ToolContext) -> asyncio.Event | None:
-    """Duck-typed read of the per-run cancel ``asyncio.Event`` from the bag.
+    """The per-run cancel event, when this run carries one.
 
-    Returns the Event ONLY when the helper bag carries a real, already-bound
-    :class:`asyncio.Event` under :data:`HELPER_RUN_CANCEL_EVENT_KEY`. Any other
-    shape (absent key / wrong type — older callers, unit tests) returns ``None``
-    so the dispatcher keeps its pre-#6 ``await asyncio.wait_for`` path
-    byte-identical. One field, one read.
+    A run wired without one (a tool invoked outside a run, a focused fixture)
+    returns ``None`` and the dispatcher keeps its plain ``asyncio.wait_for``
+    path. One field, one read.
     """
-    helpers = _helpers_of(ctx)
-    if helpers is None:
-        return None
-    candidate = helpers.get(HELPER_RUN_CANCEL_EVENT_KEY)
-    if isinstance(candidate, asyncio.Event):
-        return candidate
-    return None
+    state = ctx.run_state
+    return None if state is None else state.cancel_event
 
 
 def _tool_cancel_drain_seconds(ctx: ToolContext) -> float:
     """Bounded drain budget for a cancelled in-flight tool task (RC-driven)."""
-    helpers = _helpers_of(ctx)
-    rc = helpers.get("rc") if isinstance(helpers, dict) else None
+    rc = _run_constants(ctx)
     drain = getattr(rc, "tool_cancel_drain_seconds", None)
     if isinstance(drain, bool) or not isinstance(drain, (int, float)):
         return _TOOL_CANCEL_DRAIN_FALLBACK_SECONDS
@@ -291,37 +330,28 @@ async def _record_tool_call_soft_cap_warning(
 ) -> dict[str, Any] | None:
     """Increment the optional subagent soft-cap counter and return a warning.
 
-    The counter is scoped to the engine helper bag, so the host child engines
-    get one isolated count set per subagent run. A cap of 0 means unlimited.
-    The warning is advisory only: the caller annotates the already-produced
-    tool result and never alters dispatch success/error semantics.
+    The counts live on the run's own state, so a child run gets one isolated
+    set per subagent run. A cap of 0 means unlimited. The warning is advisory
+    only: the caller annotates the already-produced tool result and never alters
+    dispatch success/error semantics.
     """
-    helpers = _helpers_of(ctx)
-    if helpers is None:
+    state = ctx.run_state
+    if state is None:
         return None
-    raw_limits = helpers.get(TOOL_CALL_SOFT_CAPS_HELPER_KEY)
-    if not isinstance(raw_limits, dict):
-        return None
-    limit = _coerce_non_negative_int(raw_limits.get(tool_name))
+    limit = _coerce_non_negative_int(state.tool_call_soft_caps.get(tool_name))
     if limit is None or limit == 0:
         return None
 
-    raw_state = helpers.get(TOOL_CALL_SOFT_CAP_STATE_HELPER_KEY)
-    if not isinstance(raw_state, dict):
-        raw_state = {}
-        helpers[TOOL_CALL_SOFT_CAP_STATE_HELPER_KEY] = raw_state
-
-    lock = raw_state.get(_TOOL_CALL_SOFT_CAP_LOCK_KEY)
+    cap_state = state.tool_call_soft_cap_state
+    lock = cap_state.lock
     if lock is None:
-        lock = helpers.get(_TOOL_SHARED_STATE_LOCK_HELPER_KEY)
+        lock = state.tool_shared_state_lock
     if lock is None or not hasattr(lock, "__aenter__"):
         lock = asyncio.Lock()
-    raw_state[_TOOL_CALL_SOFT_CAP_LOCK_KEY] = lock
+    cap_state.lock = lock
 
     async with lock:
-        raw_counts = raw_state.setdefault(_TOOL_CALL_SOFT_CAP_COUNTS_KEY, {})
-        counts = raw_counts if isinstance(raw_counts, dict) else {}
-        raw_state[_TOOL_CALL_SOFT_CAP_COUNTS_KEY] = counts
+        counts = cap_state.counts
         count = _coerce_non_negative_int(counts.get(tool_name)) or 0
         count += 1
         counts[tool_name] = count
@@ -349,10 +379,7 @@ async def _record_tool_call_soft_cap_warning(
             "status": status,
             "message": message,
         }
-        raw_warnings = raw_state.setdefault(_TOOL_CALL_SOFT_CAP_WARNINGS_KEY, [])
-        warnings = raw_warnings if isinstance(raw_warnings, list) else []
-        raw_state[_TOOL_CALL_SOFT_CAP_WARNINGS_KEY] = warnings
-        warnings.append(dict(warning))
+        cap_state.warnings.append(dict(warning))
         return warning
 
 
@@ -420,68 +447,57 @@ def _annotate_tool_result_event(
 # Consecutive same-tool-same-error cap.
 # Research found the leader can retry an IDENTICAL failed tool call up to
 # 200 times (docgen-en-005, long-en-004 Write storms). The dispatcher tracks
-# a single per-run streak on the helper bag (`protocore.helpers`); when the
+# a single per-run streak on the run's state; when the
 # (tool_name, signature) tuple repeats more times than the RC cap, the next
 # error is rewritten with the `consecutive_error_cap` kind so the model sees
 # a distinct stop signal instead of looping. Streak resets on (a) a different
 # (tool, signature) tuple or (b) a successful tool call.
-_CONSECUTIVE_ERROR_STATE_KEY: str = "tool_dispatch.consecutive_error_state"
-
-# Fallback default when no RC is wired into the helper bag (test fixtures /
+# Fallback default when the run carries no constants (test fixtures /
 # legacy dispatch paths). Mirrors the executor's defensive ``getattr`` pattern
 # for the analogous ``max_ask_user_calls_per_run``.
 _DEFAULT_CONSECUTIVE_ERROR_CAP: int = 4
 
-# Subagent tool-call soft caps. The host injects these helper-bag entries only
-# for child/subagent runs; core treats them as an optional diagnostics layer
-# above normal dispatch and never gates tool execution.
-TOOL_CALL_SOFT_CAPS_HELPER_KEY: str = "subagent_tool_call_soft_caps"
-TOOL_CALL_SOFT_CAP_STATE_HELPER_KEY: str = "subagent_tool_call_soft_cap_state"
+# Subagent tool-call soft caps. The host declares the limits on a child run's
+# state; core treats them as an optional diagnostics layer above normal dispatch
+# and never gates tool execution. These two name the fields on the tool result
+# that carry a warning back to the caller.
 TOOL_CALL_SOFT_CAP_METADATA_KEY: str = "tool_call_soft_cap"
 TOOL_CALL_SOFT_CAP_WARNINGS_METADATA_KEY: str = "tool_call_soft_cap_warnings"
 
-_TOOL_SHARED_STATE_LOCK_HELPER_KEY: str = "tool_shared_state_lock"
-_TOOL_CALL_SOFT_CAP_COUNTS_KEY: str = "counts"
-_TOOL_CALL_SOFT_CAP_WARNINGS_KEY: str = "warnings"
-_TOOL_CALL_SOFT_CAP_LOCK_KEY: str = "lock"
-
-# SANDBOX_DOWN canonical-signature streak.
+# Transport-down canonical-signature streak.
 # Tracks a SEPARATE counter from the generic consecutive-error cap so the
 # threshold can fire earlier (default 3 vs cap default 4). When the streak
-# reaches ``RuntimeConstants.sandbox_down_system_message_threshold`` the
-# dispatcher posts a pending-injection signal on the helper bag for the
-# host's executor loop to consume — it appends a synthetic user-role
-# :class:`Message` instructing the agent to switch to inline (Write-only)
-# strategy. The signal is one-shot per streak: a successful tool call OR a
-# fresh non-SANDBOX_DOWN signature clears it. Observed prompts hitting
-# 38-46 errored Bash calls each against rotating supervisor IPs;
-# without the inline-strategy nudge the agent kept
-# retrying and consumed its full token budget without making progress.
-_SANDBOX_DOWN_STREAK_STATE_KEY: str = "tool_dispatch.sandbox_down_streak"
-_SANDBOX_DOWN_INJECTION_PENDING_KEY: str = "tool_dispatch.sandbox_down_injection_pending"
-_SANDBOX_DOWN_CANONICAL_SUFFIX: str = ":SANDBOX_DOWN"
+# reaches ``LoopConstants.sandbox_down_system_message_threshold`` the
+# dispatcher raises a one-shot signal on the run's state for the loop above
+# to consume — that loop appends a synthetic user-role :class:`Message`
+# telling the agent to work by another route while the transport is down.
+# One-shot per streak: a successful tool call OR a signature that is not a
+# transport-down one clears it. What the streak is for: a run can otherwise
+# spend its whole token budget retrying a tool whose way out is gone, dozens
+# of failed calls deep, because each failure looks new to a counter that
+# tells errors apart by their text.
+_TRANSPORT_DOWN_CANONICAL_SUFFIX: str = ":TRANSPORT_DOWN"
 
 # Fallback default when no RC is wired (test fixtures, legacy paths).
 # Mirrors :data:`_DEFAULT_CONSECUTIVE_ERROR_CAP` defensive pattern.
-_DEFAULT_SANDBOX_DOWN_THRESHOLD: int = 3
+_DEFAULT_TRANSPORT_DOWN_THRESHOLD: int = 3
 
 # Stabilization Pydantic ``string_type``
 # terminal streak. Tracks consecutive validation errors with
 # ``type=string_type`` on the SAME tool independently of the generic
 # consecutive-error cap so this failure mode can be tuned separately.
-# When the streak reaches ``RuntimeConstants.tool_dispatch_string_type_
+# When the streak reaches ``LoopConstants.tool_dispatch_string_type_
 # terminal_cap`` the dispatcher rewrites the next dispatch error to
 # ``DispatchErrorKind.consecutive_error_cap`` with a stronger terminal
 # guidance string (the model is told to stop retrying the same shape).
 # The streak resets on a successful tool call OR a fresh non-string_type
-# error signature, the same pattern as the SANDBOX_DOWN counter.
+# error signature, the same pattern as the transport-down counter.
 #
 # A host's own write/append/bash tools are expected to coerce the common
 # malformed shapes (list/dict instead of str) silently, so this guard is a
 # safety net for residual
 # cases (e.g. an uncoercible ``content=None`` or a future field that did
 # not get a coercion validator).
-_STRING_TYPE_STREAK_STATE_KEY: str = "tool_dispatch.string_type_streak"
 _STRING_TYPE_CANONICAL_MARKER: str = "string_type"
 
 # Fallback default when no RC is wired (test fixtures, legacy paths).
@@ -489,42 +505,6 @@ _STRING_TYPE_CANONICAL_MARKER: str = "string_type"
 # BEFORE the generic ``tool_dispatch_consecutive_error_cap`` (default 4)
 # wraps the error with vague guidance.
 _DEFAULT_STRING_TYPE_TERMINAL_CAP: int = 3
-
-#: The helper-bag entries this module keeps for the life of ONE run: the streaks
-#: whose caps are documented per-run, and the one-shot signal that goes with
-#: them. An engine that re-arms has to clear these, or the next turn opens with
-#: the previous turn's streak already counted and its one-shot already spent —
-#: an agent that repeats one failing call each turn would cross a per-run cap
-#: that no single turn ever reached.
-#:
-#: Everything else in the bag belongs to the host — the cancel event, the
-#: constants snapshot, the shared lock, the error counter, the soft-cap *limits*
-#: as opposed to their counts — and a re-arm must leave all of it alone.
-RUN_SCOPED_HELPER_KEYS: Final[frozenset[str]] = frozenset(
-    {
-        _CONSECUTIVE_ERROR_STATE_KEY,
-        _SANDBOX_DOWN_STREAK_STATE_KEY,
-        _SANDBOX_DOWN_INJECTION_PENDING_KEY,
-        _STRING_TYPE_STREAK_STATE_KEY,
-        TOOL_CALL_SOFT_CAP_STATE_HELPER_KEY,
-    }
-)
-
-
-def clear_run_scoped_helpers(helpers: Any) -> int:
-    """Drop this module's per-run cells from ``helpers``; return how many went.
-
-    Accepts anything so the caller does not have to know what the host put on
-    the engine: a bag that is not a mutable mapping simply has nothing to clear.
-    """
-    if not isinstance(helpers, MutableMapping):
-        return 0
-    removed = 0
-    for key in RUN_SCOPED_HELPER_KEYS:
-        if key in helpers:
-            del helpers[key]
-            removed += 1
-    return removed
 
 # Normalisation regexes — strip variable identifiers (uuid-shaped call ids,
 # absolute paths, line numbers, the dispatcher's own ``after Ns`` timeout
@@ -538,93 +518,30 @@ _HEX_TOKEN_RE = re.compile(r"\b[0-9a-fA-F]{16,}\b")
 _NUMBER_RE = re.compile(r"\b\d+\b")
 _TIMEOUT_DURATION_RE = re.compile(r"timed out after \d+s")
 
-# Broaden signature normalisation so transient sandbox-unreachable /
-# command-missing errors collapse to a single canonical signature regardless
-# of Bash command shape. The leader varies command text on retry (different
-# quoted strings, paths, regex snippets) so the (tool, signature) tuple kept
-# changing and the consecutive-error cap never fired on subagent-crash cases.
+# Broaden signature normalisation so a storm of failures against one
+# unreachable transport collapses to a single canonical signature regardless
+# of the arguments the model varied on retry. The model changes command text
+# between attempts (different quoted strings, paths, regex snippets), so the
+# (tool, signature) tuple kept changing and the consecutive-error cap never
+# fired on a tool that was simply unreachable.
 #
-# Canonical patterns take precedence over hashing — when a message matches
-# ``_SANDBOX_DOWN_PATTERNS`` the signature is fixed to ``<tool>:SANDBOX_DOWN``
-# and the cap can collapse N varied retries against a dead sandbox into a
-# single streak. Similarly for ``command not found`` on Bash.
+# The host's verdict takes precedence over hashing: when the bound
+# :class:`~protocore.contracts.resilience.IResilienceClassifier` says a
+# failure belongs to one of
+# :data:`~protocore.contracts.resilience.TRANSPORT_DOWN_ERROR_CLASSES`, the
+# signature is fixed to ``<tool>:TRANSPORT_DOWN`` and the cap collapses N
+# varied retries against a dead transport into one streak. Core recognises
+# none of those failures by their wording: the wordings belong to whatever
+# the host put behind its tools, and a pattern for them here would be a copy
+# of another codebase, kept in step by nothing. Similarly for
+# ``command not found``, which is the shell's own wording and is asked of a
+# tool the host declared as running a shell.
 #
-# When no canonical pattern matches we still hash, but first strip quoted
+# When no verdict collapses the failure we still hash, but first strip quoted
 # strings and absolute file paths so cosmetic variation between retries
 # (different file names, regex snippets, search needles) does not bump the
 # signature.
-#
-# The literal `supervisor 5\d\d` alternative DOES NOT MATCH any real production
-# wording. Every actual sandbox-down message has context between `supervisor`
-# and the status code (`supervisor /exec returned 502`, `supervisor at <url>
-# unreachable: <exc>`, `supervisor unreachable after respawn: <exc>`,
-# `supervisor auth failed: <exc>`, `sandbox provision failed: <exc>`,
-# `sandbox readiness failed after pod create: <exc>`). Those phrasings come
-# from the sandbox RPC client, which raises an unreachable/auth error; the
-# sandbox dispatcher wraps them into a dispatch error; and the Bash tool wraps
-# that once more into the outer ``"sandbox dispatch failed: ..."`` shape that
-# the dispatcher here actually sees.
-#
-# The legacy ``supervisor 5\d\d`` short form is RETAINED for backward
-# compatibility with existing tests + as a defensive safety net
-# for any future emit site that omits the descriptive context. New alternatives
-# cover every production phrase grouped by emit module.
-#
-# Tenant sandbox capacity exhaustion is a common failure cluster: the
-# capacity wording was not previously recognised by ``_SANDBOX_DOWN_PATTERNS``
-# — only supervisor/provision/readiness failures were. Net effect: the
-# SANDBOX_DOWN canonical signature never fired for typed admission denials,
-# the inline Write-only nudge never injected, and the model burned Bash retries
-# on each capacity-blocked tool call until the run hit its turn budget.
-# Adding the capacity wording here causes the same inline-strategy nudge to
-# fire after N capacity-blocked Bash retries (default N=3), so the model
-# pivots to Write/Edit and frees up tenant quota for other concurrent runs.
-# Behaviourally identical action to supervisor-down (the synthetic message
-# already says "Sandbox is currently unavailable; switch to inline strategy" —
-# applies verbatim to capacity).
-#
-# Emit sites covered:
-# * the raw capacity-exhausted detail
-#   ``"sandbox capacity exhausted (tenant_id=..., dimension=..., retry_after=Ns)"``.
-# * the Bash tool's user-visible wrapper
-#   ``"Sandbox temporarily unavailable, will retry. Reason: capacity exhausted
-#   (dimension=cpu, retry_after=5s)"`` — this is the form the dispatcher sees
-#   most often because Bash is the only tool that surfaces capacity to the
-#   model.
-_SANDBOX_DOWN_PATTERNS = re.compile(
-    r"\b("
-    # Direct exception name surfaced raw (e.g. uncaught raise in tests).
-    r"SandboxUnreachable"
-    # supervisor_rpc.py: 5xx / unexpected status / timed-out / unreachable / auth.
-    r"|supervisor\s+(?:/\w+\s+)?returned\s+5\d\d"
-    r"|supervisor\s+(?:/\w+\s+)?unexpected\s+\d{3}"
-    r"|supervisor\s+(?:/\w+\s+)?timed\s+out"
-    r"|supervisor\s+(?:at\s+\S+\s+)?unreachable"
-    r"|supervisor\s+auth\s+failed"
-    r"|supervisor\s+rejected"
-    # Legacy short form kept for backward compatibility with existing
-    # tests and as a defensive net for any future bare emit site.
-    r"|supervisor\s+5\d\d"
-    # dispatcher.py: SandboxDispatchError wrappers + bash.py outer wrapper.
-    r"|sandbox\s+(?:provision|readiness|registration|cache\s+update|dispatch)\s+failed"
-    r"|tenant\s+namespace\s+provision\s+failed"
-    # No current emit site, defensive — anticipates a future "session expired"
-    # surface; cheap to keep, harmless if it never fires.
-    r"|sandbox\s+session\s+not\s+active"
-    # Lower-level exec failure phrasings (sandbox-side).
-    r"|exec\s+failed:\s*(?:connection\s+refused|pod\s+not\s+ready)"
-    # typed capacity-exhausted admission denial. Both the
-    # raw :class:`SandboxCapacityExhausted` detail wording and the bash.py
-    # user-visible wrapper are covered. ``capacity\s+exhausted`` is the
-    # canonical phrase shared by both; ``sandbox\s+(?:temporarily\s+)?
-    # unavailable`` covers the bash.py wrapper prefix in isolation as a
-    # defensive belt-and-braces match.
-    r"|capacity\s+exhausted"
-    r"|sandbox\s+(?:temporarily\s+)?unavailable"
-    r")\b",
-    re.IGNORECASE,
-)
-_BASH_CMD_MISSING_PATTERNS = re.compile(
+_SHELL_CMD_MISSING_PATTERNS = re.compile(
     r"command not found",
     re.IGNORECASE,
 )
@@ -660,17 +577,14 @@ _QUOTED_REGEX = re.compile(r"'[^']*'|\"[^\"]*\"|`[^`]*`")
 # signature.
 _FILE_PATH_REGEX = re.compile(r"(?:/[a-zA-Z0-9_.-]+)+")
 
-# Strip rotating supervisor URLs from error text before hashing so
-# multi-IP supervisor-unreachable storms collapse to a single canonical
-# signature. The sandbox control plane respawns supervisors on rotating IPs
-# (``10.0.0.1``, ``10.0.0.2``, ``10.0.0.3``, …) and each
-# "supervisor at <url> unreachable" line embeds a fresh IP. Without this
-# collapse the SANDBOX_DOWN canonical pattern still fires per-message, but
-# defence in depth requires normalised text whenever the hash path is reached.
-# Matches private ``10.x.x.x:port`` and other rfc1918 wordings the supervisor
-# may emit.
-_SUPERVISOR_URL_PATTERN = re.compile(
-    r"https?://10\.\d+\.\d+\.\d+:\d+",
+# Strip URLs from error text before hashing. A host that restarts the thing
+# behind a tool commonly brings it back at a fresh address, and each failure
+# line then embeds a different one — so a single outage reads as a stream of
+# distinct errors to a counter that hashes the text. The classifier normally
+# collapses those failures first; this is what keeps the hash path honest
+# when it does not.
+_ERROR_URL_PATTERN = re.compile(
+    r"\b[a-z][a-z0-9+.-]*://\S+",
     re.IGNORECASE,
 )
 
@@ -686,7 +600,7 @@ _CONTRACT_HALLUCINATION = re.compile(r"^[a-z_]+_contract$")
 def _contract_hallucination_hint(tool_name: str, *, finalize_terminal: bool = False) -> str:
     """Build the nudge message for a hallucinated ``*_contract`` tool name.
 
-    Typed-Finalize tenants (``RuntimeConstants.agent_finalize_tool_as_terminal``)
+    Typed-Finalize tenants (``LoopConstants.agent_finalize_tool_as_terminal``)
     must NOT be steered to the legacy ``<finalization_contract>`` XML block when
     they misfire a ``finalization_contract`` "tool" — that re-introduces the very
     prose-contract leak the ``Finalize`` tool retires. For them the nudge points
@@ -721,7 +635,7 @@ class DispatchErrorKind(StrEnum):
  ``consecutive_error_cap`` tracks
  dispatcher rewrites a real failure into this kind once the per-run
  consecutive-identical-error streak exceeds
- ``RuntimeConstants.tool_dispatch_consecutive_error_cap``.
+ ``LoopConstants.tool_dispatch_consecutive_error_cap``.
  """
 
     validation = "validation"
@@ -780,6 +694,17 @@ class DispatchOutcome:
  evidence_records:
  Typed tool-authored observations retained only by the runtime. They are
  intentionally absent from model-visible result blocks and event payloads.
+ canonical_content:
+ The whole value the tool returned, when ``content`` is only a
+ projection of it. ``None`` means the two are the same value.
+ ui_payload:
+ Structured detail for whoever is watching the run. Rides the result
+ event and stops there — it never enters the transcript.
+ canonical_ref:
+ Where the canonical value can be fetched back from, if the tool
+ stored it anywhere.
+ path:
+ The workspace path this result is a view of, if it is a view of one.
  """
 
     tool_call: ToolCall
@@ -795,6 +720,10 @@ class DispatchOutcome:
     metadata: dict[str, Any] | None = None
     evidence_records: tuple[EvidenceRecord, ...] = ()
     evidence_producer: EvidenceProducerBinding | None = None
+    canonical_content: str | None = None
+    ui_payload: dict[str, Any] | None = None
+    canonical_ref: str | None = None
+    path: str | None = None
 
 
 DISPATCH_REPLAY_ERROR_KIND_METADATA_KEY: str = "tool_dispatch.replay_error_kind"
@@ -813,56 +742,9 @@ DISPATCH_STRUCTURED_ERROR_METADATA_KEY: str = "structured_error"
 STRUCTURED_ERROR_FINALIZATION_RECOMMENDED_KEY: str = "finalization_recommended"
 STRUCTURED_ERROR_REASON_KEY: str = "reason"
 
-#: The helper-bag key under which the executor places a per-run cancel
-#: ``asyncio.Event`` (``ctx.metadata["protocore.helpers"]["cancel_event"]``). The
-#: the host side SETs it on a user cancel; the dispatcher RACES the in-flight
-#: tool task against ``cancel_event.wait()`` so a leader blocked inside the
-#: synchronous ``Agent`` tool unblocks promptly instead of after the whole
-#: subagent runs. MUST stay in lockstep with
-#: ``executor_main.HELPER_RUN_CANCEL_EVENT`` /
-#: ``subagent_runner.HELPER_RUN_CANCEL_EVENT`` (both ``"cancel_event"``). Read
-#: best-effort / duck-typed: an absent or non-Event value ⇒ pre-#6 behaviour
-#: (byte-identical), so older callers / tests are unaffected.
-HELPER_RUN_CANCEL_EVENT_KEY: Final[str] = "cancel_event"
-
-#: Helper-bag key under which the first-fan-out run stores the shared
-#: :class:`~protocore.runtime.subagent_budget.SubagentTreeBudget` — one object per
-#: maximal parallel-dispatched subtree, threaded by reference to every descendant
-#: so that subtree draws parallel-subagent slots from a single semaphore. It is
-#: minted lazily in the concurrent-delegation branch from
-#: ``rc.max_concurrent_subagents_per_tree`` by the first run to fan out with no
-#: budget in its bag (usually the root; deeper if the root only delegates
-#: serially) and stored here; descendants inherit the SAME object via the
-#: parent-helpers dict-copy (identical propagation to ``cancel_event`` /
-#: ``root_run_id``). Absent ⇒ no tree-wide bound (older callers / tests).
-HELPER_SUBAGENT_TREE_BUDGET_KEY: Final[str] = "subagent_tree_budget"
-
-#: Helper-bag key under which a child engine finds ITS OWN
-#: :class:`~protocore.runtime.subagent_budget.SubagentTreePermit`. Unlike the
-#: shared budget, this is per-child: the parent acquires a tree slot at the
-#: dispatch site, stamps the handle on the child's dispatch metadata
-#: (:data:`~protocore.contracts.tools.SUBAGENT_TREE_PERMIT_METADATA_KEY`), and the
-#: the host runner lodges it here in the child's freshly-built helper bag. The
-#: child's delegation branch reads it to release-while-awaiting around its own
-#: nested gather. Absent ⇒ this run holds no tree slot to release (root leader /
-#: serial dispatch).
-HELPER_SUBAGENT_TREE_PERMIT_KEY: Final[str] = "subagent_tree_permit"
-
-#: Helper-bag key under which the ROOT run's
-#: :class:`~protocore.runtime.run_work_budget.RunWorkLedger` lives — the
-#: CUMULATIVE total-work budget for the whole tree (child runs started, tokens
-#: charged), as opposed to the instantaneous concurrency bound above. Minted for
-#: the root when its bag is composed rather than lazily at the first fan-out,
-#: because a leader that emits one delegation call per turn never fans out and is
-#: exactly the wave-after-wave pattern the cumulative bound exists for. Inherited
-#: by every descendant through the parent-helpers dict-copy, so the whole tree
-#: counts into ONE ledger. Re-exported from the module that owns it rather than
-#: restated, so there is one string and nothing to keep in lockstep.
-HELPER_RUN_WORK_LEDGER_KEY: Final[str] = RUN_WORK_LEDGER_HELPER_KEY
-
 #: Fallback bounded-drain budget (seconds) for a cancelled in-flight tool task
-#: when the helper bag carries no ``rc`` (older callers / tests). The live path
-#: uses ``RuntimeConstants.tool_cancel_drain_seconds``; this mirrors its default
+#: when the run carries no constants (older callers / tests). The live path
+#: uses ``LoopConstants.tool_cancel_drain_seconds``; this mirrors its default
 #: so behaviour is identical when the RC is unreachable.
 _TOOL_CANCEL_DRAIN_FALLBACK_SECONDS: Final[float] = 2.0
 
@@ -917,11 +799,20 @@ class ToolDispatcher:
         permission_gate: ToolPermissionGate,
         hook_manager: IHookManager | None = None,
         tool_error_counter: IRunToolErrorCounter | None = None,
+        roles: ToolRoleMap = EMPTY_TOOL_ROLE_MAP,
+        resilience_classifier: IResilienceClassifier | None = None,
     ) -> None:
         self._registry = registry
         self._gate = permission_gate
         self._hooks = hook_manager
         self._tool_error_counter = tool_error_counter
+        self._roles = roles
+        """What the host said its tools do — the dispatcher asks it instead of
+        recognising a tool by a name it spelled itself."""
+        self._resilience_classifier = resilience_classifier
+        """Who says what kind of failure a message describes. Absent, the
+        dispatcher tells failures apart by their own text alone and no run of
+        them is ever read as one transport being down."""
 
     async def _record_tool_error(self, ctx: ToolContext) -> None:
         """Best-effort increment of ``runs.tool_errors_count`` for the run.
@@ -935,10 +826,8 @@ class ToolDispatcher:
  they are not durably persisted as their own ``runs.id`` rows), and
  any non-UUID-shaped string fed into the ``WHERE id = $1`` UUID column
  triggers ``psycopg.errors.InvalidTextRepresentation`` (~20x/run noise).
- The parent's ``root_run_id`` is already plumbed by the host's subagent
- runner and agent-dispatch adapter via ``HELPER_ROOT_RUN_ID`` and lives in
- ``ctx.metadata["protocore.helpers"]["root_run_id"]``. It is the
- parent's bare UUID — semantically the right aggregate and SQL-safe.
+ The parent's ``root_run_id`` is already plumbed by the host down the run
+ tree and lives on the run's state. It is the parent's bare UUID — semantically the right aggregate and SQL-safe.
 
  Non-raising — the dispatcher must never surface a telemetry failure
  as a tool error (counter leak / cascade). Logged at WARNING so the
@@ -961,19 +850,14 @@ class ToolDispatcher:
     def _resolve_error_attribution_run_id(ctx: ToolContext) -> str:
         """Return the run id to attribute the tool-error increment to.
 
-        Prefers ``ctx.metadata["protocore.helpers"]["root_run_id"]`` when
-        present — the parent (root) run's bare UUID, plumbed by
-        the host subagent dispatch path. Falls back to ``ctx.run_id`` for
-        leader runs where root_run_id == run_id and for test contexts that
-        do not wire a helpers bag.
+        Prefers the run state's ``root_run_id`` when present — the parent
+        (root) run's bare UUID, plumbed by the host's subagent dispatch path.
+        Falls back to ``ctx.run_id`` for leader runs where root_run_id ==
+        run_id and for test contexts that wire no state.
         """
-        metadata = ctx.metadata
-        if metadata:
-            helpers = metadata.get("protocore.helpers")
-            if isinstance(helpers, dict):
-                root_run_id = helpers.get("root_run_id")
-                if isinstance(root_run_id, str) and root_run_id:
-                    return root_run_id
+        state = ctx.run_state
+        if state is not None and state.root_run_id:
+            return state.root_run_id
         return ctx.run_id
 
     # ------------------------------------------------------------------
@@ -989,13 +873,7 @@ class ToolDispatcher:
         that pre-date the RC plumbing). Mirrors the defensive ``getattr``
         pattern used for ``max_ask_user_calls_per_run``.
         """
-        metadata = ctx.metadata
-        if not metadata:
-            return _DEFAULT_CONSECUTIVE_ERROR_CAP
-        helpers = metadata.get("protocore.helpers")
-        if not isinstance(helpers, dict):
-            return _DEFAULT_CONSECUTIVE_ERROR_CAP
-        rc = helpers.get("rc")
+        rc = _run_constants(ctx)
         if rc is None:
             return _DEFAULT_CONSECUTIVE_ERROR_CAP
         raw = getattr(rc, "tool_dispatch_consecutive_error_cap", _DEFAULT_CONSECUTIVE_ERROR_CAP)
@@ -1003,55 +881,43 @@ class ToolDispatcher:
             value = int(raw)
         except (TypeError, ValueError):
             return _DEFAULT_CONSECUTIVE_ERROR_CAP
-        # ``ge=2`` is enforced by the RuntimeConstants validator; defence
+        # ``ge=2`` is enforced by the LoopConstants validator; defence
         # in depth here so a corrupted snapshot cannot push the cap to 1
         # (which would reject the very first error).
         return value if value >= 2 else _DEFAULT_CONSECUTIVE_ERROR_CAP
 
     @staticmethod
-    def _resolve_sandbox_down_threshold(ctx: ToolContext) -> int:
+    def _resolve_transport_down_threshold(ctx: ToolContext) -> int:
         """Read ``sandbox_down_system_message_threshold`` from the RC snapshot.
 
-        Falls back to :data:`_DEFAULT_SANDBOX_DOWN_THRESHOLD` when no helper
-        bag / RC snapshot is wired. Mirrors :meth:`_resolve_consecutive_error_cap`.
+        Falls back to :data:`_DEFAULT_TRANSPORT_DOWN_THRESHOLD` when no RC
+        snapshot is wired. Mirrors :meth:`_resolve_consecutive_error_cap`.
         """
-        metadata = ctx.metadata
-        if not metadata:
-            return _DEFAULT_SANDBOX_DOWN_THRESHOLD
-        helpers = metadata.get("protocore.helpers")
-        if not isinstance(helpers, dict):
-            return _DEFAULT_SANDBOX_DOWN_THRESHOLD
-        rc = helpers.get("rc")
+        rc = _run_constants(ctx)
         if rc is None:
-            return _DEFAULT_SANDBOX_DOWN_THRESHOLD
+            return _DEFAULT_TRANSPORT_DOWN_THRESHOLD
         raw = getattr(
-            rc, "sandbox_down_system_message_threshold", _DEFAULT_SANDBOX_DOWN_THRESHOLD
+            rc, "sandbox_down_system_message_threshold", _DEFAULT_TRANSPORT_DOWN_THRESHOLD
         )
         try:
             value = int(raw)
         except (TypeError, ValueError):
-            return _DEFAULT_SANDBOX_DOWN_THRESHOLD
-        # ``gt=0`` is enforced by the RuntimeConstants validator; defence in
+            return _DEFAULT_TRANSPORT_DOWN_THRESHOLD
+        # ``gt=0`` is enforced by the LoopConstants validator; defence in
         # depth so a corrupted snapshot cannot push the threshold to 0
         # (which would fire on every dispatch).
-        return value if value >= 1 else _DEFAULT_SANDBOX_DOWN_THRESHOLD
+        return value if value >= 1 else _DEFAULT_TRANSPORT_DOWN_THRESHOLD
 
     @staticmethod
     def _resolve_string_type_terminal_cap(ctx: ToolContext) -> int:
         """Read ``tool_dispatch_string_type_terminal_cap`` from the RC snapshot.
 
  Falls back to
- :data:`_DEFAULT_STRING_TYPE_TERMINAL_CAP` when no helper bag / RC
+ :data:`_DEFAULT_STRING_TYPE_TERMINAL_CAP` when no run state / RC
  snapshot is wired (legacy test fixtures). Mirrors
  :meth:`_resolve_consecutive_error_cap` defensive pattern.
  """
-        metadata = ctx.metadata
-        if not metadata:
-            return _DEFAULT_STRING_TYPE_TERMINAL_CAP
-        helpers = metadata.get("protocore.helpers")
-        if not isinstance(helpers, dict):
-            return _DEFAULT_STRING_TYPE_TERMINAL_CAP
-        rc = helpers.get("rc")
+        rc = _run_constants(ctx)
         if rc is None:
             return _DEFAULT_STRING_TYPE_TERMINAL_CAP
         raw = getattr(
@@ -1063,7 +929,7 @@ class ToolDispatcher:
             value = int(raw)
         except (TypeError, ValueError):
             return _DEFAULT_STRING_TYPE_TERMINAL_CAP
-        # ``ge=2`` is enforced by the RuntimeConstants validator; defence
+        # ``ge=2`` is enforced by the LoopConstants validator; defence
         # in depth here so a corrupted snapshot cannot push the cap to 1.
         return value if value >= 2 else _DEFAULT_STRING_TYPE_TERMINAL_CAP
 
@@ -1092,12 +958,10 @@ class ToolDispatcher:
 
  Order matters:
 
- 1. Strip rotating supervisor URLs
- (``http://10.0.0.1:9292`` and similar rfc1918 + port shapes)
- collapse to ``<SUPERVISOR_URL>`` before any other normalisation.
- Without this, a multi-IP supervisor-unreachable storm produces fresh
- hashed signatures every iteration when the SANDBOX_DOWN canonical
- pattern does not match the surface phrasing.
+ 1. Strip URLs, which collapse to ``<url>`` before any other
+ normalisation. Without this, a failing transport that comes back at
+ a fresh address each time produces a fresh hashed signature every
+ iteration whenever the host's classifier returned no verdict.
  2. Strip quoted content (`'foo'`, `"bar"`, ```baz```) and absolute
  file paths.
  3. Strip uuid-shaped tokens, long hex blobs, the dispatcher's own
@@ -1105,7 +969,7 @@ class ToolDispatcher:
  4. Collapse whitespace so the hash stays stable across cosmetic
  spacing differences between retries.
  """
-        normalized = _SUPERVISOR_URL_PATTERN.sub("<SUPERVISOR_URL>", message)
+        normalized = _ERROR_URL_PATTERN.sub("<url>", message)
         normalized = _QUOTED_REGEX.sub("<quoted>", normalized)
         normalized = _FILE_PATH_REGEX.sub("<path>", normalized)
         normalized = _UUID_RE.sub("<uuid>", normalized)
@@ -1115,20 +979,52 @@ class ToolDispatcher:
         normalized = re.sub(r"\s+", " ", normalized).strip()
         return normalized
 
+    @staticmethod
+    def _is_transport_down(
+        message: str,
+        tool_name: str | None,
+        classifier: IResilienceClassifier | None,
+    ) -> bool:
+        """Whether the host calls this failure one of the transport being down.
+
+        Best-effort in both directions: no classifier means no, and a
+        classifier that raises means no. A failing verdict must not turn a
+        tool error into a dispatch crash, and the only thing lost by
+        answering no is one collapsed signature.
+        """
+        if classifier is None:
+            return False
+        try:
+            verdict = classifier.classify_error_text(message, tool_name=tool_name)
+        except Exception:
+            _logger.warning(
+                "resilience classifier raised on a dispatch error for tool=%s; "
+                "treating the failure as unclassified",
+                tool_name or "<unknown>",
+                exc_info=True,
+            )
+            return False
+        return verdict in TRANSPORT_DOWN_ERROR_CLASSES
+
     @classmethod
     def _error_signature(
         cls,
         kind: DispatchErrorKind,
         message: str,
         tool_name: str | None = None,
+        roles: ToolRoleMap = EMPTY_TOOL_ROLE_MAP,
+        classifier: IResilienceClassifier | None = None,
     ) -> str:
         """Return the per-error-streak signature.
 
- Canonical signatures take precedence: a sandbox-unreachable message
- collapses to ``<tool>:SANDBOX_DOWN`` and a Bash ``command not found``
- collapses to ``Bash:BASH_CMD_MISSING`` regardless of surrounding text —
- without this the consecutive-error cap never fires when the leader varies
- its Bash command shape on retry (subagent-crash regression pattern).
+ Canonical signatures take precedence: a failure the host's
+ ``classifier`` calls a transport-down one collapses to
+ ``<tool>:TRANSPORT_DOWN``, and a shell tool's ``command not found``
+ collapses to ``<tool>:SHELL_CMD_MISSING``, both regardless of
+ surrounding text — without this the consecutive-error cap never fires
+ when the model varies its argument shape on retry. Core asks the host
+ for the first of those verdicts and never reads the wording itself; a
+ run with no classifier bound simply has no transport-down signature.
 
  Otherwise we hash ``(error_kind, normalised_message)`` where the
  normalisation already strips quoted content + file paths via
@@ -1142,45 +1038,33 @@ class ToolDispatcher:
  """
         # Canonical-match short-circuit traces — logged so that when the
         # consecutive-error cap fires we can verify which branch triggered.
-        if _SANDBOX_DOWN_PATTERNS.search(message):
+        if cls._is_transport_down(message, tool_name, classifier):
             _logger.debug(
                 "DIAG tool_dispatch.canonical_error_match "
-                "tool=%s kind=%s match=SANDBOX_DOWN excerpt=%r",
+                "tool=%s kind=%s match=TRANSPORT_DOWN excerpt=%r",
                 tool_name or "<unknown>",
                 kind.value,
                 message[:100],
             )
-            return f"{tool_name or 'unknown'}:SANDBOX_DOWN"
-        if tool_name == "Bash" and _BASH_CMD_MISSING_PATTERNS.search(message):
+            return f"{tool_name or 'unknown'}{_TRANSPORT_DOWN_CANONICAL_SUFFIX}"
+        if (
+            roles.has_role(tool_name, ToolRole.runs_shell)
+            and _SHELL_CMD_MISSING_PATTERNS.search(message)
+        ):
             _logger.debug(
                 "DIAG tool_dispatch.canonical_error_match "
-                "tool=Bash kind=%s match=BASH_CMD_MISSING excerpt=%r",
+                "tool=%s kind=%s match=SHELL_CMD_MISSING excerpt=%r",
+                tool_name,
                 kind.value,
                 message[:100],
             )
-            return f"{tool_name}:BASH_CMD_MISSING"
+            return f"{tool_name}:SHELL_CMD_MISSING"
         normalized = cls._normalize_error_text(message)
         payload = f"{kind.value}|{normalized}"
         return hashlib.sha256(payload.encode("utf-8")).hexdigest()[:16]
 
-    @staticmethod
-    def _helpers_bag(ctx: ToolContext) -> dict[str, Any] | None:
-        """Return the per-run helper bag if wired into ``ctx.metadata``.
-
-        The bag is mutable (built per run by
-        ``service_runtime.build_helper_bag``); the dispatcher uses it to
-        park a small streak-tracking cell that is naturally per-run
-        isolated.
-        """
-        metadata = ctx.metadata
-        if not metadata:
-            return None
-        helpers = metadata.get("protocore.helpers")
-        return helpers if isinstance(helpers, dict) else None
-
-    @classmethod
     def _apply_consecutive_error_cap(
-        cls,
+        self,
         ctx: ToolContext,
         tool_name: str,
         kind: DispatchErrorKind,
@@ -1196,59 +1080,52 @@ class ToolDispatcher:
  :class:`DispatchErrorKind.consecutive_error_cap` with guidance to
  try a different approach + the original error text appended.
 
- State shape: a single mutable cell on the helper bag holding the
- last (tool_name, signature) and the current consecutive count.
- Switching tool OR signature resets the count to 1.
+ State shape: one record on the run's state holding the last
+ (tool_name, signature) and the current consecutive count. Switching
+ tool OR signature resets the count to 1.
 
- In addition to the generic cap, the method
- maintains a SEPARATE counter for SANDBOX_DOWN canonical signatures
- (``<tool>:SANDBOX_DOWN``) and posts a one-shot injection signal on
- the helper bag when that counter reaches
- ``RuntimeConstants.sandbox_down_system_message_threshold``. The
- signal is consumed by the host executor loop, which appends a
- synthetic user-role message instructing the agent to switch to
- inline (Write-only) strategy.
+ In addition to the generic cap, the method maintains a SEPARATE
+ counter for transport-down canonical signatures
+ (``<tool>:TRANSPORT_DOWN``) and raises a one-shot injection signal on
+ the run's state when that counter reaches
+ ``LoopConstants.sandbox_down_system_message_threshold``. The signal is
+ consumed by the loop above, which appends a synthetic user-role
+ message telling the agent to reach its goal by another route.
  """
-        helpers = cls._helpers_bag(ctx)
-        if helpers is None:
-            # No bag wired — best-effort no-op so unit tests + legacy
-            # dispatch paths keep working. Production paths always wire
-            # the bag via ``query._dispatch_tool``.
+        state = ctx.run_state
+        if state is None:
+            # A tool invoked outside a run counts no streak: there is nothing
+            # for a per-run cap to be a cap on.
             return kind, message
 
-        signature = cls._error_signature(kind, message, tool_name)
-        state_raw = helpers.get(_CONSECUTIVE_ERROR_STATE_KEY)
-        last_tool: str | None = None
-        last_sig: str | None = None
-        count: int = 0
-        if isinstance(state_raw, dict):
-            last_tool_raw = state_raw.get("tool_name")
-            last_sig_raw = state_raw.get("signature")
-            count_raw = state_raw.get("count", 0)
-            if isinstance(last_tool_raw, str):
-                last_tool = last_tool_raw
-            if isinstance(last_sig_raw, str):
-                last_sig = last_sig_raw
-            if isinstance(count_raw, int) and count_raw >= 0:
-                count = count_raw
-
-        if last_tool == tool_name and last_sig == signature:
-            count += 1
+        cls = type(self)
+        signature = cls._error_signature(
+            kind,
+            message,
+            tool_name,
+            roles=self._roles,
+            classifier=self._resilience_classifier,
+        )
+        prior = state.consecutive_error
+        if (
+            prior is not None
+            and prior.tool_name == tool_name
+            and prior.signature == signature
+        ):
+            count = prior.count + 1
         else:
             count = 1
 
-        helpers[_CONSECUTIVE_ERROR_STATE_KEY] = {
-            "tool_name": tool_name,
-            "signature": signature,
-            "count": count,
-        }
+        state.consecutive_error = ConsecutiveErrorStreak(
+            tool_name=tool_name, signature=signature, count=count
+        )
 
-        # Separately track the SANDBOX_DOWN streak
+        # Separately track the transport-down streak
         # so the injection threshold can fire earlier (default 3) than the
         # generic cap (default 4). The two counters are kept independent so
         # operators can tune them independently per category.
-        cls._track_sandbox_down_streak(
-            ctx, helpers, signature, emit_diagnostics=emit_diagnostics
+        cls._track_transport_down_streak(
+            ctx, state, signature, emit_diagnostics=emit_diagnostics
         )
 
         # separately track Pydantic
@@ -1259,7 +1136,7 @@ class ToolDispatcher:
         # :meth:`_reset_consecutive_error_streak`).
         string_type_terminal = cls._track_string_type_streak(
             ctx,
-            helpers,
+            state,
             tool_name,
             kind,
             message,
@@ -1289,93 +1166,84 @@ class ToolDispatcher:
         return kind, message
 
     @classmethod
-    def _track_sandbox_down_streak(
+    def _track_transport_down_streak(
         cls,
         ctx: ToolContext,
-        helpers: dict[str, Any],
+        state: RunScopedState,
         signature: str,
         *,
         emit_diagnostics: bool = True,
     ) -> None:
-        """Update the SANDBOX_DOWN canonical-signature streak counter.
+        """Update the transport-down canonical-signature streak counter.
 
  Runs every time
  :meth:`_apply_consecutive_error_cap` records a dispatch error. When
- ``signature`` ends in :data:`_SANDBOX_DOWN_CANONICAL_SUFFIX` the
- counter increments; otherwise it resets to zero (any non-SANDBOX_DOWN
- error breaks the streak so the injection signal does not fire across
- a mix of unrelated tool failures).
+ ``signature`` ends in :data:`_TRANSPORT_DOWN_CANONICAL_SUFFIX` the
+ counter increments; otherwise it resets to zero (any other error
+ breaks the streak so the injection signal does not fire across a mix
+ of unrelated tool failures).
 
- Once the counter reaches the RC threshold, the helper bag gains a
- one-shot ``True`` flag at :data:`_SANDBOX_DOWN_INJECTION_PENDING_KEY`.
- The host executor loop consumes the flag by appending a
- synthetic user-role message and then clearing it via
- :meth:`_consume_sandbox_down_injection_signal`. Until the flag is
+ Once the counter reaches the RC threshold, the run's state raises a
+ one-shot injection-pending flag. The loop above consumes it by
+ appending a synthetic user-role message and then clearing it via
+ :meth:`_consume_transport_down_injection_signal`. Until the flag is
  consumed the counter does NOT re-arm the signal on every subsequent
- SANDBOX_DOWN — re-arming only happens after a successful tool call
- or a non-SANDBOX_DOWN error breaks the streak.
+ transport-down failure — re-arming only happens after a successful
+ tool call or another error breaks the streak.
 
  Best-effort: no exceptions propagate out of this helper. The cap
  path keeps working even if the signal cannot be posted.
  """
-        if not signature.endswith(_SANDBOX_DOWN_CANONICAL_SUFFIX):
-            helpers.pop(_SANDBOX_DOWN_STREAK_STATE_KEY, None)
+        if not signature.endswith(_TRANSPORT_DOWN_CANONICAL_SUFFIX):
+            state.transport_down = None
             return
 
-        prior = helpers.get(_SANDBOX_DOWN_STREAK_STATE_KEY)
-        prior_count = 0
-        if isinstance(prior, dict):
-            raw = prior.get("count", 0)
-            if isinstance(raw, int) and raw >= 0:
-                prior_count = raw
+        prior = state.transport_down
+        new_count = (prior.count if prior is not None else 0) + 1
+        state.transport_down = SignatureStreak(signature=signature, count=new_count)
 
-        new_count = prior_count + 1
-        helpers[_SANDBOX_DOWN_STREAK_STATE_KEY] = {
-            "signature": signature,
-            "count": new_count,
-        }
-
-        threshold = cls._resolve_sandbox_down_threshold(ctx)
+        threshold = cls._resolve_transport_down_threshold(ctx)
         # Only arm the signal at the exact threshold crossing so
-        # the host loop sees the nudge once per streak. Subsequent
-        # SANDBOX_DOWN errors keep incrementing the counter for telemetry
+        # the loop above sees the nudge once per streak. Subsequent
+        # transport-down errors keep incrementing the counter for telemetry
         # but do not re-arm — preventing a flood of synthetic messages.
         if new_count == threshold:
             if emit_diagnostics:
                 _logger.warning(
-                    "DIAG tool_dispatch.sandbox_down_threshold_reached "
+                    "DIAG tool_dispatch.transport_down_threshold_reached "
                     "run=%s signature=%s count=%d threshold=%d",
                     ctx.run_id,
                     signature,
                     new_count,
                     threshold,
                 )
-            helpers[_SANDBOX_DOWN_INJECTION_PENDING_KEY] = True
+            state.transport_down_injection_pending = True
 
     @classmethod
-    def _consume_sandbox_down_injection_signal(cls, ctx: ToolContext) -> bool:
-        """Pop the SANDBOX_DOWN injection-pending flag.
+    def _consume_transport_down_injection_signal(cls, ctx: ToolContext) -> bool:
+        """Pop the transport-down injection-pending flag.
 
- The host executor loop calls this
+ The loop driving the run calls this
  after every TurnEvent dispatch step. Returns ``True`` exactly once
  per streak (when the flag is armed by
- :meth:`_track_sandbox_down_streak`). Subsequent calls return
+ :meth:`_track_transport_down_streak`). Subsequent calls return
  ``False`` until the streak resets and re-arms.
 
- Best-effort: a missing helper bag returns ``False`` silently. The
+ Best-effort: a run with no state returns ``False`` silently. The
  method never raises — failure to consume the flag must not break
- the executor loop.
+ the loop that calls it.
  """
-        helpers = cls._helpers_bag(ctx)
-        if helpers is None:
+        state = ctx.run_state
+        if state is None or not state.transport_down_injection_pending:
             return False
-        return bool(helpers.pop(_SANDBOX_DOWN_INJECTION_PENDING_KEY, False))
+        state.transport_down_injection_pending = False
+        return True
 
     @classmethod
     def _track_string_type_streak(
         cls,
         ctx: ToolContext,
-        helpers: dict[str, Any],
+        state: RunScopedState,
         tool_name: str,
         kind: DispatchErrorKind,
         message: str,
@@ -1405,33 +1273,21 @@ class ToolDispatcher:
  moved to a different shape).
  """
         is_string_type = cls._is_string_type_error(kind, message)
-        prior = helpers.get(_STRING_TYPE_STREAK_STATE_KEY)
-        prior_tool: str | None = None
-        prior_count = 0
-        if isinstance(prior, dict):
-            prior_tool_raw = prior.get("tool_name")
-            prior_count_raw = prior.get("count", 0)
-            if isinstance(prior_tool_raw, str):
-                prior_tool = prior_tool_raw
-            if isinstance(prior_count_raw, int) and prior_count_raw >= 0:
-                prior_count = prior_count_raw
+        prior = state.string_type
 
         if not is_string_type:
             # Any non-string_type error breaks the streak. We don't
             # clear it here on success — that path lives in
             # :meth:`_reset_consecutive_error_streak`.
-            helpers.pop(_STRING_TYPE_STREAK_STATE_KEY, None)
+            state.string_type = None
             return None
 
-        if prior_tool == tool_name:
-            new_count = prior_count + 1
+        if prior is not None and prior.tool_name == tool_name:
+            new_count = prior.count + 1
         else:
             new_count = 1
 
-        helpers[_STRING_TYPE_STREAK_STATE_KEY] = {
-            "tool_name": tool_name,
-            "count": new_count,
-        }
+        state.string_type = ToolStreak(tool_name=tool_name, count=new_count)
 
         cap = cls._resolve_string_type_terminal_cap(ctx)
         if new_count >= cap:
@@ -1466,25 +1322,25 @@ class ToolDispatcher:
 
  Called after a tool returns a non-error :class:`ToolResult` — the
  next error (even for the same tool + same signature) starts a
- fresh streak. Best-effort: a missing helper bag is a silent no-op.
+ fresh streak. Best-effort: a run with no state is a silent no-op.
 
- Also clears the SANDBOX_DOWN counter and
+ Also clears the transport-down counter and
  the pending injection signal. A successful tool call (even of a
- different tool) is empirical evidence the sandbox recovered, so the
- next sandbox-down storm should restart at count=1 and the inline
- strategy can be re-armed at the threshold.
+ different tool) is empirical evidence the transport recovered, so the
+ next storm should restart at count=1 and the nudge can be re-armed at
+ the threshold.
 
  also clears the ``string_type``
  terminal-cap counter so a subsequent malformed-args storm starts
  fresh.
  """
-        helpers = cls._helpers_bag(ctx)
-        if helpers is None:
+        state = ctx.run_state
+        if state is None:
             return
-        helpers.pop(_CONSECUTIVE_ERROR_STATE_KEY, None)
-        helpers.pop(_SANDBOX_DOWN_STREAK_STATE_KEY, None)
-        helpers.pop(_SANDBOX_DOWN_INJECTION_PENDING_KEY, None)
-        helpers.pop(_STRING_TYPE_STREAK_STATE_KEY, None)
+        state.consecutive_error = None
+        state.transport_down = None
+        state.transport_down_injection_pending = False
+        state.string_type = None
 
     # ------------------------------------------------------------------
     # DAG tool-precondition mechanism
@@ -1499,10 +1355,7 @@ class ToolDispatcher:
  the defensive ``getattr`` pattern used for
  ``tool_dispatch_consecutive_error_cap`` etc.
  """
-        helpers = cls._helpers_bag(ctx)
-        if helpers is None:
-            return True
-        rc = helpers.get("rc")
+        rc = _run_constants(ctx)
         if rc is None:
             return True
         return bool(getattr(rc, "tool_preconditions_enabled", True))
@@ -1524,10 +1377,10 @@ class ToolDispatcher:
         Sources the tool's ``preconditions`` list from
         :attr:`ToolDefinition.preconditions` via ``tool.definition``. If
         the tool has no ``preconditions`` (None or empty list) the check
-        returns ``None`` without consulting the helper bag.
+        returns ``None`` without consulting the run's state.
 
         Disabled (returns ``None``) when
-        ``RuntimeConstants.tool_preconditions_enabled`` is False.
+        ``LoopConstants.tool_preconditions_enabled`` is False.
         """
         if not cls._resolve_preconditions_enabled(ctx):
             return None
@@ -1542,8 +1395,8 @@ class ToolDispatcher:
         preconditions = getattr(definition, "preconditions", None)
         if not preconditions:
             return None
-        helpers = cls._helpers_bag(ctx)
-        satisfied = load_satisfied_set(helpers)
+        state = ctx.run_state
+        satisfied = set(state.satisfied_preconditions) if state is not None else set()
         return check_preconditions(
             preconditions=list(preconditions),
             arguments=arguments,
@@ -1561,22 +1414,21 @@ class ToolDispatcher:
     ) -> None:
         """Persist that *tool_name* was successfully called.
 
-        Updates the per-run satisfied-precondition set on the helper bag
-        so subsequent dispatches in the same run can see the satisfaction.
-        Mirrors the v1 ``dispatch.py:2579-2607`` record path.
+        Updates the run's satisfied-precondition set so subsequent dispatches
+        in the same run can see the satisfaction.
 
         Honours :attr:`ToolDefinition.path_fields` when present so tools
         with non-standard path argument names (``copy_path`` /
         ``move_path`` in v1) record the correct ``tool_name:path`` entry.
 
-        No-op when ``tool_preconditions_enabled`` is False or the helper
-        bag is missing — legacy test fixtures still dispatch successfully
-        without the satisfaction set.
+        No-op when ``tool_preconditions_enabled`` is False or the call carries
+        no run state — legacy test fixtures still dispatch successfully without
+        the satisfaction set.
         """
         if not cls._resolve_preconditions_enabled(ctx):
             return
-        helpers = cls._helpers_bag(ctx)
-        if helpers is None:
+        state = ctx.run_state
+        if state is None:
             return
         path_fields: list[str] | None = None
         try:
@@ -1587,18 +1439,105 @@ class ToolDispatcher:
             raw_fields = getattr(definition, "path_fields", None)
             if isinstance(raw_fields, list):
                 path_fields = [field for field in raw_fields if isinstance(field, str)]
-        satisfied = load_satisfied_set(helpers)
+        satisfied = set(state.satisfied_preconditions)
         record_satisfaction(
             tool_name=tool_name,
             arguments=arguments,
             satisfied=satisfied,
             path_fields=path_fields,
         )
-        store_satisfied_set(helpers, satisfied)
+        state.satisfied_preconditions = satisfied
 
     # ------------------------------------------------------------------
     # Public dispatch entry
     # ------------------------------------------------------------------
+
+    async def _invoke_within_lifecycle(
+        self,
+        *,
+        lifecycle: ILifecycleRegistry | None,
+        tool: Any,
+        tool_call: ToolCall,
+        ctx: ToolContext,
+        final_args: dict[str, Any],
+        effective_timeout: float,
+        cancel_event: asyncio.Event | None,
+    ) -> ToolResult:
+        """Invoke the tool, wrapped in the ``around`` chain at ``tool_execute``.
+
+        With no registry, or with nothing registered at the coordinate, this is
+        the plain invocation and nothing about it changes — the timeout, the
+        cancel race and every exception type the arms below catch are the ones
+        they always were.
+
+        With a chain, three things are true and each of them is deliberate.
+        The tool's own failure is re-raised **as itself** after the chain has
+        unwound, so a handler sees the real exception and cannot convert a
+        timeout into a success by swallowing it. A handler that refuses — by
+        deciding, by raising, by timing out, or by answering unreadably —
+        stops the call: :class:`ToolPolicyDenied` carries its reason into the
+        permission arm, because a seam that could not say yes has not said it.
+        And a handler that skips its ``next`` skips the tool itself, which is
+        the same refusal: there is no result to report, so the call is refused
+        rather than answered with a silence.
+        """
+
+        async def _run_tool() -> ToolResult:
+            if cancel_event is None:
+                return await asyncio.wait_for(
+                    tool.invoke(ctx, final_args),
+                    timeout=effective_timeout,
+                )
+            return await _invoke_tool_raced_with_cancel(
+                tool=tool,
+                ctx=ctx,
+                final_args=final_args,
+                effective_timeout=effective_timeout,
+                cancel_event=cancel_event,
+            )
+
+        if lifecycle is None or not lifecycle.registrations(HookEvent.tool_execute):
+            return await _run_tool()
+
+        produced: list[ToolResult] = []
+        raised: list[BaseException] = []
+
+        async def _next(_context: LifecycleContext) -> None:
+            try:
+                produced.append(await _run_tool())
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                raised.append(exc)
+                raise
+
+        outcome = await lifecycle.around(
+            LifecycleContext(
+                point=HookEvent.tool_execute,
+                run_id=ctx.run_id,
+                session_id=ctx.session_id,
+                tenant_id=ctx.tenant_id,
+                payload={
+                    "tool_name": tool_call.name,
+                    "tool_call_id": tool_call.id,
+                    "arguments": dict(final_args),
+                },
+            ),
+            _next,
+        )
+        if raised:
+            raise raised[0]
+        if outcome.verdict is not LifecycleVerdict.allow:
+            raise ToolPolicyDenied(
+                outcome.reason
+                or f"tool execution refused at {HookEvent.tool_execute.value}"
+            )
+        if not produced:
+            raise ToolPolicyDenied(
+                f"{outcome.decided_by or 'a lifecycle handler'} skipped the "
+                f"invocation of {tool_call.name!r}"
+            )
+        return produced[0]
 
     async def dispatch(
         self,
@@ -1608,14 +1547,17 @@ class ToolDispatcher:
         visibility_policy: ToolVisibilityPolicy,
         timeout_seconds: int,
         subagent_whitelist: Iterable[str] | None = None,
+        child_run: bool = False,
         preapproved_tool_call_id: str | None = None,
         admit_evidence: Callable[[tuple[EvidenceRecord, ...], EvidenceProducerBinding], None]
         | None = None,
+        on_dispatch_start: Callable[[ToolCall], Awaitable[None]] | None = None,
+        lifecycle: ILifecycleRegistry | None = None,
     ) -> AsyncIterator[TurnEvent | DispatchOutcome]:
         """Drive one dispatch lifecycle.
 
         Yields :class:`TurnEvent` envelopes in Anthropic-style ordering
-        (``hook_fired`` for PreToolUse … optional ``sandbox_starting``
+        (``hook_fired`` for PreToolUse … optional ``tool_transport_starting``
         … ``hook_fired`` for PostToolUse … ``tool_result``). On approval
         path the terminal event is ``tool_call_pending`` (no
         tool_result). The final item yielded is always a
@@ -1631,13 +1573,29 @@ class ToolDispatcher:
         The dispatcher never RAISES on tool errors — all failure modes
         surface as :class:`DispatchOutcome` with ``success=False`` and a
         populated :attr:`DispatchOutcome.error_kind`.
+
+        ``on_dispatch_start`` is awaited at exactly one point: after every gate,
+        hook, precondition and cancel check has passed, and immediately before
+        the tool is invoked. It is the only moment at which a caller can record
+        durably that this call is about to happen — earlier is a lie for every
+        call a gate then parks or denies, and later is too late for a run that
+        dies inside the tool. A caller that persists there gets a record whose
+        four outcomes (parked, in flight, asking, settled) can be told apart
+        after a crash.
+
+        ``lifecycle`` is the run's registry (:mod:`protocore.contracts.middleware`).
+        When one is passed, the invocation is wrapped in the ``around`` chain at
+        :attr:`HookEvent.tool_execute` — the one coordinate that can see the call
+        go in and the result come out. A handler that skips its ``next`` skips
+        the tool; a handler that raises, times out or answers unreadably denies
+        the call, which surfaces as a permission failure like any other refusal.
         """
-        metadata = dict(ctx.metadata)
+        metadata = copy_metadata(ctx)
         metadata.setdefault("tool_call_id", tool_call.id)
         # tools-initiative A2: expose the live per-run visibility policy to
         # policy-aware tools (ToolSearch) so discovery honours the SAME
         # visible/blocked contract the permission gate enforces below. A live
-        # model instance, mirroring the ``protocore.helpers`` bag precedent.
+        # model instance, not a serialised copy.
         metadata.setdefault(TOOL_VISIBILITY_POLICY_METADATA_KEY, visibility_policy)
         ctx = ctx.model_copy(update={"metadata": metadata})
 
@@ -1649,8 +1607,7 @@ class ToolDispatcher:
             # raw "unknown tool" error, prompting the model to inline the XML
             # block in its assistant text.
             if _CONTRACT_HALLUCINATION.fullmatch(tool_call.name):
-                _helpers = ctx.metadata.get("protocore.helpers")
-                _rc = _helpers.get("rc") if isinstance(_helpers, dict) else None
+                _rc = _run_constants(ctx)
                 msg = _contract_hallucination_hint(
                     tool_call.name,
                     finalize_terminal=bool(
@@ -1678,7 +1635,10 @@ class ToolDispatcher:
         # registered tool after lookup, frozen in the context, and never read
         # from a model-visible result payload.
         ctx = ctx.model_copy(
-            update={"evidence_producer_binding": tool.evidence_producer}
+            update={
+                "evidence": (ctx.evidence or ToolEvidenceContext())
+                .with_producer_binding(tool.evidence_producer)
+            }
         )
 
         # ── Step 2: schema validation (input dict shape) ───────────
@@ -1693,10 +1653,11 @@ class ToolDispatcher:
         # the run down from inside the dispatcher. Refusing the call as a
         # validation error keeps the failure where the model can see it and
         # re-issue the call with a sane payload.
-        if _nesting_exceeds(tool_call.arguments, MAX_DATA_NESTING_DEPTH):
+        depth_ceiling = _resolve_max_data_nesting_depth(ctx)
+        if _nesting_exceeds(tool_call.arguments, depth_ceiling):
             msg = (
                 "tool arguments nest deeper than "
-                f"{MAX_DATA_NESTING_DEPTH} levels — re-issue the call with a "
+                f"{depth_ceiling} levels — re-issue the call with a "
                 "flatter payload"
             )
             final_kind, final_msg = self._apply_consecutive_error_cap(
@@ -1743,6 +1704,7 @@ class ToolDispatcher:
             ctx=ctx,
             visibility_policy=visibility_policy,
             subagent_whitelist=subagent_whitelist,
+            child_run=child_run,
             hook_manager=self._hooks,
             skip_pre_tool_approval=preapproved_tool_call_id == tool_call.id,
         )
@@ -1818,7 +1780,7 @@ class ToolDispatcher:
         # by the per-run satisfied-precondition set, return a
         # ``[PRECONDITION NOT MET: ...]`` error envelope BEFORE invoking
         # the tool. The check is gated by
-        # ``RuntimeConstants.tool_preconditions_enabled`` so operators
+        # ``LoopConstants.tool_preconditions_enabled`` so operators
         # can disable enforcement without redeploying the tool registry.
         precondition_reason = self._check_tool_preconditions(
             tool=tool,
@@ -1846,12 +1808,11 @@ class ToolDispatcher:
             )
             return
 
-        # NOTE: ``sandbox_starting`` is intentionally NOT emitted here.
-        # The host's sandbox manager owns the event entirely — it emits only on
-        # cold start (with reason=session_first_call|respawn_after_idle,
-        # pod_id, namespace, sandbox_profile, run_id). The core
-        # dispatcher cannot distinguish hot from cold and would emit
-        # spurious events on every hot-pod dispatch.
+        # NOTE: ``tool_transport_starting`` is intentionally NOT emitted
+        # here. The host's transport owns that event entirely and emits it on
+        # a cold start only, with a payload describing how it was brought up.
+        # The dispatcher cannot tell a cold start from a warm one and would
+        # emit a spurious event on every warm dispatch.
 
         # ── Step 5: timeout-wrapped execute ────────────────────────
         # A tool that owns its own long-lived async unit (the ``Agent`` tool,
@@ -1865,7 +1826,7 @@ class ToolDispatcher:
         loop = asyncio.get_running_loop()
         started_at = loop.time()
         # #6 cancel propagation — when the executor put a per-run cancel
-        # ``asyncio.Event`` on the helper bag, RACE the tool task against it so a
+        # ``asyncio.Event`` on the run state, RACE the tool task against it so a
         # leader parked inside the synchronous ``Agent`` tool (whole subagent)
         # unblocks within the cancel-poll latency instead of ~2 min. Absent ⇒
         # the plain ``await asyncio.wait_for`` path (byte-identical, no-op for
@@ -1891,20 +1852,18 @@ class ToolDispatcher:
             raise ToolDispatchCancelled(
                 f"tool dispatch cancelled for run {ctx.run_id!r}"
             )
+        if on_dispatch_start is not None:
+            await on_dispatch_start(tool_call)
         try:
-            if cancel_event is None:
-                tool_result = await asyncio.wait_for(
-                    tool.invoke(ctx, final_args),
-                    timeout=effective_timeout,
-                )
-            else:
-                tool_result = await _invoke_tool_raced_with_cancel(
-                    tool=tool,
-                    ctx=ctx,
-                    final_args=final_args,
-                    effective_timeout=effective_timeout,
-                    cancel_event=cancel_event,
-                )
+            tool_result = await self._invoke_within_lifecycle(
+                lifecycle=lifecycle,
+                tool=tool,
+                tool_call=tool_call,
+                ctx=ctx,
+                final_args=final_args,
+                effective_timeout=effective_timeout,
+                cancel_event=cancel_event,
+            )
         except TimeoutError:
             duration_ms = int((loop.time() - started_at) * 1000)
             timeout_label = (
@@ -2041,21 +2000,39 @@ class ToolDispatcher:
             return
 
         success = not tool_result.is_error
-        content = tool_result.content
+        # ``content`` from here on is the MODEL PROJECTION — the text that
+        # will sit in the transcript. The canonical value is kept beside it
+        # and is never rewritten by anything below: the error paths, the
+        # consecutive-error cap and the PostToolUse hook all speak to the
+        # model, and a message written for the model is not the value the
+        # tool produced.
+        canonical_content = tool_result.content
+        content = tool_result.model_content
+        ui_payload = tool_result.ui_payload
+        canonical_ref = tool_result.canonical_ref
+        result_path = tool_result.path
         result_metadata = dict(tool_result.metadata)
         evidence_records = tool_result.evidence_records
         evidence_producer: EvidenceProducerBinding | None = None
         if success and evidence_records:
-            evidence_producer = ctx.evidence_producer_binding
+            evidence_producer = (
+                ctx.evidence.producer_binding if ctx.evidence is not None else None
+            )
             if evidence_producer is None:
                 success = False
                 content = "tool evidence rejected: registered tool has no evidence producer binding"
+                canonical_content = content
+                ui_payload = None
+                canonical_ref = None
                 evidence_records = ()
             else:
-                origin = ctx.evidence_origin
+                origin = ctx.evidence.origin if ctx.evidence is not None else None
                 if origin is None:
                     success = False
                     content = "tool evidence rejected: dispatch context has no evidence origin"
+                    canonical_content = content
+                    ui_payload = None
+                    canonical_ref = None
                     evidence_records = ()
                     evidence_producer = None
                 else:
@@ -2069,10 +2046,13 @@ class ToolDispatcher:
                         )
                         for record in evidence_records
                     )
-                    if not ctx.evidence_admission_deferred:
+                    if not _admission_deferred(ctx):
                         if admit_evidence is None:
                             success = False
                             content = "tool evidence rejected: dispatcher has no private ledger admission channel"
+                            canonical_content = content
+                            ui_payload = None
+                            canonical_ref = None
                             evidence_records = ()
                             evidence_producer = None
                         else:
@@ -2087,6 +2067,9 @@ class ToolDispatcher:
                                 )
                                 success = False
                                 content = f"tool evidence rejected: {exc}"
+                                canonical_content = content
+                                ui_payload = None
+                                canonical_ref = None
                                 evidence_records = ()
                                 evidence_producer = None
         # A tool that returns ``ToolResult(is_error=True)`` still counts as
@@ -2144,7 +2127,7 @@ class ToolDispatcher:
             # admitted first; otherwise a completion-order success could
             # satisfy a dependency before a later rejection turns it into an
             # error.  Serial dispatch commits the normal state immediately.
-            if not ctx.evidence_admission_deferred:
+            if not _admission_deferred(ctx):
                 # Successful tool result breaks the consecutive-error streak so a
                 # subsequent failure restarts at count=1. Without this reset,
                 # ``ToolA(err)…ToolA(ok)…ToolA(err)`` would carry the count
@@ -2219,14 +2202,26 @@ class ToolDispatcher:
             }
 
         # ── Step 6: ToolResult envelope event ──────────────────────
+        # ``success`` and ``is_error`` are both stated, and they mirror each
+        # other by construction. Two readers grew up on this payload asking
+        # opposite questions, and a client that reads only the one its author
+        # happened to pick must not see a failed call as a success.
+        #
+        # ``ui_payload`` leaves the runtime here and nowhere else: this event
+        # is the UI's channel, and the transcript built further down carries
+        # the projection only.
         yield TurnEvent(
             type=EventType.TOOL_RESULT,
             run_id=ctx.run_id,
             payload={
                 "tool_call_id": tool_call.id,
                 "success": success,
+                "is_error": not success,
                 "duration_ms": duration_ms,
                 "content_blocks": [{"type": "text", "text": content}],
+                **({"ui_payload": ui_payload} if ui_payload else {}),
+                **({"canonical_ref": canonical_ref} if canonical_ref else {}),
+                **({"path": result_path} if result_path else {}),
                 **({"metadata": outcome_metadata} if outcome_metadata else {}),
             },
         )
@@ -2241,6 +2236,12 @@ class ToolDispatcher:
             metadata=outcome_metadata,
             evidence_records=evidence_records,
             evidence_producer=evidence_producer,
+            canonical_content=(
+                None if canonical_content == content else canonical_content
+            ),
+            ui_payload=ui_payload,
+            canonical_ref=canonical_ref,
+            path=result_path,
         )
 
     # ------------------------------------------------------------------
@@ -2272,6 +2273,7 @@ class ToolDispatcher:
             payload={
                 "tool_call_id": tool_call.id,
                 "success": False,
+                "is_error": True,
                 "error": {
                     "kind": kind.value,
                     "message": message,
@@ -2281,32 +2283,33 @@ class ToolDispatcher:
         )
 
 
-def consume_sandbox_down_injection_signal(
-    helpers: dict[str, Any] | None,
+def consume_transport_down_injection_signal(
+    state: RunScopedState | None,
 ) -> bool:
-    """Public consumer for the SANDBOX_DOWN injection-pending flag.
+    """Public consumer for the transport-down injection-pending flag.
 
- The host executor loop calls this
- once per dispatched ``TurnEvent``. Returns ``True`` exactly once per
- streak (when :meth:`ToolDispatcher._track_sandbox_down_streak` armed
- the flag). Subsequent calls in the same streak return ``False`` until
- a successful tool call or a non-SANDBOX_DOWN error resets the counter.
+ The loop driving a run calls this once per dispatched ``TurnEvent``.
+ Returns ``True`` exactly once per streak (when
+ :meth:`ToolDispatcher._track_transport_down_streak` raised the flag).
+ Subsequent calls in the same streak return ``False`` until a successful
+ tool call or another error resets the counter.
 
  Parameters
  ----------
- helpers:
- The per-run helper bag (``ctx.metadata["protocore.helpers"]``).
- ``None`` is treated as "no signal" — the function never raises.
+ state:
+ The run's state. ``None`` is treated as "no signal" — the function
+ never raises.
 
  Returns
  -------
  bool
- ``True`` iff the dispatcher armed the flag and this is the first
- consumer to pop it. ``False`` otherwise.
+ ``True`` iff the dispatcher raised the flag and this is the first
+ consumer to take it. ``False`` otherwise.
  """
-    if helpers is None:
+    if state is None or not state.transport_down_injection_pending:
         return False
-    return bool(helpers.pop(_SANDBOX_DOWN_INJECTION_PENDING_KEY, False))
+    state.transport_down_injection_pending = False
+    return True
 
 
 __all__ = [
@@ -2315,5 +2318,5 @@ __all__ = [
     "ToolDispatcher",
     "ToolPermissionDecision",
     "ToolPermissionOutcome",
-    "consume_sandbox_down_injection_signal",
+    "consume_transport_down_injection_signal",
 ]

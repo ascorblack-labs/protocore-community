@@ -1,7 +1,7 @@
 """Tests for :mod:`protocore.runtime.token_counting`."""
 from __future__ import annotations
 
-from protocore.contracts.runtime_constants import RuntimeConstants
+from protocore.contracts.runtime_constants import LoopConstants
 from protocore.runtime.token_counting import (
     LanguageProfile,
     chars_per_token,
@@ -37,7 +37,7 @@ def test_detect_empty_defaults_latin() -> None:
 
 
 def test_chars_per_token_distinct_for_cyrillic_escape() -> None:
-    rc = RuntimeConstants()
+    rc = LoopConstants()
     # Cyrillic-in-JSON-escape MUST be lower cpt than cyrillic-prose (more
     # tokens per character due to UTF-8 escape doubling cost).
     cyrillic_cpt = chars_per_token(LanguageProfile.cyrillic_prose, rc)
@@ -46,17 +46,17 @@ def test_chars_per_token_distinct_for_cyrillic_escape() -> None:
 
 
 def test_estimate_tokens_nonzero() -> None:
-    rc = RuntimeConstants()
+    rc = LoopConstants()
     assert estimate_tokens("hello", rc) >= 1
 
 
 def test_estimate_tokens_empty() -> None:
-    rc = RuntimeConstants()
+    rc = LoopConstants()
     assert estimate_tokens("", rc) == 0
 
 
 def test_estimate_tokens_scales_with_length() -> None:
-    rc = RuntimeConstants()
+    rc = LoopConstants()
     short = estimate_tokens("a" * 100, rc)
     longer = estimate_tokens("a" * 1000, rc)
     assert longer > short
@@ -70,7 +70,7 @@ def test_estimate_tokens_mixed_content_not_poisoned_by_one_escape() -> None:
     Cyrillic char estimated ~33.3K tokens vs ~10K for the same Latin text —
     a 3.3x over-count that falsely tripped per-iteration compaction.
     """
-    rc = RuntimeConstants()
+    rc = LoopConstants()
     latin = "a" * 40_000
     pure = estimate_tokens(latin, rc)
     # "\\u0440" is the 6 literal ASCII chars backslash-u-0-4-4-0, i.e. a JSON
@@ -87,7 +87,7 @@ def test_estimate_tokens_mixed_content_not_poisoned_by_one_cyrillic() -> None:
     """Regression: one raw Cyrillic char in mostly-Latin text must NOT force
     the whole blob into the cyrillic_prose (cpt 2.5) bucket (was a 1.6x
     over-count)."""
-    rc = RuntimeConstants()
+    rc = LoopConstants()
     latin = "a" * 40_000
     pure = estimate_tokens(latin, rc)
     with_one_cyrillic = estimate_tokens(latin + "я", rc)
@@ -97,7 +97,7 @@ def test_estimate_tokens_mixed_content_not_poisoned_by_one_cyrillic() -> None:
 
 def test_estimate_tokens_pure_class_matches_single_profile() -> None:
     """The per-class partition must not change pure single-class estimates."""
-    rc = RuntimeConstants()
+    rc = LoopConstants()
     # Pure Latin: 1000 / 4.0 = 250.
     assert estimate_tokens("a" * 1000, rc) == 250
     # Pure Cyrillic prose: 1000 / 2.5 = 400.
@@ -109,7 +109,7 @@ def test_estimate_tokens_pure_class_matches_single_profile() -> None:
 def test_estimate_tokens_escaped_cyrillic_still_costed_high() -> None:
     """Escaped Cyrillic chars must still be costed at the high (escape) cpt —
     the fix must not UNDER-count them, only stop them poisoning the rest."""
-    rc = RuntimeConstants()
+    rc = LoopConstants()
     escaped = "\\u0440" * 1000  # 6000 chars of pure \\u04xx escape sequences.
     estimate = estimate_tokens(escaped, rc)
     # 6000 / 1.2 = 5000; escapes cost far more than the same char count of

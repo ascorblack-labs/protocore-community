@@ -26,7 +26,7 @@ from collections.abc import AsyncIterator
 import pytest
 
 from protocore.contracts.llm import ProviderDelta, ProviderDeltaKind
-from protocore.contracts.runtime_constants import RuntimeConstants
+from protocore.contracts.runtime_constants import LoopConstants
 from protocore.contracts.types import Message, MessageRole, TextBlock
 from protocore.runtime.events import EventType, TurnEvent
 from protocore.runtime.query import (
@@ -107,7 +107,7 @@ async def test_answer_shaped_text_block_is_public(engine_factory) -> None:
     ``collapsed`` would destroy — the user would be left with no reply at all —
     so it is pinned at both ends of the block, not just at the open.
     """
-    engine = engine_factory(rc=RuntimeConstants(model_context_window=4_096))
+    engine = engine_factory(rc=LoopConstants(model_context_window=4_096))
     engine.history.append(_user_message("what is a TOML table?"))
     engine.llm.stream_with_tools = _make_provider_deltas( # type: ignore[method-assign]
         [
@@ -136,7 +136,7 @@ async def test_terminal_gate_call_does_not_collapse_the_answer(
     durable transcript, which shows this message as prose and nothing else.
     """
     engine = engine_factory(
-        rc=RuntimeConstants(model_context_window=4_096),
+        rc=LoopConstants(model_context_window=4_096),
         expected_terminal_tool=_TERMINAL_TOOL,
     )
     engine.history.append(_user_message("summarise the findings"))
@@ -167,7 +167,7 @@ async def test_unnamed_tool_call_leaves_the_answer_public(engine_factory) -> Non
     the cheap error is the missed collapse, not the swallowed answer.
     """
     engine = engine_factory(
-        rc=RuntimeConstants(model_context_window=4_096),
+        rc=LoopConstants(model_context_window=4_096),
         expected_terminal_tool=_TERMINAL_TOOL,
     )
     engine.history.append(_user_message("summarise the findings"))
@@ -202,7 +202,7 @@ async def test_narration_before_a_tool_call_settles_on_the_stop(
     A client that renders live and reconciles on the stop ends up agreeing with
     what the transcript will say after a reload.
     """
-    engine = engine_factory(rc=RuntimeConstants(model_context_window=4_096))
+    engine = engine_factory(rc=LoopConstants(model_context_window=4_096))
     engine.history.append(_user_message("find the deprecation date"))
     engine.llm.stream_with_tools = _make_provider_deltas( # type: ignore[method-assign]
         [
@@ -230,7 +230,7 @@ async def test_narration_after_a_tool_call_opens_collapsed(engine_factory) -> No
     run's reply. That is the only thing the open frame can ever prove, and here
     it can.
     """
-    engine = engine_factory(rc=RuntimeConstants(model_context_window=4_096))
+    engine = engine_factory(rc=LoopConstants(model_context_window=4_096))
     engine.history.append(_user_message("find the deprecation date"))
     engine.llm.stream_with_tools = _make_provider_deltas( # type: ignore[method-assign]
         [
@@ -257,7 +257,7 @@ async def test_reasoning_is_never_prose(engine_factory) -> None:
     block is the model's working by definition, which is also how the durable
     transcript projects it (``reasoning_summary`` → ``collapsed``).
     """
-    engine = engine_factory(rc=RuntimeConstants(model_context_window=4_096))
+    engine = engine_factory(rc=LoopConstants(model_context_window=4_096))
     engine.history.append(_user_message("hi"))
     engine.llm.stream_with_tools = _make_provider_deltas( # type: ignore[method-assign]
         [
@@ -289,7 +289,7 @@ async def test_settled_value_never_relaxes_across_a_mixed_message(
     collapse the start already published. The message below opens a block on
     each side of a tool call so both directions are exercised at once.
     """
-    engine = engine_factory(rc=RuntimeConstants(model_context_window=4_096))
+    engine = engine_factory(rc=LoopConstants(model_context_window=4_096))
     engine.history.append(_user_message("find the deprecation date"))
     engine.llm.stream_with_tools = _make_provider_deltas( # type: ignore[method-assign]
         [
@@ -333,7 +333,7 @@ async def test_a_consumer_that_ignores_the_field_sees_todays_stream(
     than just that the old keys survive — also catches a frame being added,
     removed or reordered on the way in.
     """
-    engine = engine_factory(rc=RuntimeConstants(model_context_window=4_096))
+    engine = engine_factory(rc=LoopConstants(model_context_window=4_096))
     engine.history.append(_user_message("find the deprecation date"))
     engine.llm.stream_with_tools = _make_provider_deltas( # type: ignore[method-assign]
         [

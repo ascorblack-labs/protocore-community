@@ -20,7 +20,7 @@ Universal-core invariants:
   transport classifier onto these neutral classes.
 * **Behaviour-preserving by default.** Every knob defaults to a value that
   reproduces current behaviour; resilience is opt-in per tenant via
-  ``RuntimeConstants.resilience_*``.
+  ``LoopConstants.resilience_*``.
 * **Horizontal-scale-safe.** The token bucket here is a pure data model;
   the runtime helper that mutates it (``protocore.runtime.resilience``)
   takes an injected lock so a pod keeps its own non-amplification budget
@@ -31,6 +31,9 @@ Universal-core invariants:
 The contracts split:
 
 * :class:`ResilienceErrorClass` — the small neutral failure taxonomy.
+* :class:`IResilienceClassifier` — the host's verdict on which of those
+  classes a failure message belongs to, so core never learns to read
+  wordings it does not own.
 * :class:`ResilienceAction` — the small neutral recovery-strategy set.
 * :class:`ResilienceDecision` — one classify-then-act verdict.
 * :class:`RetryBudgetState` — the pure token-bucket model.
@@ -185,6 +188,47 @@ RETRYABLE_ERROR_CLASSES: frozenset[ResilienceErrorClass] = frozenset(
 )
 """Error classes that are candidate-retryable (still gated by budget,
 deadline reserve, and the per-call idempotency stance)."""
+
+
+# The classes that mean "the way out to the tool is down, not the request".
+# A streak of these on one tool is evidence the tool is unreachable however
+# its message is worded, so the dispatcher collapses them to a single error
+# signature and counts them as one run of failures.
+TRANSPORT_DOWN_ERROR_CLASSES: frozenset[ResilienceErrorClass] = frozenset(
+    {
+        ResilienceErrorClass.transient_retryable,
+        ResilienceErrorClass.rate_limited,
+        ResilienceErrorClass.timeout_rebuild,
+    }
+)
+"""Error classes that say the transport, not the call, is at fault."""
+
+
+@runtime_checkable
+class IResilienceClassifier(Protocol):
+    """The host's verdict on what kind of failure a message describes.
+
+    Core reads failure text it did not write and must not learn to recognise
+    it: the wordings belong to whatever the host put behind its tools, and a
+    pattern for them in core is a copy of another codebase that goes stale
+    without a build ever failing. So the host, which owns those wordings,
+    answers the only question core asks of them — which neutral class of
+    failure is this — and core acts on the class alone.
+
+    A host that binds no classifier keeps the neutral behaviour: every failure
+    is told apart by its own text, and none is recognised as a transport
+    being down.
+    """
+
+    def classify_error_text(
+        self, message: str, *, tool_name: str | None = None
+    ) -> ResilienceErrorClass | None:
+        """Classify one failure message, or return ``None`` for no verdict.
+
+        ``None`` is the honest answer for text the host does not recognise;
+        core then treats the failure as its own distinct kind rather than
+        folding it into a class it was not shown to belong to.
+        """
 
 
 class ResilienceAction(StrEnum):
@@ -409,7 +453,9 @@ class IToolTransport(Protocol):
 
 __all__ = [
     "RETRYABLE_ERROR_CLASSES",
+    "TRANSPORT_DOWN_ERROR_CLASSES",
     "ClassifiedLike",
+    "IResilienceClassifier",
     "IToolTransport",
     "ResilienceAction",
     "ResilienceDecision",

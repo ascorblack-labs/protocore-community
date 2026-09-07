@@ -15,6 +15,11 @@ from enum import StrEnum
 # stream event types are where a reader of the wire format looks for it.
 from protocore.contracts.types import BlockVisibility
 
+# The lifecycle of a host's tool transport is named in both event vocabularies,
+# and the key that says WHICH transport is the same key in both. Imported
+# rather than restated so the two cannot drift.
+from protocore.events import TOOL_TRANSPORT_EVENT_FIELD
+
 
 class EventType(StrEnum):
     """Per-turn streaming event taxonomy.
@@ -38,13 +43,21 @@ class EventType(StrEnum):
     ERROR = "error"
 
     # ----- Protocore extensions -----
-    SANDBOX_STARTING = "sandbox_starting"
-    SANDBOX_READY = "sandbox_ready"
+    # Whatever the host puts between a tool call and the place it runs. Its
+    # payload names the transport under
+    # :data:`~protocore.events.TOOL_TRANSPORT_EVENT_FIELD`.
+    TOOL_TRANSPORT_STARTING = "tool_transport_starting"
+    TOOL_TRANSPORT_READY = "tool_transport_ready"
     SUBAGENT_SPAWN = "subagent_spawn"
     SUBAGENT_PROGRESS = "subagent_progress"
     SUBAGENT_COMPLETE = "subagent_complete"
     HOOK_FIRED = "hook_fired"
     TOOL_CALL_PENDING = "tool_call_pending"
+    # A wait was recorded, typed and with an identity. Carries the interrupt
+    # that was just parked and the whole open set beside it, so a host that
+    # renders one card per wait can draw a parked batch in one pass and quote
+    # the ids back when the answers arrive.
+    INTERRUPT_PARKED = "interrupt_parked"
     STATE_CHANGED = "state_changed"
     # Deep-mode SGR plan step. Carries the
     # structured ordered plan + the single next tool the model recorded
@@ -91,4 +104,4 @@ class EventType(StrEnum):
     CANDIDATE_RELEASED = "candidate_released"
 
 
-__all__ = ["BlockVisibility", "EventType"]
+__all__ = ["TOOL_TRANSPORT_EVENT_FIELD", "BlockVisibility", "EventType"]

@@ -1,6 +1,6 @@
 """Repeated-tool-error circuit breaker (core).
 
-When a tool fails ``RuntimeConstants.max_consecutive_tool_errors`` times in a row
+When a tool fails ``LoopConstants.max_consecutive_tool_errors`` times in a row
 with the SAME error class, the core loop HARD-STOPS it for the rest of the run
 (removed from the advertised surface AND denied at dispatch via
 ``effective_tool_policy.blocked``) and injects ONE bounded corrective
@@ -21,7 +21,7 @@ from __future__ import annotations
 
 import pytest
 
-from protocore.contracts.runtime_constants import RuntimeConstants
+from protocore.contracts.runtime_constants import LoopConstants
 from protocore.contracts.tools import ToolInvocationError
 from protocore.contracts.types import (
     SYNTHETIC_RECOVERY_CIRCUIT_BREAKER,
@@ -54,7 +54,7 @@ FAILING = "Read"  # mirror the /project tool family that storms
 
 def _engine(
     *,
-    rc: RuntimeConstants | None = None,
+    rc: LoopConstants | None = None,
     tools: list[MockTool] | None = None,
     expected_terminal_tool: str | None = None,
 ) -> QueryEngine:
@@ -67,7 +67,7 @@ def _engine(
             tenant_id="tenant-cb",
             session_id="sess-cb",
             model_name="qwen3.6-35b-a3b",
-            rc=rc or RuntimeConstants(model_context_window=4_096),
+            rc=rc or LoopConstants(model_context_window=4_096),
             expected_terminal_tool=expected_terminal_tool,
         ),
         llm_provider=object(),  # type: ignore[arg-type]  # never streamed in these tests
@@ -77,7 +77,7 @@ def _engine(
         skill_store=InMemorySkillStore(),
         blob_store=InMemoryBlobStore(),
     )
-    # The per-run helper bag is wired by the executor in production; here we
+    # The per-run state is wired by the executor in production; here we
     # attach an empty one (the dispatcher reads adapters from it). The breaker's
     # in-flight streak lives on the ENGINE (``_circuit_breaker_streak``), not the
     # bag, so it is snapshot-persisted across resume.
@@ -269,7 +269,7 @@ async def test_breaker_state_survives_snapshot_round_trip() -> None:
 @pytest.mark.asyncio
 async def test_default_cap_value_is_three() -> None:
     """Lock the documented default (trips on the 3rd identical failure)."""
-    assert RuntimeConstants().max_consecutive_tool_errors == 3
+    assert LoopConstants().max_consecutive_tool_errors == 3
     assert _resolve_max_consecutive_tool_errors(_engine()) == 3
 
 
@@ -334,7 +334,7 @@ async def test_success_of_different_tool_resets_streak() -> None:
 async def test_in_flight_streak_survives_snapshot_resume_and_trips() -> None:
     """The pre-trip streak is snapshot-persisted, so a cross-pod
     resume at cap-1 failures keeps the count: ONE more failure on the resumed
-    engine trips. (Before the fix a fresh helper bag reset the count and the run
+    engine trips. (Before the fix a fresh run state reset the count and the run
     could exceed the cap without tripping.)"""
     engine = _engine(tools=[_failing_tool()])
     cap = engine.config.rc.max_consecutive_tool_errors
@@ -343,7 +343,7 @@ async def test_in_flight_streak_survives_snapshot_resume_and_trips() -> None:
     for i in range(cap - 1):
         await _dispatch(engine, _call(f"t{i}"))
     assert FAILING not in engine._circuit_broken_tools
-    # The in-flight streak is captured in the snapshot (NOT just the helper bag).
+    # The in-flight streak is captured in the snapshot (NOT just the run state).
     snapshot = engine.snapshot()
     assert snapshot["circuit_breaker_streak"] == {
         "tool_name": FAILING,
@@ -351,7 +351,7 @@ async def test_in_flight_streak_survives_snapshot_resume_and_trips() -> None:
         "count": cap - 1,
     }
 
-    # Resume on a fresh pod (fresh helper bag) ...
+    # Resume on a fresh pod (fresh run state) ...
     resumed = _engine(tools=[_failing_tool()])
     await resumed.resume_from_snapshot(snapshot)
     assert resumed._circuit_breaker_streak == {

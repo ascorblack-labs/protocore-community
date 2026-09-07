@@ -11,14 +11,29 @@ tests, not benchmark performance. Programmable surfaces (e.g.
 from __future__ import annotations
 
 import asyncio
+import builtins
 import hashlib
 from collections import defaultdict, deque
-from collections.abc import AsyncIterator, Sequence
+from collections.abc import AsyncIterator, Callable, Coroutine, Mapping, Sequence
+from contextlib import suppress
 from datetime import UTC as _UTC
 from datetime import datetime
-from typing import Any
+from typing import Any, cast
 
-from protocore.contracts.agent_dispatch import IAgentDispatch, SubagentNotFoundError
+from protocore.contracts.agent_dispatch import (
+    IAgentDispatch,
+    SubagentHandle,
+    SubagentNotFoundError,
+)
+from protocore.contracts.background import (
+    BACKGROUND_TERMINAL_STATUSES,
+    AgentRef,
+    StartWork,
+    TaskRecord,
+    TerminalObserver,
+    WorkHandle,
+    WorkSpec,
+)
 from protocore.contracts.blob import BlobNotFoundError, IBlobStore
 from protocore.contracts.events import IEventStream
 from protocore.contracts.hooks import (
@@ -44,6 +59,12 @@ from protocore.contracts.memory import (
     MemoryScope,
     MemoryWriteDecision,
     MemoryWriteResult,
+)
+from protocore.contracts.observability import (
+    IRequestManifestSink,
+    ManifestValue,
+    RequestManifest,
+    request_digest,
 )
 from protocore.contracts.run import IRunStore, RunNotFoundError
 from protocore.contracts.search import Hit, IndexDoc, ISearchIndex
@@ -211,6 +232,73 @@ class InMemoryLLMProvider(ILLMProvider):
                     name="usage",
                     payload={"input_tokens": usage_input_tokens},
                 )
+            )
+        stream.append(
+            LLMStreamEvent(
+                name="message_stop",
+                payload={"stop_reason": StopReason.tool_use.value},
+            )
+        )
+        self._scripted_streams.append(stream)
+
+    def queue_scripted_stream(self, events: Sequence[LLMStreamEvent]) -> None:
+        """Enqueue one raw provider stream, emitted verbatim on the next call.
+
+        The escape hatch behind the shaped helpers above: a scenario that
+        needs a turn no helper spells — several ``tool_use`` blocks in one
+        assistant message, reasoning deltas with no text, a stream that
+        stops mid-block — scripts the events itself instead of reaching
+        into this double's queue.
+        """
+        self._scripted_streams.append(list(events))
+
+    def queue_multi_tool_call_response(
+        self,
+        *,
+        tool_calls: Sequence[tuple[str, str, dict[str, Any]]],
+        text_prefix: str = "",
+    ) -> None:
+        """Enqueue ONE assistant turn emitting several ``tool_use`` blocks.
+
+        ``tool_calls`` is ``(tool_call_id, tool_name, arguments)`` in the
+        order the model asks for them — the order the run must preserve in
+        history whatever order the tools finish in.
+        """
+        import json as _json
+
+        stream: list[LLMStreamEvent] = [
+            LLMStreamEvent(name="message_start", payload={}),
+        ]
+        if text_prefix:
+            stream.extend(
+                [
+                    LLMStreamEvent(name="content_block_start", payload={"kind": "text"}),
+                    LLMStreamEvent(
+                        name="content_block_delta",
+                        payload={"text": text_prefix, "kind": "text"},
+                    ),
+                    LLMStreamEvent(name="content_block_stop", payload={}),
+                ]
+            )
+        for tool_call_id, tool_name, args in tool_calls:
+            stream.extend(
+                [
+                    LLMStreamEvent(
+                        name="tool_use_start",
+                        payload={"tool_call_id": tool_call_id, "tool_name": tool_name},
+                    ),
+                    LLMStreamEvent(
+                        name="tool_use_input_delta",
+                        payload={
+                            "tool_call_id": tool_call_id,
+                            "partial_input_json": _json.dumps(args),
+                        },
+                    ),
+                    LLMStreamEvent(
+                        name="tool_use_stop",
+                        payload={"tool_call_id": tool_call_id, "final_input": args},
+                    ),
+                ]
             )
         stream.append(
             LLMStreamEvent(
@@ -485,7 +573,7 @@ class InMemoryMemory(IMemory):
 
     #: Default dedup threshold the fake applies when the caller passes
     #: ``similarity_threshold=None`` (the real adapter resolves this from
-    #: ``RuntimeConstants.memory_write_similarity_threshold``).
+    #: ``LoopConstants.memory_write_similarity_threshold``).
     default_similarity_threshold: float = 0.85
 
     #: Default per-scope soft cap the fake applies when the caller passes
@@ -835,7 +923,7 @@ class InMemoryWorkspace(IWorkspace):
     """
 
     #: Defaults applied when the caller passes the corresponding cap as ``None``
-    #: (0 = unbounded). The real adapter resolves these from RuntimeConstants.
+    #: (0 = unbounded). The real adapter resolves these from LoopConstants.
     default_max_bytes: int = 1_048_576
     default_max_units_per_scope: int = 256
     default_max_scope_bytes: int = 33_554_432
@@ -1292,7 +1380,7 @@ class InMemoryWorkspace(IWorkspace):
 
 
 class InMemorySkillStore(ISkillStore):
-    """``dict[(tenant_id, skill_id), (manifest, body)]`` backed.
+    """``dict[(account_id, skill_id), (manifest, body)]`` backed.
 
     Flat account-scoped catalog: each skill is ``id``/``name``/
     ``description``/``enabled``. Mirrors the real ``PgSkillStore`` which
@@ -1301,20 +1389,20 @@ class InMemorySkillStore(ISkillStore):
 
     def __init__(self) -> None:
         self._store: dict[tuple[str, str], tuple[SkillManifest, str]] = {}
-        # Multi-file overlay keyed by (tenant_id, skill_id). When a key is
+        # Multi-file overlay keyed by (account_id, skill_id). When a key is
         # missing we synthesise a single SKILL.md entry from the legacy body
         # (lazy backward path).
         self._files: dict[tuple[str, str], dict[str, bytes]] = {}
         # ``SkillManifest`` (the frozen core contract) carries no ``enabled``
         # flag, but the real store filters disabled skills out of ``list`` and
         # ``list_enabled_subset``. Track the toggle as fixture-only side state
-        # keyed by ``(tenant_id, skill_id)``. Missing key ⇒ enabled.
+        # keyed by ``(account_id, skill_id)``. Missing key ⇒ enabled.
         self._enabled: dict[tuple[str, str], bool] = {}
 
-    async def list(self, tenant_id: str) -> Sequence[SkillIndexEntry]:
+    async def list(self, account_id: str) -> Sequence[SkillIndexEntry]:
         entries: list[SkillIndexEntry] = []
         for (t, skill_id), (manifest, _) in self._store.items():
-            if t != tenant_id:
+            if t != account_id:
                 continue
             # The real store only returns ``enabled = TRUE`` skills.
             enabled = self._enabled.get((t, skill_id), True)
@@ -1330,16 +1418,16 @@ class InMemorySkillStore(ISkillStore):
             )
         return entries
 
-    async def load(self, tenant_id: str, skill_id: str) -> SkillBundle:
-        manifest, body = self._store[(tenant_id, skill_id)]
+    async def load(self, account_id: str, skill_id: str) -> SkillBundle:
+        manifest, body = self._store[(account_id, skill_id)]
         return SkillBundle(manifest=manifest, body=body)
 
-    async def upsert(self, tenant_id: str, manifest: SkillManifest, body: str) -> None:
-        self._store[(tenant_id, manifest.id)] = (manifest, body)
+    async def upsert(self, account_id: str, manifest: SkillManifest, body: str) -> None:
+        self._store[(account_id, manifest.id)] = (manifest, body)
 
     async def create(
         self,
-        tenant_id: str,
+        account_id: str,
         payload: SkillUpsertInput,
     ) -> SkillIndexEntry:
         import uuid
@@ -1349,10 +1437,10 @@ class InMemorySkillStore(ISkillStore):
             id=new_id,
             name=payload.name,
             description=payload.description,
-            tenant_id=tenant_id,
+            tenant_id=account_id,
         )
-        self._store[(tenant_id, new_id)] = (manifest, payload.body_md)
-        self._enabled[(tenant_id, new_id)] = payload.enabled
+        self._store[(account_id, new_id)] = (manifest, payload.body_md)
+        self._enabled[(account_id, new_id)] = payload.enabled
         return SkillIndexEntry(
             id=new_id,
             name=payload.name,
@@ -1362,11 +1450,11 @@ class InMemorySkillStore(ISkillStore):
 
     async def update(
         self,
-        tenant_id: str,
+        account_id: str,
         skill_id: str,
         payload: SkillUpsertInput,
     ) -> SkillIndexEntry:
-        if (tenant_id, skill_id) not in self._store:
+        if (account_id, skill_id) not in self._store:
             from protocore.contracts.skills import SkillNotFoundError
 
             raise SkillNotFoundError(f"skill {skill_id} not found")
@@ -1374,10 +1462,10 @@ class InMemorySkillStore(ISkillStore):
             id=skill_id,
             name=payload.name,
             description=payload.description,
-            tenant_id=tenant_id,
+            tenant_id=account_id,
         )
-        self._store[(tenant_id, skill_id)] = (manifest, payload.body_md)
-        self._enabled[(tenant_id, skill_id)] = payload.enabled
+        self._store[(account_id, skill_id)] = (manifest, payload.body_md)
+        self._enabled[(account_id, skill_id)] = payload.enabled
         return SkillIndexEntry(
             id=skill_id,
             name=payload.name,
@@ -1385,18 +1473,18 @@ class InMemorySkillStore(ISkillStore):
             enabled=payload.enabled,
         )
 
-    async def delete(self, tenant_id: str, skill_id: str) -> None:
-        self._store.pop((tenant_id, skill_id), None)
-        self._enabled.pop((tenant_id, skill_id), None)
+    async def delete(self, account_id: str, skill_id: str) -> None:
+        self._store.pop((account_id, skill_id), None)
+        self._enabled.pop((account_id, skill_id), None)
 
-    async def set_enabled(self, tenant_id: str, skill_id: str, *, enabled: bool) -> None:
+    async def set_enabled(self, account_id: str, skill_id: str, *, enabled: bool) -> None:
         # Track the toggle in fixture side state so ``list`` /
         # ``list_enabled_subset`` drop disabled skills with store parity.
-        self._enabled[(tenant_id, skill_id)] = enabled
+        self._enabled[(account_id, skill_id)] = enabled
 
     def _subset_entries(
         self,
-        tenant_id: str,
+        account_id: str,
         names: Sequence[str],
         *,
         enabled_only: bool,
@@ -1409,7 +1497,7 @@ class InMemorySkillStore(ISkillStore):
         wanted = set(names)
         out: list[SkillIndexEntry] = []
         for (t, skill_id), (manifest, _) in self._store.items():
-            if t != tenant_id:
+            if t != account_id:
                 continue
             if manifest.name not in wanted:
                 continue
@@ -1428,22 +1516,22 @@ class InMemorySkillStore(ISkillStore):
 
     async def list_subset(
         self,
-        tenant_id: str,
+        account_id: str,
         names: Sequence[str],
     ) -> Sequence[SkillIndexEntry]:
         # Whitelist resolution by bare name — like the real store, ignores
         # the ``enabled`` toggle.
-        return self._subset_entries(tenant_id, names, enabled_only=False)
+        return self._subset_entries(account_id, names, enabled_only=False)
 
     async def list_enabled_subset(
         self,
-        tenant_id: str,
+        account_id: str,
         names: Sequence[str],
     ) -> Sequence[SkillIndexEntry]:
         # Prompt-surfacing path: same bare-name matching as ``list_subset``
         # plus the ``enabled = TRUE`` filter so a disabled skill is not
         # resurfaced by a stale project pin.
-        return self._subset_entries(tenant_id, names, enabled_only=True)
+        return self._subset_entries(account_id, names, enabled_only=True)
 
     # ------------------------------------------------------------------
     # Multi-file bundle surface.
@@ -1451,7 +1539,7 @@ class InMemorySkillStore(ISkillStore):
 
     def put_file(
         self,
-        tenant_id: str,
+        account_id: str,
         skill_id: str,
         path: str,
         body: bytes,
@@ -1462,18 +1550,18 @@ class InMemorySkillStore(ISkillStore):
         integration tests to exercise the multi-file surface without
         needing the real PG-backed adapter + IBlobStore wiring.
         """
-        bundle = self._files.setdefault((tenant_id, skill_id), {})
+        bundle = self._files.setdefault((account_id, skill_id), {})
         bundle[path] = body
 
     async def list_files(
         self,
-        tenant_id: str,
+        account_id: str,
         skill_id: str,
     ) -> Sequence[SkillFileRef]:
-        bundle = self._files.get((tenant_id, skill_id))
+        bundle = self._files.get((account_id, skill_id))
         if bundle is None:
             # Lazy backward path — synthesise SKILL.md from legacy body.
-            stored = self._store.get((tenant_id, skill_id))
+            stored = self._store.get((account_id, skill_id))
             if stored is None:
                 return []
             _, body = stored
@@ -1505,15 +1593,15 @@ class InMemorySkillStore(ISkillStore):
 
     async def load_file(
         self,
-        tenant_id: str,
+        account_id: str,
         skill_id: str,
         path: str,
     ) -> bytes | None:
-        bundle = self._files.get((tenant_id, skill_id))
+        bundle = self._files.get((account_id, skill_id))
         if bundle is None:
             if path != SKILL_ENTRY_PATH:
                 return None
-            stored = self._store.get((tenant_id, skill_id))
+            stored = self._store.get((account_id, skill_id))
             if stored is None:
                 return None
             _, body = stored
@@ -1529,9 +1617,13 @@ class InMemorySkillStore(ISkillStore):
 class InMemoryAgentDispatch(IAgentDispatch):
     """In-memory subagent registry + scripted dispatch result."""
 
-    def __init__(self) -> None:
+    def __init__(self, pool: InMemoryWorkPool | None = None) -> None:
         self._defs: dict[tuple[str, str], SubagentDef] = {}
         self._next_result: SubagentResult | None = None
+        #: Where launched children live. Given one by the host in production;
+        #: minted here so a test that only wants a scripted result gets a
+        #: working pool without having to assemble one.
+        self.pool = pool if pool is not None else InMemoryWorkPool()
 
     def register(self, definition: SubagentDef) -> None:
         self._defs[(definition.tenant_id, definition.id)] = definition
@@ -1549,17 +1641,222 @@ class InMemoryAgentDispatch(IAgentDispatch):
         except KeyError as e:
             raise SubagentNotFoundError(subagent_id) from e
 
-    async def dispatch(self, task: SubagentTask) -> SubagentResult:
-        if self._next_result is not None:
-            result = self._next_result
-            self._next_result = None
-            return result
-        return SubagentResult(
-            subagent_id=task.subagent_id,
-            parent_run_id=task.parent_run_id,
-            output="",
-            success=True,
+    async def dispatch(self, task: SubagentTask) -> SubagentHandle:
+        """Launch the scripted child and hand back its handle.
+
+        The double launches through the same pool a host would, so a test that
+        exercises the handle exercises the shape the host has to supply rather
+        than a shortcut only the double has.
+        """
+        result = self._next_result
+        self._next_result = None
+        if result is None:
+            result = SubagentResult(
+                subagent_id=task.subagent_id,
+                parent_run_id=task.parent_run_id,
+                output="",
+                success=True,
+            )
+        settled = result
+
+        async def _start(task_id: str) -> WorkHandle[SubagentResult]:
+            async def _run() -> SubagentResult:
+                return settled
+
+            return InMemoryWorkHandle(task_id=task_id, pool=self.pool, run=_run())
+
+        record = await self.pool.launch(
+            WorkSpec(
+                session_id=task.parent_run_id,
+                kind="agent",
+                label=task.subagent_id,
+                notify_on_finish=task.notify_on_finish,
+                expected_seconds=task.expected_seconds,
+                timeout_seconds=task.timeout_seconds,
+                agent=AgentRef(name=task.subagent_id),
+            ),
+            _start,
         )
+        handle = self.pool.handle(record.id)
+        if handle is None:  # pragma: no cover - launch always binds one
+            raise RuntimeError(f"pool lost the handle for {record.id}")
+        return cast("SubagentHandle", handle)
+
+
+# ---------------------------------------------------------------------------
+# In-memory work pool — commands and child runs under one address space
+# ---------------------------------------------------------------------------
+
+
+class InMemoryWorkHandle:
+    """One launched unit of work, backed by a coroutine.
+
+    The handle owns the task, not the other way round: cancelling it is how the
+    work stops, and awaiting it is how the work is collected. Both are done
+    through the same object because a caller that could wait but not stop would
+    have to reach past the handle to cancel, and whatever it reached for would
+    be the real handle.
+    """
+
+    def __init__(
+        self, *, task_id: str, pool: InMemoryWorkPool, run: Coroutine[Any, Any, Any]
+    ) -> None:
+        self._task_id = task_id
+        self._pool = pool
+        self._task: asyncio.Task[Any] = asyncio.ensure_future(run)
+        self._task.add_done_callback(self._settle)
+
+    def identity(self) -> TaskRecord:
+        record = self._pool.get(self._task_id)
+        if record is None:  # pragma: no cover - the record outlives the handle
+            raise RuntimeError(f"pool lost the record for {self._task_id}")
+        return record
+
+    async def wait(self) -> Any:
+        return await asyncio.shield(self._task)
+
+    async def stop(self, grace_seconds: float = 0.0) -> TaskRecord:
+        if not self._task.done():
+            if grace_seconds > 0:
+                with suppress(asyncio.TimeoutError, asyncio.CancelledError):
+                    await asyncio.wait_for(
+                        asyncio.shield(self._task), timeout=grace_seconds
+                    )
+            self._task.cancel()
+            with suppress(asyncio.CancelledError):
+                await self._task
+        return self.identity()
+
+    def _settle(self, task: asyncio.Task[Any]) -> None:
+        record = self._pool.get(self._task_id)
+        if record is None or record.terminal:
+            return
+        record.finished_at = self._pool.clock()
+        if task.cancelled():
+            record.status = "stopped"
+        elif task.exception() is not None:
+            record.status = "failed"
+            record.error = str(task.exception())
+            record.exit_code = 1
+        else:
+            record.status = "succeeded"
+            record.exit_code = 0
+        self._pool.announce(record)
+
+
+class InMemoryWorkPool:
+    """A pool that holds both kinds of work, for tests and for host reference."""
+
+    def __init__(self) -> None:
+        self.records: list[TaskRecord] = []
+        self.handles: dict[str, InMemoryWorkHandle] = {}
+        self.attached_sessions: set[str] = set()
+        self.observers: list[TerminalObserver] = []
+        self.stopped_sessions: list[tuple[str, float]] = []
+        self._minted = 0
+        self._woken: set[str] = set()
+        self._now = 0.0
+
+    # -- what a test drives --------------------------------------------------
+
+    def clock(self) -> float:
+        """Monotonic-enough time. Advanced explicitly so durations are stated."""
+        return self._now
+
+    def advance(self, seconds: float) -> None:
+        self._now += seconds
+
+    def announce(self, record: TaskRecord) -> None:
+        for observer in list(self.observers):
+            observer(record)
+
+    # -- IWorkPool -----------------------------------------------------------
+
+    async def launch(self, spec: WorkSpec, start: StartWork) -> TaskRecord:
+        self._minted += 1
+        record = TaskRecord.minted(f"task-{self._minted}", spec)
+        self.records.append(record)
+        self.attached_sessions.add(spec.session_id)
+        record.status = "running"
+        record.started_at = self._now
+        handle = await start(record.id)
+        self.handles[record.id] = cast("InMemoryWorkHandle", handle)
+        return record
+
+    def handle(self, task_id: str) -> WorkHandle[Any] | None:
+        return self.handles.get(task_id)
+
+    async def stop(
+        self, task_id: str, grace_seconds: float = 0.0
+    ) -> TaskRecord | None:
+        handle = self.handles.get(task_id)
+        if handle is None:
+            return self.get(task_id)
+        return await handle.stop(grace_seconds)
+
+    async def stop_session(
+        self, scope: str, grace_seconds: float = 0.0
+    ) -> Sequence[TaskRecord]:
+        self.stopped_sessions.append((scope, grace_seconds))
+        stopped: list[TaskRecord] = []
+        for record in list(self.owned_by(scope)):
+            if record.terminal:
+                continue
+            result = await self.stop(record.id, grace_seconds)
+            if result is not None:
+                stopped.append(result)
+        return stopped
+
+    def owned_by(self, scope: str) -> builtins.list[TaskRecord]:
+        """Records ``scope`` is responsible for ending — its own, or its session's."""
+        return [
+            record
+            for record in self.records
+            if scope in (record.owner_scope, record.session_id)
+        ]
+
+    def subscribe(self, on_terminal: TerminalObserver) -> Callable[[], None]:
+        self.observers.append(on_terminal)
+
+        def _cancel() -> None:
+            if on_terminal in self.observers:
+                self.observers.remove(on_terminal)
+
+        return _cancel
+
+    def mark_session_attached(self, session_id: str) -> None:
+        self.attached_sessions.add(session_id)
+
+    async def ensure_session_attached(self, session_id: str) -> bool:
+        if session_id not in self.attached_sessions:
+            return False
+        return all(
+            record.terminal or record.id in self.handles
+            for record in self.list(session_id)
+        )
+
+    def list(self, session_id: str) -> builtins.list[TaskRecord]:
+        return [item for item in self.records if item.session_id == session_id]
+
+    def get(self, task_id: str) -> TaskRecord | None:
+        for item in self.records:
+            if item.id == task_id:
+                return item
+        return None
+
+    async def refresh(self, task_id: str) -> object:
+        return self.get(task_id)
+
+    def drain_wakes(self, session_id: str) -> builtins.list[str]:
+        ids = [
+            item.id
+            for item in self.list(session_id)
+            if item.notify_on_finish
+            and item.status in BACKGROUND_TERMINAL_STATUSES
+            and item.id not in self._woken
+        ]
+        self._woken.update(ids)
+        return ids
 
 
 # ---------------------------------------------------------------------------
@@ -1724,12 +2021,17 @@ class InMemoryHookManager(IHookManager):
 
     def __init__(self) -> None:
         self._specs: dict[str, HookSpec] = {}
-        self._next_action: dict[HookEvent, HookResult] = {}
+        self._scripted: dict[HookEvent, list[HookResult]] = {}
         self.invocations: list[tuple[HookEvent, dict[str, Any], str]] = []
 
     def queue_action(self, event: HookEvent, result: HookResult) -> None:
-        """Script the next :meth:`invoke` return value for an event."""
-        self._next_action[event] = result
+        """Script one more :meth:`invoke` return value for an event.
+
+        A queue rather than a slot, because a single assistant message can
+        ask for several calls and a test about what happens to the SECOND one
+        has to be able to say what the hook did to the first.
+        """
+        self._scripted.setdefault(event, []).append(result)
 
     async def invoke(
         self,
@@ -1738,8 +2040,10 @@ class InMemoryHookManager(IHookManager):
         tenant_id: str,
     ) -> HookResult:
         self.invocations.append((event, payload, tenant_id))
-        result = self._next_action.pop(event, None)
-        return result or HookResult(action=HookActionKind.ALLOW)
+        scripted = self._scripted.get(event)
+        if scripted:
+            return scripted.pop(0)
+        return HookResult(action=HookActionKind.ALLOW)
 
     async def register(self, spec: HookSpec) -> None:
         self._specs[spec.id] = spec
@@ -1872,6 +2176,215 @@ class InMemoryToolRegistry(IToolRegistry):
         return defs
 
 
+# ---------------------------------------------------------------------------
+# In-memory request-manifest sink + the replay provider it feeds
+# ---------------------------------------------------------------------------
+
+
+class ReplayMismatchError(AssertionError):
+    """A replayed run asked for something the recording does not contain.
+
+    An ``AssertionError`` on purpose: a replay that quietly served the nearest
+    recorded answer would be a fixture that agrees with whatever the code now
+    does, which is the one thing a recording exists to rule out.
+    """
+
+
+class InMemoryRequestManifestSink(IRequestManifestSink):
+    """Keeps every manifest, and puts the oversized bodies in a blob store.
+
+    This is the shape a host is expected to have — the core hands over a
+    manifest and the parts too large to inline, and the host decides where they
+    live. Here they go into an :class:`InMemoryBlobStore`, whose ``put`` is
+    content-addressed and idempotent exactly as the contract requires, and the
+    ref comes back onto a copy of the manifest through
+    :meth:`RequestManifest.with_blob_refs`.
+
+    Recording is what makes it useful twice: the manifests it holds are the
+    input to :class:`ReplayLLMProvider`, so a test can drive a run, keep what
+    it asked for, and then prove that the same run rebuilt elsewhere asks for
+    the same thing.
+    """
+
+    def __init__(self, blobs: InMemoryBlobStore | None = None) -> None:
+        self.blobs = blobs if blobs is not None else InMemoryBlobStore()
+        self._manifests: list[RequestManifest] = []
+        self._by_id: dict[str, RequestManifest] = {}
+
+    @property
+    def manifests(self) -> Sequence[RequestManifest]:
+        """Every manifest recorded, in the order the run made the calls."""
+        return tuple(self._manifests)
+
+    @property
+    def request_digests(self) -> Sequence[str]:
+        """The recorded requests' content digests, in call order."""
+        return tuple(item.request_sha256 for item in self._manifests)
+
+    def get(self, manifest_id: str) -> RequestManifest:
+        return self._by_id[manifest_id]
+
+    async def body_of(self, manifest: RequestManifest, slot: str) -> bytes:
+        """The canonical bytes of one manifest slot, inline or out of the store."""
+        value: ManifestValue = getattr(manifest, slot)
+        if value.inline is not None:
+            return value.inline.encode("utf-8")
+        if value.blob_ref is None:
+            raise KeyError(f"{slot} is neither inline nor stored")
+        tenant_id = manifest.identity.get("tenant_id") or _REPLAY_TENANT
+        return await self.blobs.get(tenant_id, value.blob_ref)
+
+    async def record_request_manifest(
+        self,
+        *,
+        manifest: RequestManifest,
+        manifest_id: str,
+        bodies: Mapping[str, bytes],
+    ) -> None:
+        tenant_id = manifest.identity.get("tenant_id") or _REPLAY_TENANT
+        refs: dict[str, str] = {}
+        for slot, body in bodies.items():
+            stored = await self.blobs.put(
+                tenant_id, body, content_type="application/json"
+            )
+            refs[slot] = stored.ref
+        kept = manifest.with_blob_refs(refs) if refs else manifest
+        # The id is a property of what was SENT, so storing the bodies must not
+        # have moved it. Checked rather than assumed: this double is what the
+        # replay provider keys on.
+        if kept.manifest_id != manifest_id:
+            raise ValueError(
+                f"storing the bodies moved the manifest id from {manifest_id} "
+                f"to {kept.manifest_id}"
+            )
+        self._manifests.append(kept)
+        self._by_id[manifest_id] = kept
+
+
+#: Tenant used for blob puts when a manifest carries no correlation identity.
+#: Obviously synthetic, and never a real scope.
+_REPLAY_TENANT = "replay"
+
+
+class ReplayLLMProvider(ILLMProvider):
+    """Serves a recorded run's provider events back, in order, or refuses.
+
+    A recording is a list of (request digest, stream events) pairs — what a
+    real provider was asked and what it said. Replaying it re-drives the loop
+    without an endpoint and without paying for the tokens twice, which is what
+    makes a recorded incident into a regression test.
+
+    The refusal is the point. The provider matches the request it is handed
+    against the digest recorded for that position, and a run whose assembly has
+    drifted — a prompt section that moved, a tool that is no longer advertised,
+    a constant that changed a budget — raises :class:`ReplayMismatchError`
+    instead of being served an answer to a question it did not ask. Correlation
+    metadata is excluded from the digest (see
+    :func:`~protocore.contracts.observability.request_digest`), so replaying a
+    recording under a new run id is not itself a mismatch.
+
+    Build one with :meth:`from_recording`, or from a sink and the streams that
+    were seen alongside it with :meth:`from_sink`.
+    """
+
+    def __init__(self, recording: Sequence[tuple[str, Sequence[LLMStreamEvent]]]) -> None:
+        self._recording = list(recording)
+        self._position = 0
+        self._calls: list[LLMRequest] = []
+
+    @classmethod
+    def from_recording(
+        cls, recording: Sequence[tuple[str, Sequence[LLMStreamEvent]]]
+    ) -> ReplayLLMProvider:
+        return cls(recording)
+
+    @classmethod
+    def from_sink(
+        cls,
+        sink: InMemoryRequestManifestSink,
+        streams: Sequence[Sequence[LLMStreamEvent]],
+    ) -> ReplayLLMProvider:
+        """Pair each recorded manifest with the stream that answered it."""
+        if len(streams) != len(sink.manifests):
+            raise ValueError(
+                f"{len(sink.manifests)} manifest(s) recorded but "
+                f"{len(streams)} stream(s) supplied; a replay needs one answer "
+                "per request"
+            )
+        return cls(list(zip(sink.request_digests, streams, strict=True)))
+
+    @property
+    def calls(self) -> Sequence[LLMRequest]:
+        """Every request replayed, for assertions."""
+        return tuple(self._calls)
+
+    @property
+    def exhausted(self) -> bool:
+        return self._position >= len(self._recording)
+
+    def _next(self, request: LLMRequest) -> Sequence[LLMStreamEvent]:
+        digest = request_digest(request)
+        if self.exhausted:
+            raise ReplayMismatchError(
+                f"the recording holds {len(self._recording)} call(s) and the "
+                f"run is making another one (digest {digest[:16]})"
+            )
+        expected, events = self._recording[self._position]
+        if digest != expected:
+            raise ReplayMismatchError(
+                f"call {self._position} of the recording was made with request "
+                f"{expected[:16]} and this run is making {digest[:16]}: the "
+                "request assembly has changed, so the recorded answer is an "
+                "answer to a different question"
+            )
+        self._position += 1
+        self._calls.append(request)
+        return events
+
+    async def stream_with_tools(
+        self, request: LLMRequest
+    ) -> AsyncIterator[LLMStreamEvent]:
+        for event in self._next(request):
+            yield event
+
+    async def complete_structured(
+        self,
+        request: LLMRequest,
+        response_schema: dict[str, Any],
+    ) -> LLMResponse:
+        del response_schema
+        return _response_from_events(self._next(request))
+
+    async def complete_text(self, request: LLMRequest) -> LLMResponse:
+        return _response_from_events(self._next(request))
+
+    def count_tokens(self, text: str, model: str | None = None) -> int:
+        return max(1, len(text) // 4) if text else 0
+
+
+def _response_from_events(events: Sequence[LLMStreamEvent]) -> LLMResponse:
+    """Fold a recorded stream into the one response a non-streaming call wants."""
+    text_parts: list[str] = []
+    stop_reason = StopReason.end_turn
+    for event in events:
+        if event.name == "content_block_delta":
+            piece = event.payload.get("text")
+            if isinstance(piece, str):
+                text_parts.append(piece)
+        elif event.name == "message_stop":
+            raw = event.payload.get("stop_reason")
+            if isinstance(raw, str):
+                stop_reason = StopReason(raw)
+    text = "".join(text_parts)
+    return LLMResponse(
+        message=Message(
+            role=MessageRole.assistant,
+            content_blocks=[TextBlock(text=text)] if text else [],
+        ),
+        stop_reason=stop_reason,
+    )
+
+
 __all__ = [
     "InMemoryAgentDispatch",
     "InMemoryBlobStore",
@@ -1879,11 +2392,16 @@ __all__ = [
     "InMemoryHookManager",
     "InMemoryLLMProvider",
     "InMemoryMemory",
+    "InMemoryRequestManifestSink",
     "InMemoryRunStore",
     "InMemorySearchIndex",
     "InMemorySessionStore",
     "InMemorySkillStore",
     "InMemoryTodoStorage",
     "InMemoryToolRegistry",
+    "InMemoryWorkHandle",
+    "InMemoryWorkPool",
     "InMemoryWorkspace",
+    "ReplayLLMProvider",
+    "ReplayMismatchError",
 ]

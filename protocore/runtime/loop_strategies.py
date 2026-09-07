@@ -38,8 +38,6 @@ from typing import TYPE_CHECKING, Any, Protocol, runtime_checkable
 
 from protocore.contracts.llm import (
     LLMError,
-    LLMObservabilityContext,
-    LLMRequest,
     ProviderDeltaKind,
 )
 from protocore.contracts.types import (
@@ -61,7 +59,6 @@ from protocore.logging_utils import get_logger
 from protocore.runtime.context.manager import ContextBundle
 from protocore.runtime.events import EventType, TurnEvent
 from protocore.runtime.llm.delta_bridge import stream_events_to_provider_deltas
-from protocore.runtime.run_work_budget import resolve_run_work_ledger
 
 if TYPE_CHECKING:
     from protocore.contracts.llm import ProviderDelta
@@ -302,9 +299,12 @@ class DeepStrategy:
         """
         from protocore.runtime.query import (
             _iter_with_idle_watchdog,
+            _manifest_request,
             _normalize_outbound_system_messages,
+            _observability_context,
             _prepend_system_sections,
             _repair_outbound_tool_pairing,
+            build_llm_request,
         )
 
         rc = engine.config.rc
@@ -316,7 +316,7 @@ class DeepStrategy:
         )
         full_messages = _repair_outbound_tool_pairing(
             full_messages,
-            placeholder=rc.tool_result_pairing_repair_placeholder,
+            placeholder=engine.prompt_text("tool_result_pairing_repair"),
         )
         # vLLM-400 backstop (same as the main action stream): any non-leading
         # ``system`` message → ``user``. The genuine system prefix at index 0
@@ -334,30 +334,21 @@ class DeepStrategy:
                 _converted_system,
             )
 
-        request = LLMRequest(
-            model=engine.config.model_name,
+        request = build_llm_request(
+            model=engine.effective_model_name,
             messages=full_messages,
             tools=[plan_tool],
             max_tokens=_plan_max_tokens(engine, context),
-            extra={
-                # Force the plan tool natively (the host adapter maps
-                # this to OpenAI ``tool_choice``; it is what ENFORCES the schema
-                # — ``guided_json`` was measured to be a no-op on vLLM).
-                "tool_choice": {
-                    "type": "function",
-                    "function": {"name": PLAN_TOOL_NAME},
-                },
-                # Deep mode = native CoT ON, bounded by reasoning_effort so the
-                # plan call does not get its answer truncated.
-                "enable_thinking": True,
-                "reasoning_effort": engine.config.reasoning_effort,
-            },
-            observability=LLMObservabilityContext(
-                tenant_id=engine.config.tenant_id,
-                run_id=engine.config.run_id,
-                parent_run_id=engine.config.parent_run_id,
-                session_id=engine.config.session_id,
-                agent_id=engine.config.subagent_id,
+            # Force the plan tool natively (a provider adapter renders the
+            # name into its wire ``tool_choice``; it is what ENFORCES the
+            # schema — ``guided_json`` was measured to be a no-op on vLLM).
+            forced_tool_choice=PLAN_TOOL_NAME,
+            # Deep mode = native CoT ON, bounded by reasoning_effort so the
+            # plan call does not get its answer truncated.
+            thinking_enabled=True,
+            reasoning_effort=engine.effective_reasoning_effort,
+            observability=_observability_context(
+                engine,
                 call_purpose="deep_plan",
                 # This is the planning pass, so it says so. It used to say "run",
                 # which is not a member of the category set the routing surface
@@ -389,6 +380,7 @@ class DeepStrategy:
         # otherwise ("reasoning_content ... must be passed back to the API"),
         # because the synthetic planning turn previously had it None.
         reasoning_parts: list[str] = []
+        await _manifest_request(engine, request, call_purpose="deep_plan")
         plan_stream = _iter_with_idle_watchdog(
             _normalised_deltas(engine.llm.stream_with_tools(request)),
             idle_timeout=rc.llm_stream_idle_timeout_seconds,
@@ -494,7 +486,12 @@ class DeepStrategy:
         """
         # Local import — avoid a circular import with ``runtime.query`` (the
         # same pattern ``_fetch_plan`` uses for the shared wire-path helpers).
-        from protocore.runtime.query import _iter_with_idle_watchdog
+        from protocore.runtime.query import (
+            _iter_with_idle_watchdog,
+            _manifest_request,
+            _observability_context,
+            build_llm_request,
+        )
 
         rc = engine.config.rc
         instruction = _plan_fallback_instruction(surface_names, include_summary)
@@ -505,25 +502,18 @@ class DeepStrategy:
                 content_blocks=[TextBlock(text=instruction)],
             ),
         ]
+        # ``response_format`` is a plain wire field for OpenAI-compatible
+        # endpoints — an adapter forwards unknown ``extra`` keys onto the
+        # request body verbatim, and ``None`` means the rung ships none.
         for response_format in _PLAN_FALLBACK_RESPONSE_FORMATS:
-            extra: dict[str, Any] = {}
-            if response_format is not None:
-                # ``response_format`` is a plain wire field for OpenAI-compatible
-                # endpoints — the host adapter's ``_merge_options``
-                # forwards unknown ``extra`` keys onto the request body verbatim.
-                extra["response_format"] = response_format
-            request = LLMRequest(
-                model=engine.config.model_name,
+            request = build_llm_request(
+                model=engine.effective_model_name,
                 messages=fallback_messages,
                 tools=[],
                 max_tokens=max_tokens,
-                extra=extra,
-                observability=LLMObservabilityContext(
-                    tenant_id=engine.config.tenant_id,
-                    run_id=engine.config.run_id,
-                    parent_run_id=engine.config.parent_run_id,
-                    session_id=engine.config.session_id,
-                    agent_id=engine.config.subagent_id,
+                response_format=response_format,
+                observability=_observability_context(
+                    engine,
                     call_purpose="deep_plan_fallback",
                     call_category="planning",
                 ),
@@ -536,6 +526,9 @@ class DeepStrategy:
             # contract). When empty, ``_append_plan_turn`` falls back to the
             # plan's ``reasoning_summary`` / a placeholder.
             reasoning_parts: list[str] = []
+            await _manifest_request(
+                engine, request, call_purpose="deep_plan_fallback"
+            )
             plan_stream = _iter_with_idle_watchdog(
                 _normalised_deltas(engine.llm.stream_with_tools(request)),
                 idle_timeout=rc.llm_stream_idle_timeout_seconds,
@@ -629,9 +622,7 @@ class DeepStrategy:
         # method exists at all: the plan call is a real LLM call, and a deep run
         # that skipped it here would under-count the tree's total work by one
         # call per turn — on the strategy that makes the most of them.
-        resolve_run_work_ledger(
-            getattr(engine, "_helpers", None), engine.config.rc
-        ).charge_tokens(
+        engine.run_state.ensure_run_work_ledger(engine.config.rc).charge_tokens(
             input_tokens=input_tokens,
             output_tokens=int(usage.get("output_tokens", 0)),
         )

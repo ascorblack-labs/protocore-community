@@ -33,9 +33,21 @@ from urllib.parse import urlparse
 
 from protocore.contracts.hooks import HookActionKind, HookResult, IHookManager
 from protocore.contracts.tool_registry import ToolVisibilityPolicy
+from protocore.contracts.tool_roles import (
+    EMPTY_TOOL_ROLE_MAP,
+    WORKSPACE_MUTATION_ROLES,
+    ToolArgumentSlot,
+    ToolRole,
+    ToolRoleMap,
+)
 from protocore.contracts.tools import Tool, ToolContext
 from protocore.contracts.types import HookEvent
 from protocore.logging_utils import get_logger
+from protocore.runtime.tool_arguments import (
+    argument_names,
+    present_string_argument,
+    string_argument,
+)
 from protocore.safety.shell import (
     DefaultShellSafetyPolicy,
     ShellPolicyVerdict,
@@ -43,7 +55,21 @@ from protocore.safety.shell import (
 
 _logger = get_logger(__name__)
 
-_HELPERS_METADATA_KEY = "protocore.helpers"
+_warned_undeclared_slots: set[str] = set()
+
+
+def _warn_once(message: str, subject: str) -> None:
+    """Say a structural misconfiguration out loud, once per subject.
+
+    A missing declaration is a property of the installation, not of the call,
+    so repeating it on every call would bury the log without telling anyone
+    anything new.
+    """
+    key = f"{message}:{subject}"
+    if key in _warned_undeclared_slots:
+        return
+    _warned_undeclared_slots.add(key)
+    _logger.warning(message, subject)
 
 
 def _session_grant_covers(ctx: ToolContext, arguments: dict[str, Any]) -> bool:
@@ -51,9 +77,8 @@ def _session_grant_covers(ctx: ToolContext, arguments: dict[str, Any]) -> bool:
     command = str((arguments or {}).get("command") or "")
     if not command:
         return False
-    metadata = getattr(ctx, "metadata", None) or {}
-    bag = metadata.get(_HELPERS_METADATA_KEY) if isinstance(metadata, dict) else None
-    grants = list((bag or {}).get("session_grants") or [])
+    state = ctx.run_state
+    grants = list(state.session_grants) if state is not None else []
     if not grants:
         return False
     from protocore.runtime.permission_widen import grant_covers
@@ -69,23 +94,24 @@ SIDE_EFFECT_HTTP: Final[str] = "http"
 SIDE_EFFECT_WORKSPACE: Final[str] = "workspace"
 SIDE_EFFECT_STATE_ONLY: Final[str] = "state_only"
 
-# Tool name → side-effect class, per the catalog in ``docs/tools.md``.
-# Not an RC field — protocol invariant; new tools declare their class
-# via the `Tool.side_effect_class` ClassVar (a host's adapters supply it).
-_DEFAULT_SIDE_EFFECT_MAP: Final[dict[str, str]] = {
-    "Bash": SIDE_EFFECT_SANDBOX,
-    "PythonExec": SIDE_EFFECT_SANDBOX,
-    "WebFetch": SIDE_EFFECT_HTTP,
-    "Write": SIDE_EFFECT_WORKSPACE,
-    "Edit": SIDE_EFFECT_WORKSPACE,
-    "Read": SIDE_EFFECT_STATE_ONLY,
-    "Grep": SIDE_EFFECT_STATE_ONLY,
-    "Glob": SIDE_EFFECT_STATE_ONLY,
-    "Skill": SIDE_EFFECT_STATE_ONLY,
-    "Agent": SIDE_EFFECT_STATE_ONLY,
-    "ToolSearch": SIDE_EFFECT_STATE_ONLY,
-    "TodoWrite": SIDE_EFFECT_STATE_ONLY,
-}
+def side_effect_class_for_roles(held: frozenset[ToolRole]) -> str | None:
+    """The side-effect class a set of roles implies, or None when they imply none.
+
+    The classification is a protocol invariant — which classes exist and what
+    each one costs is core's business — but WHICH tool is in which class is the
+    host's, and the roles it declared say so: a tool that runs a command line
+    is sandbox-class whatever it is called, a tool that reaches a named network
+    host is http-class, and a tool that changes a file is workspace-class.
+    Roles that change nothing outside the run map to no class at all, which the
+    caller reads as the most permissive one.
+    """
+    if ToolRole.runs_shell in held:
+        return SIDE_EFFECT_SANDBOX
+    if ToolRole.fetches_url in held:
+        return SIDE_EFFECT_HTTP
+    if held & WORKSPACE_MUTATION_ROLES:
+        return SIDE_EFFECT_WORKSPACE
+    return None
 
 
 class ToolPermissionOutcome(StrEnum):
@@ -178,40 +204,23 @@ class IToolSafetyPolicy(Protocol):
         ...
 
 
-# Argument keys that carry the shell command for sandbox-class tools.
-# The gate runs on the RAW ``tool_call.arguments`` BEFORE the tool's input
-# model validates/normalises them, so the safety policy must recognise every
-# alias the model may emit — the host ``BashInput.command`` field
-# declares ``validation_alias=AliasChoices("command", "cmd", "shell")`` and the
-# alias is only resolved to ``command`` inside ``Tool.invoke`` (after this
-# gate). Reading only ``command`` here lets a ``{"cmd": "sudo rm -rf /"}`` /
-# ``{"shell": ...}`` call skip the deny patterns and still execute. These are
-# protocol-level alias names (mirrors the host field), not user-tunable —
-# hence a module constant rather than an RC.
-_SHELL_COMMAND_ARG_ALIASES: Final[tuple[str, ...]] = ("command", "cmd", "shell")
-
-# Argument keys that carry the workspace path for workspace-class tools.
-# The host ``WriteInput.path`` / ``EditInput.path`` / ``AppendFileInput.
-# path`` fields declare ``validation_alias=AliasChoices("path", "file_path")``
-# (path is canonical, file_path is the legacy alias) and the alias is only
-# resolved to ``path`` inside ``Tool.invoke`` (after this gate). Reading only
-# ``file_path`` here lets a model emit ``{"path": "/denied/x"}`` (the field
-# name its tool description instructs it to use) skip the
-# ``denied_path_prefixes`` deny patterns and still execute — same root cause
-# as the shell-command alias bypass above. .
-_WORKSPACE_PATH_ARG_ALIASES: Final[tuple[str, ...]] = ("file_path", "path")
-
-
 @dataclass(frozen=True, slots=True)
 class ShellSafetyPolicyAdapter(IToolSafetyPolicy):
     """Wraps :class:`DefaultShellSafetyPolicy` for the sandbox class.
 
-    Reads the shell command from any of :data:`_SHELL_COMMAND_ARG_ALIASES`
-    (``command``/``cmd``/``shell`` — the Bash input shape and its validation
-    aliases) and evaluates via the v1-gold deny-pattern policy.
+    Reads the shell command from every spelling the host declared for it and
+    evaluates via the deny-pattern policy. The command must be found under any
+    of them: the gate sees raw arguments, before the tool's own input model has
+    resolved an alias, so a call that spells the command differently would
+    otherwise skip the deny patterns and still execute.
+
+    A host that declares no spelling at all leaves this policy unable to read
+    the command it exists to inspect. That is a policy failure, not a pass: the
+    call goes to a person instead of running unexamined.
     """
 
     policy: DefaultShellSafetyPolicy = field(default_factory=DefaultShellSafetyPolicy)
+    roles: ToolRoleMap = EMPTY_TOOL_ROLE_MAP
 
     def applies_to(self, side_effect_class: str) -> bool:
         return side_effect_class == SIDE_EFFECT_SANDBOX
@@ -222,8 +231,22 @@ class ShellSafetyPolicyAdapter(IToolSafetyPolicy):
         arguments: dict[str, Any],
         ctx: ToolContext,
     ) -> ToolPermissionDecision:
-        del tool, ctx
-        command = self._resolve_command(arguments)
+        del ctx
+        if not argument_names(ToolArgumentSlot.shell_command, roles=self.roles):
+            _warn_once(
+                "shell deny patterns cannot run for %r: no argument spelling is "
+                "declared for the command, so the call is sent for approval "
+                "instead of being examined",
+                tool.name,
+            )
+            return ToolPermissionDecision(
+                outcome=ToolPermissionOutcome.require_approval,
+                reason="shell command argument spelling is not declared",
+                stage=PermissionStage.safety_policy,
+            )
+        command = present_string_argument(
+            arguments, ToolArgumentSlot.shell_command, roles=self.roles
+        )
         if not isinstance(command, str):
             return ToolPermissionDecision(outcome=ToolPermissionOutcome.allow)
         verdict = self.policy.evaluate(command)
@@ -235,31 +258,18 @@ class ShellSafetyPolicyAdapter(IToolSafetyPolicy):
             )
         return ToolPermissionDecision(outcome=ToolPermissionOutcome.allow)
 
-    @staticmethod
-    def _resolve_command(arguments: dict[str, Any]) -> str | None:
-        """Return the shell command from the first present alias.
-
-        The single logical ``command`` field can arrive under any of its
-        validation aliases (:data:`_SHELL_COMMAND_ARG_ALIASES`) because the
-        gate sees raw arguments before the tool's input model resolves them.
-        First alias whose value is a ``str`` wins; non-string / absent values
-        yield ``None`` (treated as nothing to evaluate by the caller).
-        """
-        for alias in _SHELL_COMMAND_ARG_ALIASES:
-            value = arguments.get(alias)
-            if isinstance(value, str):
-                return value
-        return None
-
 
 @dataclass(frozen=True, slots=True)
 class HttpDnsAllowlistPolicy(IToolSafetyPolicy):
     """DNS allowlist policy for the ``http`` side-effect class.
 
- Reads ``arguments['url']`` (WebFetch input shape). Empty allowlist
- means "allow any host" (default) — the host registers a populated
- allowlist via :meth:`ToolPermissionGate.register_policy`.
- Blocked hosts always reject regardless of allowlist.
+ Reads the target from every spelling the host declared for the ``url``
+ slot. Empty allowlist means "allow any host" (default) — the host
+ registers a populated allowlist via
+ :meth:`ToolPermissionGate.register_policy`. Blocked hosts always reject
+ regardless of allowlist. A host that declares no spelling leaves the
+ policy unable to read the address it exists to check, so the call is sent
+ for approval rather than allowed unexamined.
 
  NOTE: this is the *core* policy and is intentionally lightweight —
  it does NOT perform DNS resolution (no network in pure core).
@@ -278,6 +288,7 @@ class HttpDnsAllowlistPolicy(IToolSafetyPolicy):
 
     allowed_hosts: frozenset[str] = field(default_factory=frozenset)
     blocked_hosts: frozenset[str] = field(default_factory=frozenset)
+    roles: ToolRoleMap = EMPTY_TOOL_ROLE_MAP
 
     def __post_init__(self) -> None:
         # Normalise host sets once at construction so comparisons against
@@ -304,8 +315,20 @@ class HttpDnsAllowlistPolicy(IToolSafetyPolicy):
         arguments: dict[str, Any],
         ctx: ToolContext,
     ) -> ToolPermissionDecision:
-        del tool, ctx
-        url = arguments.get("url")
+        del ctx
+        if not argument_names(ToolArgumentSlot.url, roles=self.roles):
+            _warn_once(
+                "the host allowlist cannot run for %r: no argument spelling is "
+                "declared for the target address, so the call is sent for "
+                "approval instead of being checked",
+                tool.name,
+            )
+            return ToolPermissionDecision(
+                outcome=ToolPermissionOutcome.require_approval,
+                reason="target address argument spelling is not declared",
+                stage=PermissionStage.safety_policy,
+            )
+        url = string_argument(arguments, ToolArgumentSlot.url, roles=self.roles)
         if not isinstance(url, str):
             return ToolPermissionDecision(outcome=ToolPermissionOutcome.allow)
         parsed = urlparse(url)
@@ -338,14 +361,13 @@ class HttpDnsAllowlistPolicy(IToolSafetyPolicy):
 class WorkspacePathPolicy(IToolSafetyPolicy):
     """Path-prefix denial policy for the ``workspace`` side-effect class.
 
- Reads the path from any of :data:`_WORKSPACE_PATH_ARG_ALIASES`
- (``file_path`` / ``path`` — the Write/Edit/AppendFile input shape and
- its validation aliases). Denies any resolved path with a prefix in
- ``denied_path_prefixes``. Empty set means "allow all".
-
+ Reads the path from every spelling the host declared for it and denies
+ any resolved path with a prefix in ``denied_path_prefixes``. Empty set
+ means "allow all".
  """
 
     denied_path_prefixes: frozenset[str] = field(default_factory=frozenset)
+    roles: ToolRoleMap = EMPTY_TOOL_ROLE_MAP
 
     def applies_to(self, side_effect_class: str) -> bool:
         return side_effect_class == SIDE_EFFECT_WORKSPACE
@@ -357,7 +379,9 @@ class WorkspacePathPolicy(IToolSafetyPolicy):
         ctx: ToolContext,
     ) -> ToolPermissionDecision:
         del tool, ctx
-        path = self._resolve_path(arguments)
+        path = present_string_argument(
+            arguments, ToolArgumentSlot.path, roles=self.roles
+        )
         if not isinstance(path, str):
             return ToolPermissionDecision(outcome=ToolPermissionOutcome.allow)
         for prefix in self.denied_path_prefixes:
@@ -368,23 +392,6 @@ class WorkspacePathPolicy(IToolSafetyPolicy):
                     stage=PermissionStage.safety_policy,
                 )
         return ToolPermissionDecision(outcome=ToolPermissionOutcome.allow)
-
-    @staticmethod
-    def _resolve_path(arguments: dict[str, Any]) -> str | None:
-        """Return the workspace path from the first present alias.
-
- The single logical ``path`` field can arrive under either of its
- validation aliases (:data:`_WORKSPACE_PATH_ARG_ALIASES`) because
- the gate sees raw arguments before the tool's input model resolves
- them. First alias whose value is a ``str`` wins; non-string /
- absent values yield ``None`` (treated as nothing to evaluate by
- the caller). .
- """
-        for alias in _WORKSPACE_PATH_ARG_ALIASES:
-            value = arguments.get(alias)
-            if isinstance(value, str):
-                return value
-        return None
 
 
 # ---------------------------------------------------------------------------
@@ -414,16 +421,20 @@ class ToolPermissionGate:
         *,
         policies: Iterable[IToolSafetyPolicy] | None = None,
         side_effect_map: dict[str, str] | None = None,
+        roles: ToolRoleMap = EMPTY_TOOL_ROLE_MAP,
     ) -> None:
-        self._policies: list[IToolSafetyPolicy] = list(policies or self._default_policies())
-        self._side_effect_map: dict[str, str] = dict(side_effect_map or _DEFAULT_SIDE_EFFECT_MAP)
+        self._roles = roles
+        self._policies: list[IToolSafetyPolicy] = list(
+            policies or self._default_policies(roles)
+        )
+        self._side_effect_map: dict[str, str] = dict(side_effect_map or {})
 
     @staticmethod
-    def _default_policies() -> list[IToolSafetyPolicy]:
+    def _default_policies(roles: ToolRoleMap) -> list[IToolSafetyPolicy]:
         """Default policy stack — shell deny patterns only (no DNS / path
         config in core baseline; the host stacks tenant-specific
         instances on top via :meth:`register_policy`)."""
-        return [ShellSafetyPolicyAdapter()]
+        return [ShellSafetyPolicyAdapter(roles=roles)]
 
     def register_policy(self, policy: IToolSafetyPolicy) -> None:
         """Stack an additional policy. Evaluated after the defaults."""
@@ -432,8 +443,8 @@ class ToolPermissionGate:
     def set_side_effect_class(self, tool_name: str, side_effect_class: str) -> None:
         """Override the side-effect class for a tool name.
 
-        Used by tests + the host registry to declare classification
-        for tools not in :data:`_DEFAULT_SIDE_EFFECT_MAP`.
+        Used by tests + the host registry to state a classification the tool's
+        roles do not already imply.
         """
         self._side_effect_map[tool_name] = side_effect_class
 
@@ -450,7 +461,11 @@ class ToolPermissionGate:
         attr = getattr(tool, "side_effect_class", None)
         if isinstance(attr, str):
             return attr
-        return self._side_effect_map.get(tool.name, SIDE_EFFECT_STATE_ONLY)
+        override = self._side_effect_map.get(tool.name)
+        if override is not None:
+            return override
+        implied = side_effect_class_for_roles(self._roles.roles_of(tool.name))
+        return implied if implied is not None else SIDE_EFFECT_STATE_ONLY
 
     # ------------------------------------------------------------------
     # check — the entry point
@@ -464,6 +479,7 @@ class ToolPermissionGate:
         ctx: ToolContext,
         visibility_policy: ToolVisibilityPolicy,
         subagent_whitelist: Iterable[str] | None = None,
+        child_run: bool = False,
         hook_manager: IHookManager | None = None,
         skip_pre_tool_approval: bool = False,
     ) -> ToolPermissionDecision:
@@ -483,6 +499,14 @@ class ToolPermissionGate:
             Optional narrow scope when invoked inside a subagent — if
             non-None and non-empty, only these names are permitted in
             addition to the tenant policy.
+        child_run:
+            Whether this call is being made by a delegated run. A tool the
+            host declared ``never_delegated`` is refused for one, whatever
+            else permits it — including the tool-surface floor, and including
+            a subagent that declared nothing and therefore has no allow-list
+            stage to narrow. The catalogue applies the same rule when it
+            resolves a child's surface; both halves are needed, because a
+            child that named a tool it was never shown used to reach it.
         hook_manager:
             Optional :class:`IHookManager` to fire ``PreToolUse``. If
             ``None``, the hook stage is skipped (used by tests that
@@ -519,6 +543,12 @@ class ToolPermissionGate:
                     reason=f"tool {tool.name!r} is not in the tenant visible set",
                     stage=PermissionStage.whitelist,
                 )
+        if child_run and ToolRole.never_delegated in self._roles.roles_of(tool.name):
+            return ToolPermissionDecision(
+                outcome=ToolPermissionOutcome.deny,
+                reason=f"tool {tool.name!r} is never offered to a delegated run",
+                stage=PermissionStage.whitelist,
+            )
         if subagent_whitelist is not None:
             allow = frozenset(subagent_whitelist)
             if allow and tool.name not in allow:
@@ -560,14 +590,19 @@ class ToolPermissionGate:
                 ctx.tenant_id,
             )
         except Exception:
+            # Fail CLOSED. This stage exists to answer whether a call may run,
+            # and a stage that cannot answer has not said yes. Treating its
+            # failure as consent turned every outage of the hook executor into
+            # a silent, run-wide removal of the permission layer — the caller
+            # saw an allowed call and no sign that anything had been skipped.
             _logger.warning(
-                "PreToolUse hook raised for tool=%s; isolating",
+                "PreToolUse hook raised for tool=%s; denying",
                 tool.name,
                 exc_info=True,
             )
             return ToolPermissionDecision(
-                outcome=ToolPermissionOutcome.allow,
-                reason="hook dispatch failed; allowing",
+                outcome=ToolPermissionOutcome.deny,
+                reason="hook dispatch failed; denying",
                 stage=PermissionStage.hook,
             )
 

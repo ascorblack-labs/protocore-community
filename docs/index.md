@@ -32,6 +32,27 @@ A new engineer or agent can read these end to end, in this order:
 8. **[Glossary](glossary.md)** — concise definitions for the terms used
    throughout these docs.
 
+## Packaging
+
+The distribution is pure Python and installs with two optional extras, neither of
+which is needed to run a turn:
+
+| Extra | For | What it adds |
+|---|---|---|
+| `testing` | a host verifying its own adapters | a test runner, so `pytest --pyargs protocore.conformance` runs the packaged conformance suites |
+| `dev` | changing the core itself | the full gate toolchain: tests, coverage, lint, types, security |
+
+Token estimation has an optional native implementation, shipped as the separate
+distribution `protocore-native`. There are no wheels for it on the index yet, so
+it is built from source for now.
+
+The native extension is selected only when it can be imported, so it changes
+speed and nothing else — the same numbers either way, and both arrangements are
+tested. Set **`PROTOCORE_DISABLE_NATIVE=1`** to keep the Python implementation
+even when the extension is installed. It is read once, at import time, and
+answers which build of that function is running rather than tuning anything, so
+changing it inside a live process has no effect.
+
 ## Bilingual documentation
 
 This `docs/` tree is the **English canonical** source. A full **Russian mirror**
@@ -64,5 +85,6 @@ the Russian [`../README.md`](../README.md) is primary, and the English
 | [`../README.en.md`](../README.en.md) | Project overview and quickstart (English mirror). |
 | [`../LICENSE`](../LICENSE) | License terms (Mozilla Public License 2.0). |
 | [`../NOTICE`](../NOTICE) | Attribution and what the MPL asks of a distributor. |
+| [`../CHANGELOG.md`](../CHANGELOG.md) | What changed in each release, newest first. |
 | [`../CONTRIBUTING.md`](../CONTRIBUTING.md) | Setup, the four gates, and the conventions. |
 | [`../SECURITY.md`](../SECURITY.md) | Supported versions and private vulnerability disclosure. |

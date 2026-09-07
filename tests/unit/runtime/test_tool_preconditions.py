@@ -8,23 +8,20 @@ Covers the pure functions in
 * :func:`resolve_precondition` — path normalisation.
 * :func:`compute_masked_tools` — only bare-name patterns are masked
  pre-emptively.
-* :func:`load_satisfied_set` / :func:`store_satisfied_set` — helper-bag
- round-trip (adaptation for cross-call satisfaction state).
+* the run state's satisfied set — the cross-call round trip a dispatch makes.
 """
 
 from __future__ import annotations
 
 from typing import Any
 
+from protocore.contracts.run_state import RunScopedState
 from protocore.runtime.tool_preconditions import (
-    SATISFIED_PRECONDITIONS_KEY,
     check_preconditions,
     compute_masked_tools,
     derive_satisfied_from_messages,
-    load_satisfied_set,
     record_satisfaction,
     resolve_precondition,
-    store_satisfied_set,
 )
 
 # ----------------------------------------------------------------------
@@ -273,57 +270,40 @@ def test_compute_masked_tools_unmasks_when_satisfied() -> None:
 
 
 # ----------------------------------------------------------------------
-# load_satisfied_set / store_satisfied_set
+# The run state's satisfied set
 # ----------------------------------------------------------------------
 
 
-def test_load_satisfied_set_missing_helpers_returns_empty() -> None:
-    assert load_satisfied_set(None) == set()
-    assert load_satisfied_set({}) == set()
+def test_a_fresh_run_has_satisfied_nothing() -> None:
+    assert RunScopedState().satisfied_preconditions == set()
 
 
-def test_load_satisfied_set_handles_list_storage() -> None:
-    """Stored as a sorted list, hydrated as a set."""
-    helpers: dict[str, Any] = {SATISFIED_PRECONDITIONS_KEY: ["A", "B:x"]}
-    assert load_satisfied_set(helpers) == {"A", "B:x"}
-
-
-def test_load_satisfied_set_handles_set_storage() -> None:
-    helpers: dict[str, Any] = {SATISFIED_PRECONDITIONS_KEY: {"A", "B:x"}}
-    assert load_satisfied_set(helpers) == {"A", "B:x"}
-
-
-def test_store_satisfied_set_persists_sorted_list() -> None:
-    helpers: dict[str, Any] = {}
-    store_satisfied_set(helpers, {"B:x", "A"})
-    assert helpers[SATISFIED_PRECONDITIONS_KEY] == ["A", "B:x"]
-
-
-def test_store_satisfied_set_no_helpers_is_noop() -> None:
-    # Should not raise.
-    store_satisfied_set(None, {"A"})
-
-
-def test_helper_bag_round_trip() -> None:
-    """Persist → reload → mutate → persist preserves and extends the set."""
-    helpers: dict[str, Any] = {}
-    satisfied = load_satisfied_set(helpers)
+def test_satisfaction_round_trip() -> None:
+    """Read → record → write back preserves and extends the set."""
+    state = RunScopedState()
+    satisfied = set(state.satisfied_preconditions)
     record_satisfaction(
         tool_name="AppendFile",
         arguments={"path": "x.py"},
         satisfied=satisfied,
     )
-    store_satisfied_set(helpers, satisfied)
-    reloaded = load_satisfied_set(helpers)
-    assert reloaded == {"AppendFile", "AppendFile:x.py"}
+    state.satisfied_preconditions = satisfied
+
+    assert state.satisfied_preconditions == {"AppendFile", "AppendFile:x.py"}
+
+    reloaded = set(state.satisfied_preconditions)
     record_satisfaction(
         tool_name="AppendFile",
         arguments={"path": "y.py"},
         satisfied=reloaded,
     )
-    store_satisfied_set(helpers, reloaded)
-    final = load_satisfied_set(helpers)
-    assert final == {"AppendFile", "AppendFile:x.py", "AppendFile:y.py"}
+    state.satisfied_preconditions = reloaded
+
+    assert state.satisfied_preconditions == {
+        "AppendFile",
+        "AppendFile:x.py",
+        "AppendFile:y.py",
+    }
 
 
 # ----------------------------------------------------------------------
@@ -441,28 +421,25 @@ def test_derive_satisfied_from_messages_handles_undecodable_arguments() -> None:
     assert rebuilt == {"AppendFile"}
 
 
-def test_rehydrate_satisfied_from_history_seeds_empty_bag() -> None:
-    """the engine-side rehydrator seeds an empty helper bag.
+def test_rehydrate_satisfied_from_history_seeds_an_empty_set() -> None:
+    """The engine-side rehydrator seeds a run state that has satisfied nothing.
 
-    The helper bag is built fresh per pod; on a cross-pod re-drive
-    ``engine.history`` carries completed tool results but the helper bag is
-    empty. The rehydrator must replay every successful completed call into the
-    bag's
-    :data:`SATISFIED_PRECONDITIONS_KEY` so a precondition check
-    on the new pod sees the same set live recording would have
-    produced.
+    The run's state is composed fresh per process; on a cross-process re-drive
+    ``engine.history`` carries completed tool results but the satisfied set is
+    empty. The rehydrator must replay every successful completed call into it so
+    a precondition check in the new process sees the same set live recording
+    would have produced.
     """
     from types import SimpleNamespace
 
+    # Synthetic engine: a real QueryEngine is overkill for the two attributes
+    # the rehydrator reads (``engine.history`` and ``engine.run_state``).
+    from protocore.contracts.types import MessageRole, ToolResultBlock
     from protocore.runtime.query import _rehydrate_satisfied_from_history
 
-    # Empty helper bag = cross-pod re-drive baseline.
-    helpers: dict[str, Any] = {}
-    # Synthetic engine: a real QueryEngine is overkill for the
-    # attribute the rehydrator reads (``engine.history``).
-    from protocore.contracts.types import MessageRole, ToolResultBlock
-
+    state = RunScopedState()
     engine = SimpleNamespace(
+        run_state=state,
         history=[
             _make_assistant_tool_use("AppendFile", "c1", {"path": "x.py"}),
             _make_assistant_tool_use("Write", "c2", {"path": "y.py", "content": "ok"}),
@@ -476,13 +453,13 @@ def test_rehydrate_satisfied_from_history_seeds_empty_bag() -> None:
             ),
         ]
     )
-    _rehydrate_satisfied_from_history(helpers, engine)  # type: ignore[arg-type]
-    assert helpers.get(SATISFIED_PRECONDITIONS_KEY) == [
+    _rehydrate_satisfied_from_history(engine)  # type: ignore[arg-type]
+    assert state.satisfied_preconditions == {
         "AppendFile",
         "AppendFile:x.py",
         "Write",
         "Write:y.py",
-    ]
+    }
 
 
 def test_rehydrate_satisfied_from_history_excludes_failed_tool_results() -> None:
@@ -492,8 +469,9 @@ def test_rehydrate_satisfied_from_history_excludes_failed_tool_results() -> None
     from protocore.contracts.types import MessageRole, ToolResultBlock
     from protocore.runtime.query import _rehydrate_satisfied_from_history
 
-    helpers: dict[str, Any] = {}
+    state = RunScopedState()
     engine = SimpleNamespace(
+        run_state=state,
         history=[
             _make_assistant_tool_use("AppendFile", "failed", {"path": "x.py"}),
             SimpleNamespace(
@@ -505,8 +483,8 @@ def test_rehydrate_satisfied_from_history_excludes_failed_tool_results() -> None
             ),
         ]
     )
-    _rehydrate_satisfied_from_history(helpers, engine)  # type: ignore[arg-type]
-    assert SATISFIED_PRECONDITIONS_KEY not in helpers
+    _rehydrate_satisfied_from_history(engine)  # type: ignore[arg-type]
+    assert state.satisfied_preconditions == set()
 
 
 def test_rehydrate_satisfied_from_history_excludes_prior_run_seeded_calls() -> None:
@@ -528,8 +506,9 @@ def test_rehydrate_satisfied_from_history_excludes_prior_run_seeded_calls() -> N
     )
     from protocore.runtime.query import _rehydrate_satisfied_from_history
 
-    helpers: dict[str, Any] = {}
+    state = RunScopedState()
     engine = SimpleNamespace(
+        run_state=state,
         history=[
             # An earlier run of the session appended to the file and succeeded.
             _make_assistant_tool_use(
@@ -549,15 +528,15 @@ def test_rehydrate_satisfied_from_history_excludes_prior_run_seeded_calls() -> N
             ),
         ]
     )
-    _rehydrate_satisfied_from_history(helpers, engine)  # type: ignore[arg-type]
-    assert helpers.get(SATISFIED_PRECONDITIONS_KEY) == ["Write", "Write:notes.md"]
+    _rehydrate_satisfied_from_history(engine)  # type: ignore[arg-type]
+    assert state.satisfied_preconditions == {"Write", "Write:notes.md"}
 
 
 def test_rehydrate_satisfied_from_history_preserves_existing_set() -> None:
     """an in-process populated set always wins over the replay.
 
     A run that has been dispatching in-process has already recorded
-    the live satisfaction entries on the helper bag. The
+    the live satisfaction entries on the run's state. The
     rehydrator must NOT clobber them (the live entries are a
     strict superset of the history-replay entries — live
     recording has already added the satisfaction of the
@@ -567,31 +546,29 @@ def test_rehydrate_satisfied_from_history_preserves_existing_set() -> None:
 
     from protocore.runtime.query import _rehydrate_satisfied_from_history
 
-    # Live recording has already populated the bag with the
-    # in-flight call's satisfaction.
-    helpers: dict[str, Any] = {
-        SATISFIED_PRECONDITIONS_KEY: ["AppendFile", "AppendFile:x.py"],
-    }
+    # Live recording has already recorded the in-flight call's satisfaction.
+    state = RunScopedState(
+        satisfied_preconditions={"AppendFile", "AppendFile:x.py"}
+    )
     # History is shorter than the live set (e.g. the in-flight
     # call hasn't been appended yet) — the rehydrator must not
     # drop the live entries to match the history.
     engine = SimpleNamespace(
-        history=[_make_assistant_tool_use("Write", "c1", {"path": "y.py"})]
+        run_state=state,
+        history=[_make_assistant_tool_use("Write", "c1", {"path": "y.py"})],
     )
-    _rehydrate_satisfied_from_history(helpers, engine)  # type: ignore[arg-type]
-    # The existing entries are preserved verbatim (sorted list).
-    assert helpers.get(SATISFIED_PRECONDITIONS_KEY) == [
-        "AppendFile",
-        "AppendFile:x.py",
-    ]
+    _rehydrate_satisfied_from_history(engine)  # type: ignore[arg-type]
+    assert state.satisfied_preconditions == {"AppendFile", "AppendFile:x.py"}
 
 
-def test_rehydrate_satisfied_from_history_no_helpers_is_noop() -> None:
-    """None / empty helpers is a no-op (legacy test wiring)."""
+def test_rehydrate_satisfied_from_history_with_no_history_is_noop() -> None:
+    """An empty transcript leaves the run having satisfied nothing."""
     from types import SimpleNamespace
 
     from protocore.runtime.query import _rehydrate_satisfied_from_history
 
-    engine = SimpleNamespace(history=[])
-    _rehydrate_satisfied_from_history(None, engine)  # type: ignore[arg-type]
-    _rehydrate_satisfied_from_history({}, engine)  # type: ignore[arg-type]
+    state = RunScopedState()
+    _rehydrate_satisfied_from_history(  # type: ignore[arg-type]
+        SimpleNamespace(run_state=state, history=[])
+    )
+    assert state.satisfied_preconditions == set()

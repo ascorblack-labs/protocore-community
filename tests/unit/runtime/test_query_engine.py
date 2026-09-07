@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import pytest
 
-from protocore.contracts.runtime_constants import RuntimeConstants
+from protocore.contracts.runtime_constants import LoopConstants
 from protocore.contracts.types import Message, MessageRole, TextBlock
 from protocore.runtime.loop_state import (
     InvalidStateTransitionError,
@@ -396,7 +396,7 @@ def test_engine_config_immutable() -> None:
         tenant_id="t1",
         session_id="s1",
         model_name="qwen3.6-35b-a3b",
-        rc=RuntimeConstants(),
+        rc=LoopConstants(),
     )
     import dataclasses
     with pytest.raises(dataclasses.FrozenInstanceError):
@@ -447,13 +447,13 @@ async def test_run_continues_against_user_terminated_history(
 async def test_run_continuation_rejects_non_user_tail(
     engine_factory, in_memory_runtime
 ) -> None:
-    """A continuation run requires the history to end with a user message; an
-    assistant-terminated history is rejected before the model is ever called."""
+    """A continuation run needs something to answer; a plain assistant answer
+    is not one, and is rejected before the model is ever called."""
     engine = engine_factory()
     engine.history.append(_user("question"))
     engine.history.append(_assistant("prior answer"))
 
-    with pytest.raises(ValueError, match="role 'user'"):
+    with pytest.raises(ValueError, match="must end with"):
         async for _ in engine.run():
             pass
 
@@ -603,6 +603,9 @@ def test_rearm_refuses_a_turn_still_in_flight(engine_factory, state) -> None:
     if state is not LoopState.PENDING:
         engine.transition_to(LoopState.RUNNING)
     if state is LoopState.AWAITING:
+        # AWAITING is only a legal state when something is recorded that could
+        # end the wait.
+        engine.mark_pending_approval("call-in-flight")
         engine.transition_to(LoopState.AWAITING)
 
     with pytest.raises(InvalidStateTransitionError):

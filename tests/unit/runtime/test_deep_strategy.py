@@ -20,7 +20,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from protocore.contracts.runtime_constants import RuntimeConstants
+from protocore.contracts.runtime_constants import LoopConstants
 from protocore.contracts.types import (
     Message,
     MessageRole,
@@ -53,7 +53,7 @@ def _build_engine(
     *,
     run_mode: str,
     llm: InMemoryLLMProvider,
-    rc: RuntimeConstants | None = None,
+    rc: LoopConstants | None = None,
     system_prompt_sections: tuple[str, ...] = (),
 ) -> QueryEngine:
     registry = InMemoryToolRegistry()
@@ -65,7 +65,7 @@ def _build_engine(
             tenant_id="tenant-test",
             session_id="sess-test",
             model_name="qwen3.6-35b-a3b",
-            rc=rc or RuntimeConstants(model_context_window=8_192),
+            rc=rc or LoopConstants(model_context_window=8_192),
             run_mode=run_mode,
             thinking_enabled=(run_mode == "deep"),
             reasoning_effort="low",
@@ -157,14 +157,11 @@ async def test_deep_mode_emits_one_reasoning_step_then_acts() -> None:
     assert payload["next_tool"] == "Write"
     assert payload["task_complete"] is False
 
-    # The plan call's request was a FORCED single-tool call (tool_choice=plan),
-    # carried via extra so the host adapter forces it natively, and
-    # exposed only the plan tool.
+    # The plan call's request was a FORCED single-tool call, carried via the
+    # shared ``forced_tool_choice`` slot so a provider adapter renders it
+    # natively, and exposed only the plan tool.
     plan_call = llm.calls[0]
-    assert plan_call.extra.get("tool_choice") == {
-        "type": "function",
-        "function": {"name": PLAN_TOOL_NAME},
-    }
+    assert plan_call.extra.get("forced_tool_choice") == PLAN_TOOL_NAME
     assert plan_call.extra.get("enable_thinking") is True
     assert plan_call.extra.get("reasoning_effort") == "low"
     assert [t.name for t in plan_call.tools] == [PLAN_TOOL_NAME]
@@ -194,7 +191,7 @@ async def test_direct_mode_emits_no_reasoning_step() -> None:
 
     assert not [e for e in events if e.type is EventType.REASONING_STEP]
     # No forced plan tool call — the very first call is the auto action turn.
-    assert llm.calls[0].extra.get("tool_choice") is None
+    assert llm.calls[0].extra.get("forced_tool_choice") is None
     # Direct still threads the thinking axis (off) into extra.
     assert llm.calls[0].extra.get("enable_thinking") is False
 
@@ -738,7 +735,7 @@ async def test_deep_mode_fallback_elicits_plan_when_forced_tool_rejected() -> No
     fb = captured["fallback_request"]
     # No forced tool, no tools at all on the degrade path.
     assert list(fb.tools) == []
-    assert fb.extra.get("tool_choice") is None
+    assert fb.extra.get("forced_tool_choice") is None
     # First rung uses json_object response_format (DeepSeek accepts this).
     assert fb.extra.get("response_format") == {"type": "json_object"}
     # The prompted instruction names the json shape + the enum + the literal
@@ -782,8 +779,8 @@ async def test_deep_mode_no_fallback_on_non_fallback_worthy_error() -> None:
             self._first = True
 
         async def stream_with_tools(self, request: Any):  # type: ignore[no-untyped-def]
-            # A forced-Plan call is the one carrying tool_choice=Plan.
-            if request.extra.get("tool_choice") is not None or (
+            # A forced-Plan call is the one carrying the forced Plan choice.
+            if request.extra.get("forced_tool_choice") is not None or (
                 request.tools and request.tools[0].name == PLAN_TOOL_NAME
             ):
                 plan_calls["count"] += 1

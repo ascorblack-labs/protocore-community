@@ -30,7 +30,7 @@ from protocore.contracts.llm import (
     ProviderDeltaKind,
 )
 from protocore.contracts.observability import CacheObserverProtocol
-from protocore.contracts.runtime_constants import RuntimeConstants
+from protocore.contracts.runtime_constants import LoopConstants
 from protocore.contracts.types import (
     Message,
     MessageRole,
@@ -183,7 +183,7 @@ async def test_engine_calls_observer_on_usage_delta(
         tenant_id="tenant-observer",
         session_id="sess-observer",
         model_name="qwen3.6-35b-a3b",
-        rc=RuntimeConstants(model_context_window=4_096),
+        rc=LoopConstants(model_context_window=4_096),
         cache_observer=observer,
     )
     engine = QueryEngine(
@@ -228,7 +228,7 @@ async def test_engine_omits_observer_call_when_unset(
         tenant_id="tenant-no-observer",
         session_id="sess-no-observer",
         model_name="qwen3.6-35b-a3b",
-        rc=RuntimeConstants(model_context_window=4_096),
+        rc=LoopConstants(model_context_window=4_096),
     )
     assert config.cache_observer is None
     engine = QueryEngine(

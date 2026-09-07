@@ -12,6 +12,7 @@ from protocore.contracts.hooks import (
     HookActionKind,
     HookResult,
 )
+from protocore.contracts.run_state import RunScopedState
 from protocore.contracts.tool_registry import ToolVisibilityPolicy
 from protocore.contracts.tools import ToolContext, ToolPolicyDenied
 from protocore.contracts.types import HookEvent, ToolCall, ToolResult
@@ -24,6 +25,7 @@ from protocore.runtime.tool_dispatch import (
 from protocore.runtime.tool_permission import ToolPermissionGate
 from protocore.runtime.tool_registry import ToolRegistry
 from protocore.tests_support.adapters import InMemoryHookManager
+from tests._fixtures.tool_roles import CONVENTIONAL_TOOL_ROLES
 
 from ._tool_fixtures import MockTool, make_default_ctx
 
@@ -38,7 +40,7 @@ def _build_dispatcher(
     hook_manager: InMemoryHookManager | None = None,
 ) -> tuple[ToolDispatcher, ToolRegistry, InMemoryHookManager | None]:
     reg = ToolRegistry(tools or [])
-    gate = ToolPermissionGate()
+    gate = ToolPermissionGate(roles=CONVENTIONAL_TOOL_ROLES)
     dispatcher = ToolDispatcher(
         registry=reg,
         permission_gate=gate,
@@ -99,6 +101,7 @@ async def test_happy_path_emits_tool_result_and_success_outcome() -> None:
 @pytest.mark.asyncio
 async def test_dispatch_adds_tool_call_id_to_tool_context_metadata() -> None:
     seen_metadata: dict[str, object] = {}
+    seen_state: dict[str, Any] = {}
 
     class MetadataCapturingTool(MockTool):
         async def invoke(
@@ -107,6 +110,7 @@ async def test_dispatch_adds_tool_call_id_to_tool_context_metadata() -> None:
             arguments: dict[str, Any],
         ) -> ToolResult:
             seen_metadata.update(context.metadata)
+            seen_state["state"] = context.run_state
             return await super().invoke(context, arguments)
 
     tool = MetadataCapturingTool(tool_name="MyTool")
@@ -122,6 +126,7 @@ async def test_dispatch_adds_tool_call_id_to_tool_context_metadata() -> None:
 @pytest.mark.asyncio
 async def test_dispatch_preserves_existing_context_metadata() -> None:
     seen_metadata: dict[str, object] = {}
+    seen_state: dict[str, Any] = {}
 
     class MetadataCapturingTool(MockTool):
         async def invoke(
@@ -130,17 +135,16 @@ async def test_dispatch_preserves_existing_context_metadata() -> None:
             arguments: dict[str, Any],
         ) -> ToolResult:
             seen_metadata.update(context.metadata)
+            seen_state["state"] = context.run_state
             return await super().invoke(context, arguments)
 
-    helpers = {"workspace": object()}
+    host_slot = object()
     ctx = ToolContext(
         tenant_id="tenant-1",
         run_id="run-1",
         session_id="sess-1",
-        metadata={
-            "protocore.helpers": helpers,
-            "tool_call_id": "caller-supplied-id",
-        },
+        run_state=RunScopedState(host={"workspace": host_slot}),
+        metadata={"tool_call_id": "caller-supplied-id"},
     )
     tool = MetadataCapturingTool(tool_name="MyTool")
     dispatcher, _, _ = _build_dispatcher([tool])
@@ -150,7 +154,7 @@ async def test_dispatch_preserves_existing_context_metadata() -> None:
 
     assert outcome.success is True
     assert seen_metadata["tool_call_id"] == "caller-supplied-id"
-    assert seen_metadata["protocore.helpers"] is helpers
+    assert seen_state["state"].host["workspace"] is host_slot
 
 
 @pytest.mark.asyncio
@@ -251,13 +255,12 @@ async def test_hook_fired_not_emitted_on_whitelist_deny() -> None:
 
 
 @pytest.mark.asyncio
-async def test_core_does_not_emit_sandbox_starting_for_bash() -> None:
-    """The sandbox adapter owns the ``sandbox_starting`` event entirely. The
- core dispatcher MUST NOT emit it — it cannot distinguish hot from
- cold pod, so any emission would be spurious double-emit noise on
- hot-pod dispatches. The adapter's
- ``protocore-the host/tests/integration/sandbox/test_dispatcher.py::
- test_first_dispatch_spawns_pod`` validates the adapter side.
+async def test_core_does_not_emit_transport_starting_for_a_shell_tool() -> None:
+    """The host's transport owns ``tool_transport_starting`` entirely.
+
+ The dispatcher here must not emit it: it cannot tell a cold start from
+ a warm one, so every emission of its own would be noise on a dispatch
+ that started nothing.
  """
     tool = MockTool(tool_name="Bash", description="run shell")
     dispatcher, _, _ = _build_dispatcher([tool])
@@ -265,22 +268,22 @@ async def test_core_does_not_emit_sandbox_starting_for_bash() -> None:
 
     events, outcome = await _drain(dispatcher, tool_call=call)
 
-    sandbox = [e for e in events if e.type is EventType.SANDBOX_STARTING]
-    assert sandbox == []
+    starting = [e for e in events if e.type is EventType.TOOL_TRANSPORT_STARTING]
+    assert starting == []
     assert outcome.success
 
 
 @pytest.mark.asyncio
-async def test_core_does_not_emit_sandbox_starting_for_state_only_tool() -> None:
-    """Sanity-check the negative: non-sandbox tools must also not see
-    a ``sandbox_starting`` event from core.
+async def test_core_does_not_emit_transport_starting_for_a_state_only_tool() -> None:
+    """Sanity-check the negative: a tool that reaches no transport at all
+    must not see a ``tool_transport_starting`` event either.
     """
     tool = MockTool(tool_name="Read", description="read file")
     dispatcher, _, _ = _build_dispatcher([tool])
     call = ToolCall(name="Read", arguments={})
 
     events, _ = await _drain(dispatcher, tool_call=call)
-    assert not [e for e in events if e.type is EventType.SANDBOX_STARTING]
+    assert not [e for e in events if e.type is EventType.TOOL_TRANSPORT_STARTING]
 
 
 # ----------------------------------------------------------------------
@@ -730,7 +733,7 @@ def _build_dispatcher_with_counter(
     tools: list[MockTool] | None = None,
 ) -> ToolDispatcher:
     reg = ToolRegistry(tools or [])
-    gate = ToolPermissionGate()
+    gate = ToolPermissionGate(roles=CONVENTIONAL_TOOL_ROLES)
     return ToolDispatcher(
         registry=reg,
         permission_gate=gate,
@@ -905,7 +908,7 @@ async def test_counter_increments_n_times_for_n_dispatches() -> None:
 
 
 @pytest.mark.asyncio
-async def test_counter_attributes_error_to_root_run_id_from_helpers() -> None:
+async def test_counter_attributes_error_to_the_root_run_id() -> None:
     """When helpers bag carries ``root_run_id``, the counter MUST use it.
 
     Subagent ``run_id``s are internal and not present in PG ``runs`` rows;
@@ -922,9 +925,7 @@ async def test_counter_attributes_error_to_root_run_id_from_helpers() -> None:
         tenant_id="tenant-1",
         run_id="sub-agent-abc123",  # subagent's non-UUID id
         session_id="sess-1",
-        metadata={
-            "protocore.helpers": {"root_run_id": parent_uuid},
-        },
+        run_state=RunScopedState(root_run_id=parent_uuid),
     )
 
     _events, outcome = await _drain(
@@ -939,7 +940,7 @@ async def test_counter_attributes_error_to_root_run_id_from_helpers() -> None:
 
 @pytest.mark.asyncio
 async def test_counter_falls_back_to_ctx_run_id_without_root_run_id() -> None:
-    """No helpers bag → counter still uses ``ctx.run_id`` (leader path)."""
+    """No root run id → the counter still uses ``ctx.run_id`` (leader path)."""
 
     counter = _RecordingToolErrorCounter()
     tool = MockTool(tool_name="Boom", raise_exception=RuntimeError("kaboom"))
@@ -965,7 +966,7 @@ async def test_counter_falls_back_when_root_run_id_blank() -> None:
         tenant_id="tenant-1",
         run_id="fallback-run",
         session_id="sess-1",
-        metadata={"protocore.helpers": {"root_run_id": ""}},
+        run_state=RunScopedState(root_run_id=""),
     )
 
     _events, outcome = await _drain(
@@ -989,7 +990,7 @@ async def test_counter_attribution_routes_all_error_kinds_to_root() -> None:
             tenant_id="tenant-1",
             run_id=run_id,
             session_id="sess-1",
-            metadata={"protocore.helpers": {"root_run_id": root_uuid}},
+            run_state=RunScopedState(root_run_id=root_uuid),
         )
 
     # 1. unknown_tool
@@ -1097,13 +1098,12 @@ async def test_non_contract_unknown_tool_unchanged() -> None:
 
 
 def _ctx_with_finalize_terminal_rc() -> ToolContext:
-    """A ctx whose helper-bag RC opts into the typed-``Finalize`` terminal."""
-    from protocore.contracts.runtime_constants import RuntimeConstants
+    """A ctx whose constants opt into the typed-``Finalize`` terminal."""
+    from protocore.contracts.runtime_constants import LoopConstants
 
-    rc = RuntimeConstants(agent_finalize_tool_as_terminal=True)
-    ctx = make_default_ctx()
-    return ctx.model_copy(
-        update={"metadata": {**ctx.metadata, "protocore.helpers": {"rc": rc}}}
+    rc = LoopConstants(agent_finalize_tool_as_terminal=True)
+    return make_default_ctx().model_copy(
+        update={"run_state": RunScopedState(rc=rc)}
     )
 
 

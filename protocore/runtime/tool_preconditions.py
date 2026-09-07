@@ -15,11 +15,9 @@ the trace length.
 Ported verbatim from the v1 ``protocore.runtime.tool_preconditions`` module
 shipped at commit ``7dfa1ff``. The v2 adaptation:
 
-* uses the helper bag
- (``ToolContext.metadata["protocore.helpers"]``) for cross-call state
- instead of v1's ``AgentContext.metadata``. The :class:`ToolDispatcher`
- reads/writes the satisfied set under the
- :data:`SATISFIED_PRECONDITIONS_KEY` helper key.
+* keeps its cross-call state on the run's own state object instead of v1's
+ ``AgentContext.metadata``. The :class:`ToolDispatcher` reads and writes the
+ satisfied set there.
 * The check is wired into
  :meth:`~protocore.runtime.tool_dispatch.ToolDispatcher.dispatch` BEFORE
  the permission gate fires so a precondition violation short-circuits
@@ -41,13 +39,6 @@ import re
 from typing import Any
 
 logger = logging.getLogger(__name__)
-
-
-# Helper-bag key for the satisfied-precondition set (per-run state). The
-# dispatcher reads/writes this under
-# ``ctx.metadata["protocore.helpers"][SATISFIED_PRECONDITIONS_KEY]``.
-# Stored as a sorted list (JSON-friendly) and rehydrated to a set on read.
-SATISFIED_PRECONDITIONS_KEY: str = "tool_preconditions.satisfied"
 
 
 # Matches ``{param_name}`` placeholders in precondition patterns.
@@ -214,89 +205,13 @@ def compute_masked_tools(
     return masked
 
 
-def load_satisfied_set(
-    helpers: dict[str, Any] | None,
-    *,
-    history: list[tuple[str, dict[str, Any]]] | None = None,
-) -> set[str]:
-    """Load the per-run satisfied-precondition set from the helper bag.
-
- adaptation of v1's ``_resolved_satisfied_preconditions``.
- The v1 version rebuilt the set every dispatch by replaying
- ``ExecutionReport.tool_call_details``. v2 keeps the set durable on
- the helper bag (``ctx.metadata["protocore.helpers"]``) so each
- dispatch reads the cumulative state in O(1).
-
- The set is persisted as a sorted list (JSON-serialisable) and
- hydrated to a Python ``set`` on read.
-
- when the helper bag is missing the satisfied key
- (``SATISFIED_PRECONDITIONS_KEY`` absent or empty) AND a *history*
- fallback is provided, rebuild the set from the transcript-derived
- ``(tool_name, arguments)`` pairs. This handles the cross-pod
- re-drive case where the helper bag is built fresh per pod: a run
- that called ``AppendFile(foo)``, then the pod restarted, then a new
- pod resumed with an empty helper bag, must NOT re-block a follow-up
- ``FinalizeFile(foo)`` with ``[PRECONDITION NOT MET: AppendFile:foo]``
- just because the in-bag satisfied set is empty. The transcript
- (in the engine snapshot) is the durable source of truth, and the
- helper bag is just a per-run cache.
-
- ``helpers=None`` is treated as "no state yet" — falls through to
- the history fallback when provided. The history list is a
- chronological list of ``(tool_name, arguments)`` tuples; each entry
- is replayed through :func:`record_satisfaction` so path
- normalisation + the bare-name entry match the live recording
- semantics.
- """
-    stored: set[str] = set()
-    if helpers is not None:
-        raw = helpers.get(SATISFIED_PRECONDITIONS_KEY)
-        if isinstance(raw, set):
-            stored = {entry for entry in raw if isinstance(entry, str)}
-        elif isinstance(raw, (list, tuple)):
-            stored = {entry for entry in raw if isinstance(entry, str)}
-    if stored:
-        return stored
-    if history is None:
-        return set()
-    rebuilt: set[str] = set()
-    for tool_name, arguments in history:
-        record_satisfaction(
-            tool_name=tool_name,
-            arguments=arguments or {},
-            satisfied=rebuilt,
-        )
-    return rebuilt
-
-
-def store_satisfied_set(
-    helpers: dict[str, Any] | None,
-    satisfied: set[str],
-) -> None:
-    """Persist the satisfied set on the helper bag.
-
-    Stored as a sorted list so the snapshot is JSON-friendly (matches
-    the v1 ``context.metadata`` storage shape). The mutation is in-place
-    on the helper-bag dict — callers must hold a reference to the bag
-    (``ctx.metadata["protocore.helpers"]``) for the change to be visible
-    to subsequent dispatches.
-
-    ``helpers=None`` is a no-op (legacy test wiring without a bag).
-    """
-    if helpers is None:
-        return
-    helpers[SATISFIED_PRECONDITIONS_KEY] = sorted(satisfied)
-
-
 def derive_satisfied_from_messages(
     messages: Any,
 ) -> set[str]:
     """Rebuild the satisfied set by replaying every tool_use in *messages*.
 
- the cross-pod re-drive case. The helper bag is rebuilt
- fresh on every new pod (``service_runtime.build_helper_bag``), and
- its ``SATISFIED_PRECONDITIONS_KEY`` starts empty even when the
+ For the cross-pod re-drive case: the run's state is composed fresh on every
+ new process, so its satisfied set starts empty even when the
  engine snapshot carries a long transcript of prior ``tool_use``
  blocks. Replay each ``ToolUseBlock`` in the transcript through
  :func:`record_satisfaction` so the same bare-name + ``tool:path``
@@ -344,12 +259,9 @@ def derive_satisfied_from_messages(
 
 
 __all__ = [
-    "SATISFIED_PRECONDITIONS_KEY",
     "check_preconditions",
     "compute_masked_tools",
     "derive_satisfied_from_messages",
-    "load_satisfied_set",
     "record_satisfaction",
     "resolve_precondition",
-    "store_satisfied_set",
 ]

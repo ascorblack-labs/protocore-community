@@ -4,7 +4,8 @@ from __future__ import annotations
 from dataclasses import dataclass
 from pathlib import PurePosixPath
 
-from protocore.contracts.runtime_constants import RuntimeConstants
+from protocore.contracts.runtime_constants import LoopConstants
+from protocore.contracts.tool_roles import EMPTY_TOOL_ROLE_MAP, ToolRole, ToolRoleMap
 
 HIDDEN_PREFIX = "."
 
@@ -15,8 +16,11 @@ class RuleFile:
     body: str
     origin: str  # project_mount | trusted_store | workspace
 
+    def to_dict(self) -> dict[str, str]:
+        return {"path": self.path, "body": self.body, "origin": self.origin}
 
-def skip_dir(name: str, rc: RuntimeConstants) -> bool:
+
+def skip_dir(name: str, rc: LoopConstants) -> bool:
     if name.startswith(HIDDEN_PREFIX):
         return True
     skipped = {item.strip() for item in rc.rules_skip_dir_names.split(",") if item.strip()}
@@ -46,7 +50,7 @@ def _as_path_body(item: tuple[str, ...]) -> tuple[str, str]:
 
 def discover_agents_md(
     files: list[tuple[str, str]] | list[tuple[str, ...]],
-    rc: RuntimeConstants,
+    rc: LoopConstants,
     *,
     project_roots: tuple[str, ...] = (),
 ) -> list[RuleFile]:
@@ -78,7 +82,7 @@ def ancestor_rule_paths(file_path: str) -> list[str]:
     return out
 
 
-def is_trusted(rule: RuleFile, rc: RuntimeConstants) -> bool:
+def is_trusted(rule: RuleFile, rc: LoopConstants) -> bool:
     if rule.origin in {"project_mount", "trusted_store"}:
         return True
     if rc.rules_workspace_trust == "always":
@@ -94,12 +98,19 @@ def activate_on_filesystem_touch(
     tool_name: str,
     discovered: list[RuleFile],
     already_active: list[str],
-    rc: RuntimeConstants,
+    rc: LoopConstants,
+    roles: ToolRoleMap = EMPTY_TOOL_ROLE_MAP,
 ) -> list[str]:
-    """Bash / run_command does not activate. Workspace-written files need trust."""
+    """A shell command does not activate. Workspace-written files need trust.
+
+    A command line can touch any path in the workspace, and the path it names
+    is an argument to a program, not a declaration that the run is working on
+    that file — activating rules from it would let an incidental ``grep`` pull
+    a rule file into the prompt. Every other workspace touch is a real one.
+    """
     if not rc.rules_discovery_enabled:
         return list(already_active)
-    if tool_name in {"Bash", "run_command"}:
+    if roles.has_role(tool_name, ToolRole.runs_shell):
         return list(already_active)
     wanted = set(ancestor_rule_paths(touched_path))
     active = list(already_active)
@@ -119,7 +130,7 @@ def activate_on_filesystem_touch(
 def bodies_for_prompt(
     discovered: list[RuleFile],
     active_paths: list[str],
-    rc: RuntimeConstants,
+    rc: LoopConstants,
 ) -> list[str]:
     by_path = {item.path: item for item in discovered}
     bodies: list[str] = []

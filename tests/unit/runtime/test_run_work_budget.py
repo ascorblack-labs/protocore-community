@@ -25,12 +25,14 @@ from typing import Any
 
 import pytest
 
-from protocore.contracts.runtime_constants import RuntimeConstants
+from protocore.contracts.run_state import RunScopedState
+from protocore.contracts.runtime_constants import LoopConstants
 from protocore.contracts.types import (
     Message,
     MessageRole,
     TextBlock,
     ToolCall,
+    ToolResult,
     ToolResultBlock,
 )
 from protocore.runtime.loop_state import LoopState
@@ -41,14 +43,12 @@ from protocore.runtime.query import (
 )
 from protocore.runtime.run_work_budget import (
     RUN_TREE_TOKEN_BUDGET_EXHAUSTED,
-    RUN_WORK_LEDGER_HELPER_KEY,
     SUBAGENT_RUN_BUDGET_EXHAUSTED,
+    SUBAGENT_RUN_BUDGET_SHORT,
     RunWorkLedger,
-    resolve_run_work_ledger,
-    run_work_ledger_from,
 )
-from protocore.runtime.tool_dispatch import HELPER_RUN_WORK_LEDGER_KEY
 
+from ._tool_fixtures import MockTool
 from .test_query_parallel_safe_tools import _queue_multi_tool_stream
 from .test_query_parallel_subagents import (
     _register_delegation_tool,
@@ -56,36 +56,27 @@ from .test_query_parallel_subagents import (
 )
 
 
-def _rc(*, runs: int = 0, tokens: int = 0) -> RuntimeConstants:
+class _NonDelegationTool(MockTool):
+    """A perfectly ordinary tool: it implements no delegation contract.
+
+    The leader's own tools are what it assembles an answer out of, and the
+    budget is not allowed to touch them — so the double this test refuses to
+    charge must be recognisably NOT delegation, which now means implementing
+    nothing rather than clearing a flag.
+    """
+
+    async def invoke(self, context: Any, arguments: dict[str, Any]) -> ToolResult:
+        self.calls.append(dict(arguments))
+        return ToolResult(tool_call_id="", content="read", is_error=False)
+
+
+def _rc(*, runs: int = 0, tokens: int = 0) -> LoopConstants:
     """A constants snapshot with only the two total-work caps set."""
-    return RuntimeConstants(
+    return LoopConstants(
         model_context_window=4_096,
         max_subagent_runs_per_tree=runs,
         max_total_tokens_per_tree=tokens,
     )
-
-
-class _ReservingDelegationTool(_ScriptedDelegationTool):
-    """A delegation fake that RESERVES from the ledger, as the real tool does.
-
-    Core cannot count child runs on its own and this fake is where that shows.
-    One delegation tool call carries a LIST of tasks, and the list lives inside
-    the tool's own argument schema — which core, by design, knows nothing about.
-    So the division is: the delegation tool reserves (it is the only layer that
-    knows how many runs a call will start), and core refuses (it is where a
-    refusal becomes a tool result in the transcript, on both dispatch paths).
-
-    This fake reserves one run per call, which is what the real tool does for a
-    one-element batch. Without it a core-level end-to-end test would exercise the
-    refusal against a ledger nothing ever charges.
-    """
-
-    async def invoke(self, context: Any, arguments: dict[str, Any]) -> Any:
-        helpers = context.metadata.get("protocore.helpers")
-        ledger = run_work_ledger_from(helpers)
-        if ledger is not None:
-            ledger.reserve_child_runs(1)
-        return await super().invoke(context, arguments)
 
 
 def _tool_result_texts(engine: Any) -> list[str]:
@@ -118,19 +109,53 @@ def test_child_run_reservations_accumulate_and_never_reset() -> None:
 
     assert (first.granted, first.reason) == (2, "")
     assert (second.granted, second.reason) == (2, "")
-    assert third.granted == 1, "the third wave must see only the remaining slot"
-    assert third.reason == SUBAGENT_RUN_BUDGET_EXHAUSTED
-    assert third.refused == 1
-    assert ledger.child_runs_started == 5
-    assert ledger.reserve_child_runs(1).granted == 0
+    assert third.granted == 0, "the third wave asks for more than is left"
+    assert third.reason == SUBAGENT_RUN_BUDGET_SHORT
+    assert third.remaining == 1
+    assert ledger.child_runs_started == 4
+    assert ledger.reserve_child_runs(1).granted == 1
+    assert ledger.reserve_child_runs(1).reason == SUBAGENT_RUN_BUDGET_EXHAUSTED
 
 
-def test_grant_is_a_prefix_not_all_or_nothing() -> None:
-    """A batch bigger than the remainder runs the part that fits."""
+def test_a_batch_bigger_than_the_remainder_is_refused_whole() -> None:
+    """Admission is all-or-nothing, and the answer says how much would fit.
+
+    A prefix grant has to be sliced by whoever knows how the call maps to child
+    runs, and a grant handed out and thrown away charges the tree for runs that
+    never start. So the call is refused entire and ``remaining`` tells the
+    caller the size that would be admitted.
+    """
     ledger = RunWorkLedger(max_child_runs=3, max_tokens=0)
     grant = ledger.reserve_child_runs(10)
-    assert (grant.requested, grant.granted, grant.refused) == (10, 3, 7)
+    assert (grant.requested, grant.granted, grant.refused) == (10, 0, 10)
+    assert grant.reason == SUBAGENT_RUN_BUDGET_SHORT
+    assert grant.remaining == 3
     assert grant.fully_granted is False
+    assert ledger.child_runs_started == 0, "a refused batch must not be charged"
+
+
+def test_a_charge_is_taken_once_per_call_id() -> None:
+    """One call reaching the charge twice — parked, then approved — pays once."""
+    ledger = RunWorkLedger(max_child_runs=5, max_tokens=0)
+
+    first = ledger.reserve_child_runs(2, call_id="call-a")
+    second = ledger.reserve_child_runs(2, call_id="call-a")
+
+    assert (first.granted, second.granted) == (2, 2)
+    assert ledger.child_runs_started == 2
+    assert ledger.has_charged("call-a") is True
+    assert ledger.has_charged("call-b") is False
+
+
+def test_charged_call_ids_survive_the_snapshot() -> None:
+    """The pause can outlive the process, so the record of it must too."""
+    ledger = RunWorkLedger(max_child_runs=5, max_tokens=0)
+    ledger.reserve_child_runs(2, call_id="call-a")
+
+    rebuilt = RunWorkLedger.from_snapshot(ledger.to_snapshot())
+    rebuilt.reserve_child_runs(2, call_id="call-a")
+
+    assert rebuilt.child_runs_started == 2
 
 
 def test_zero_caps_are_the_unlimited_sentinel() -> None:
@@ -158,12 +183,8 @@ def test_tokens_are_monotonic_and_ignore_negative_reports() -> None:
     assert ledger.delegation_refusal_reason() == RUN_TREE_TOKEN_BUDGET_EXHAUSTED
 
 
-def test_token_exhaustion_refuses_the_whole_batch_not_a_prefix() -> None:
-    """The token budget is all-or-nothing where the run budget is a prefix.
-
-    Once the tree's total spend is gone, no fraction of a further batch is worth
-    starting — unlike a run count, where the remaining slots are real capacity.
-    """
+def test_token_exhaustion_refuses_the_whole_batch() -> None:
+    """Once the tree's total spend is gone, no further batch is worth starting."""
     ledger = RunWorkLedger(max_child_runs=100, max_tokens=10)
     ledger.charge_tokens(input_tokens=10, output_tokens=0)
     grant = ledger.reserve_child_runs(4)
@@ -196,56 +217,50 @@ def test_spent_summary_names_both_budgets() -> None:
 # ---------------------------------------------------------------------------
 
 
-def test_resolve_mints_into_the_bag_and_returns_the_same_object() -> None:
-    helpers: dict[str, Any] = {}
-    first = resolve_run_work_ledger(helpers, _rc(runs=3))
-    second = resolve_run_work_ledger(helpers, _rc(runs=99))
-    assert first is second, "a second resolve must not mint a second ledger"
+def test_ensure_mints_once_and_returns_the_same_object() -> None:
+    state = RunScopedState()
+    first = state.ensure_run_work_ledger(_rc(runs=3))
+    second = state.ensure_run_work_ledger(_rc(runs=99))
+    assert first is second, "a second call must not mint a second ledger"
     assert first.max_child_runs == 3, "the cap is captured at mint, not re-read"
-    assert helpers[RUN_WORK_LEDGER_HELPER_KEY] is first
-    assert run_work_ledger_from(helpers) is first
-
-
-def test_helper_key_is_one_string_across_modules() -> None:
-    """``tool_dispatch`` re-exports the owning module's key rather than restating it."""
-    assert HELPER_RUN_WORK_LEDGER_KEY == RUN_WORK_LEDGER_HELPER_KEY
+    assert state.run_work_ledger is first
 
 
 def test_descendants_at_depth_count_into_the_root_ledger() -> None:
     """A grandchild's work lands in the ROOT's ledger, not a fresh one.
 
-    Simulates exactly what the host subagent runner does to build a child
-    bag: ``dict(parent_helpers)``. The copy is shallow, so the ledger travels by
-    reference — which is the mechanism that makes "counted across the whole
-    tree" true at every depth rather than only for direct children.
+    Simulates what a host does to compose a child's state: it carries the
+    parent's ledger across by reference — which is the mechanism that makes
+    "counted across the whole tree" true at every depth rather than only for
+    direct children.
     """
-    root: dict[str, Any] = {}
-    ledger = resolve_run_work_ledger(root, _rc(runs=6))
+    root = RunScopedState()
+    ledger = root.ensure_run_work_ledger(_rc(runs=6))
 
-    child = dict(root)
-    grandchild = dict(child)
-    great_grandchild = dict(grandchild)
+    child = RunScopedState(run_work_ledger=root.run_work_ledger)
+    grandchild = RunScopedState(run_work_ledger=child.run_work_ledger)
+    great_grandchild = RunScopedState(run_work_ledger=grandchild.run_work_ledger)
 
-    for bag in (child, grandchild, great_grandchild):
-        resolve_run_work_ledger(bag, _rc(runs=6)).reserve_child_runs(2)
-        resolve_run_work_ledger(bag, _rc(runs=6)).charge_tokens(
+    for state in (child, grandchild, great_grandchild):
+        state.ensure_run_work_ledger(_rc(runs=6)).reserve_child_runs(2)
+        state.ensure_run_work_ledger(_rc(runs=6)).charge_tokens(
             input_tokens=5, output_tokens=5
         )
 
     assert ledger.child_runs_started == 6
     assert ledger.tokens_charged == 30
     assert ledger.delegation_refusal_reason() == SUBAGENT_RUN_BUDGET_EXHAUSTED
-    assert run_work_ledger_from(great_grandchild) is ledger
+    assert great_grandchild.run_work_ledger is ledger
 
 
-def test_bagless_caller_gets_its_own_ledger() -> None:
-    """No mutable bag ⇒ a local ledger that bounds only the caller.
+def test_a_run_composed_without_one_gets_its_own_ledger() -> None:
+    """No shared ledger ⇒ a local one that bounds only this run.
 
     Better than no bound, and unmistakable for a tree-wide one: nothing else can
     reach it.
     """
-    first = resolve_run_work_ledger(None, _rc(runs=2))
-    second = resolve_run_work_ledger(None, _rc(runs=2))
+    first = RunScopedState().ensure_run_work_ledger(_rc(runs=2))
+    second = RunScopedState().ensure_run_work_ledger(_rc(runs=2))
     assert first is not second
 
 
@@ -255,7 +270,7 @@ def test_missing_constants_read_as_unlimited() -> None:
     class _Bare:
         pass
 
-    assert resolve_run_work_ledger(None, _Bare()).unlimited is True
+    assert RunScopedState().ensure_run_work_ledger(_Bare()).unlimited is True
 
 
 # ---------------------------------------------------------------------------
@@ -269,7 +284,6 @@ async def test_exhausted_budget_refuses_delegation_without_invoking_the_tool(
 ) -> None:
     """The refusal happens BEFORE dispatch — no child run, no tool invocation."""
     engine = engine_factory(rc=_rc(runs=1))
-    setattr(engine, "_helpers", {})  # noqa: B010 — stand in for the executor bag
     tool = _register_delegation_tool(in_memory_runtime)
     _resolve_run_work_ledger(engine).reserve_child_runs(1)  # spend the only slot
 
@@ -297,7 +311,6 @@ async def test_refusal_is_actionable_not_generic(
     that close off that reading.
     """
     engine = engine_factory(rc=_rc(runs=1))
-    setattr(engine, "_helpers", {})  # noqa: B010
     _register_delegation_tool(in_memory_runtime)
     _resolve_run_work_ledger(engine).reserve_child_runs(1)
 
@@ -324,7 +337,6 @@ async def test_token_exhaustion_refuses_delegation_by_name(
 ) -> None:
     """The token budget refuses delegation, and says which budget it was."""
     engine = engine_factory(rc=_rc(tokens=50))
-    setattr(engine, "_helpers", {})  # noqa: B010
     tool = _register_delegation_tool(in_memory_runtime)
     _resolve_run_work_ledger(engine).charge_tokens(input_tokens=40, output_tokens=10)
 
@@ -348,10 +360,8 @@ async def test_non_delegation_tools_are_untouched_by_an_exhausted_budget(
     it exists to prevent.
     """
     engine = engine_factory(rc=_rc(runs=1))
-    setattr(engine, "_helpers", {})  # noqa: B010
     _register_delegation_tool(in_memory_runtime)
-    plain = _ScriptedDelegationTool(tool_name="Read", description="read")
-    plain.is_parallel_delegation = False
+    plain = _NonDelegationTool(tool_name="Read", description="read")
     in_memory_runtime["tools"].register(plain)
     _resolve_run_work_ledger(engine).reserve_child_runs(1)
 
@@ -370,7 +380,6 @@ async def test_budget_with_room_left_dispatches_normally(
 ) -> None:
     """Control: an unexhausted budget changes nothing about the dispatch."""
     engine = engine_factory(rc=_rc(runs=5))
-    setattr(engine, "_helpers", {})  # noqa: B010
     tool = _register_delegation_tool(in_memory_runtime)
 
     _events, outcome = await _drain_dispatch_tool_deferred(
@@ -398,7 +407,6 @@ async def test_serial_dispatch_refuses_too(engine_factory, in_memory_runtime) ->
     easiest way to exceed the budget wide open.
     """
     engine = engine_factory(rc=_rc(runs=1))
-    setattr(engine, "_helpers", {})  # noqa: B010
     tool = _register_delegation_tool(in_memory_runtime)
     _resolve_run_work_ledger(engine).reserve_child_runs(1)
 
@@ -431,11 +439,12 @@ async def test_cap_holds_across_waves_and_the_run_still_finalises(
     wave one is dispatched in full (2 of 3), wave two is admitted one child deep
     and refused on the second, and the run reaches a normal text completion
     afterwards. If the second wave were judged against a fresh cap it would run
-    both, which is the unbounded behaviour this replaces.
+    both, which is the unbounded behaviour this replaces. The delegation tool
+    below charges nothing — the loop charges a slot where a child run starts, so
+    an ordinary delegation fake is all the cap needs to be real.
     """
     engine = engine_factory(rc=_rc(runs=3))
-    setattr(engine, "_helpers", {})  # noqa: B010
-    tool = _ReservingDelegationTool(tool_name="Agent", description="delegate")
+    tool = _ScriptedDelegationTool(tool_name="Agent", description="delegate")
     in_memory_runtime["tools"].register(tool)
 
     for wave in ("a", "b"):
@@ -496,7 +505,6 @@ async def test_llm_usage_charges_the_tree_ledger(
     test written against it would have asserted 0 == 0 and pinned nothing.
     """
     engine = engine_factory(rc=_rc(tokens=0))
-    setattr(engine, "_helpers", {})  # noqa: B010
     _register_delegation_tool(in_memory_runtime)
     in_memory_runtime["llm"].queue_tool_call_response(
         tool_call_id="c-1",

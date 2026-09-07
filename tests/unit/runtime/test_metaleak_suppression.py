@@ -26,7 +26,7 @@ from typing import Any
 import pytest
 
 from protocore.contracts.llm import LLMStreamEvent
-from protocore.contracts.runtime_constants import RuntimeConstants
+from protocore.contracts.runtime_constants import LoopConstants
 from protocore.contracts.tools import Tool
 from protocore.contracts.types import (
     TERMINAL_TOOL_METADATA_KEY,
@@ -40,7 +40,7 @@ from protocore.contracts.types import (
 )
 from protocore.runtime.events import EventType, TurnEvent
 from protocore.runtime.loop_state import LoopState
-from protocore.runtime.query import query
+from protocore.runtime.query import _query as query
 
 # ---------------------------------------------------------------------------
 # Tool stubs: a recording Write (write-first recovery target) + a BACKGROUND
@@ -115,14 +115,14 @@ class _BackgroundFinalizeTool(Tool):
         )
 
 
-def _finalize_rc() -> RuntimeConstants:
+def _finalize_rc() -> LoopConstants:
     """The live shape: typed-Finalize terminal + nudge armed + min_chars=1.
 
     Disable the write-first prefix by default so the plain background-Finalize
     tests are not affected by the deliverable-write steering; the BLOCKER test
     re-enables it explicitly."""
 
-    return RuntimeConstants(
+    return LoopConstants(
         model_context_window=4_096,
         terminal_tool_nudge_enabled=True,
         terminal_tool_nudge_write_first_enabled=False,

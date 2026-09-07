@@ -34,7 +34,7 @@ class SkillNotFoundError(SkillStoreError):
 
 
 class SkillConflictError(SkillStoreError):
-    """Raised when a skill name collides with an existing account skill."""
+    """Raised when a skill name collides with one already in the bank."""
 
 
 class SkillIndexEntry(BaseModel):
@@ -98,44 +98,49 @@ class ISkillStore(Protocol):
 
     Supports CRUD + body load + ``list_files`` / ``load_file``
     for multi-file skill bundle support.
+
+    ``account_id`` throughout is the opaque key a skill bank is addressed by —
+    see :attr:`~protocore.runtime.query_engine.QueryEngineConfig.account_id`.
+    This package neither parses it nor assumes what a host addresses with it;
+    the name is the spelling embedders already pass and is kept for that reason.
     """
 
-    async def list(self, tenant_id: str) -> Sequence[SkillIndexEntry]:
-        """Return the account's skill index."""
+    async def list(self, account_id: str) -> Sequence[SkillIndexEntry]:
+        """Return the bank's skill index."""
         ...
 
-    async def load(self, tenant_id: str, skill_id: str) -> SkillBundle:
+    async def load(self, account_id: str, skill_id: str) -> SkillBundle:
         """Fetch full skill manifest + body markdown."""
         ...
 
-    async def upsert(self, tenant_id: str, manifest: SkillManifest, body: str) -> None:
-        """Create or update an account skill (body stored as blob)."""
+    async def upsert(self, account_id: str, manifest: SkillManifest, body: str) -> None:
+        """Create or update a skill in the bank (body stored as a blob)."""
         ...
 
-    async def create(self, tenant_id: str, payload: SkillUpsertInput) -> SkillIndexEntry:
-        """Insert a new account skill."""
+    async def create(self, account_id: str, payload: SkillUpsertInput) -> SkillIndexEntry:
+        """Insert a new skill into the bank."""
         ...
 
     async def update(
         self,
-        tenant_id: str,
+        account_id: str,
         skill_id: str,
         payload: SkillUpsertInput,
     ) -> SkillIndexEntry:
-        """Update an existing account skill."""
+        """Update a skill already in the bank."""
         ...
 
-    async def delete(self, tenant_id: str, skill_id: str) -> None:
-        """Delete an account skill by id."""
+    async def delete(self, account_id: str, skill_id: str) -> None:
+        """Delete a skill from the bank by id."""
         ...
 
-    async def set_enabled(self, tenant_id: str, skill_id: str, *, enabled: bool) -> None:
+    async def set_enabled(self, account_id: str, skill_id: str, *, enabled: bool) -> None:
         """Soft toggle skill enabled flag."""
         ...
 
     async def list_subset(
         self,
-        tenant_id: str,
+        account_id: str,
         names: Sequence[str],
     ) -> Sequence[SkillIndexEntry]:
         """Return entries matching the given skill names.
@@ -151,7 +156,7 @@ class ISkillStore(Protocol):
 
     async def list_enabled_subset(
         self,
-        tenant_id: str,
+        account_id: str,
         names: Sequence[str],
     ) -> Sequence[SkillIndexEntry]:
         """Return ENABLED entries matching the given skill names.
@@ -168,7 +173,7 @@ class ISkillStore(Protocol):
 
     async def list_files(
         self,
-        tenant_id: str,
+        account_id: str,
         skill_id: str,
     ) -> Sequence[SkillFileRef]:
         """List every file in the skill bundle as ``SkillFileRef`` rows.
@@ -183,7 +188,7 @@ class ISkillStore(Protocol):
 
     async def load_file(
         self,
-        tenant_id: str,
+        account_id: str,
         skill_id: str,
         path: str,
     ) -> bytes | None:

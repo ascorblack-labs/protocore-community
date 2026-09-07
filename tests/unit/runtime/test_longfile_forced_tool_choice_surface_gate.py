@@ -22,7 +22,7 @@ from collections.abc import AsyncIterator
 import pytest
 
 from protocore.contracts.llm import ProviderDelta, ProviderDeltaKind
-from protocore.contracts.runtime_constants import RuntimeConstants
+from protocore.contracts.runtime_constants import LoopConstants
 from protocore.contracts.types import (
     Message,
     MessageRole,
@@ -100,7 +100,7 @@ async def test_force_hint_not_consumed_when_forced_tool_not_on_surface(
     the hint, so a downstream consumer sees ``None`` and the force is
     silently dropped.
     """
-    engine = engine_factory(rc=RuntimeConstants(model_context_window=4_096))
+    engine = engine_factory(rc=LoopConstants(model_context_window=4_096))
     engine.history.append(_user_message("do work"))
     engine.llm.stream_with_tools = _stub_stream(_finish_deltas())  # type: ignore[method-assign]
 
@@ -135,7 +135,7 @@ async def test_force_hint_consumed_when_forced_tool_on_surface(
     the outbound ``LLMRequest.extra``. The hint is consumed so the next
     stream is not double-forced.
     """
-    engine = engine_factory(rc=RuntimeConstants(model_context_window=4_096))
+    engine = engine_factory(rc=LoopConstants(model_context_window=4_096))
     engine.history.append(_user_message("do work"))
 
     captured: list[object] = []
@@ -174,7 +174,7 @@ async def test_force_hint_no_op_when_unset(engine_factory) -> None:
     stream builder must not set ``forced_tool_choice`` on the request and
     must not throw (idempotent on the no-hint path).
     """
-    engine = engine_factory(rc=RuntimeConstants(model_context_window=4_096))
+    engine = engine_factory(rc=LoopConstants(model_context_window=4_096))
     engine.history.append(_user_message("hello"))
     captured: list[object] = []
 

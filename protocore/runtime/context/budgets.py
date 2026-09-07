@@ -1,10 +1,10 @@
 """Formula-derived token budgets per
 
-Pure function. Same :class:`RuntimeConstants` snapshot yields the same
+Pure function. Same :class:`LoopConstants` snapshot yields the same
 :class:`TokenBudgets` — cross-pod deterministic. No module-level cache.
 
 All budgets are **derived** from a canonical input
-(:attr:`RuntimeConstants.model_context_window`) and per-section ratios.
+(:attr:`LoopConstants.model_context_window`) and per-section ratios.
 The dashboard surfaces ratios as canonical inputs and the derived values
 as read-only computed fields.
 """
@@ -12,7 +12,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-from protocore.contracts.runtime_constants import RuntimeConstants
+from protocore.contracts.runtime_constants import LoopConstants
 
 
 @dataclass(frozen=True, slots=True)
@@ -59,7 +59,7 @@ class TokenBudgets:
         )
 
 
-def derive_budgets(rc: RuntimeConstants) -> TokenBudgets:
+def derive_budgets(rc: LoopConstants) -> TokenBudgets:
     """Compute :class:`TokenBudgets` from an RC snapshot.
 
     Pure function. The dashboard's RC editor surfaces ratios; this function

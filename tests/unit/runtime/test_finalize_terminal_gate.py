@@ -20,7 +20,7 @@ from typing import Any
 
 import pytest
 
-from protocore.contracts.runtime_constants import RuntimeConstants
+from protocore.contracts.runtime_constants import LoopConstants
 from protocore.contracts.tools import ToolContext
 from protocore.contracts.types import (
     SESSION_HISTORY_SEED_METADATA_KEY,
@@ -62,6 +62,7 @@ from protocore.tests_support.adapters import (
     InMemorySkillStore,
     InMemoryToolRegistry,
 )
+from tests._fixtures.tool_roles import CONVENTIONAL_TOOL_ROLES
 
 from ._tool_fixtures import MockTool
 
@@ -95,10 +96,11 @@ def _build_engine(
     *,
     llm: InMemoryLLMProvider,
     registry: InMemoryToolRegistry,
-    rc: RuntimeConstants,
+    rc: LoopConstants,
 ) -> QueryEngine:
     return QueryEngine(
         config=QueryEngineConfig(
+            tool_roles=CONVENTIONAL_TOOL_ROLES,
             run_id="run-finalize",
             tenant_id="tenant-test",
             session_id="sess-test",
@@ -121,7 +123,7 @@ def _build_engine(
 
 
 def test_finalize_gate_requires_nudge_before_finalize() -> None:
-    rc = RuntimeConstants(model_context_window=4_096, terminal_tool_nudge_enabled=True)
+    rc = LoopConstants(model_context_window=4_096, terminal_tool_nudge_enabled=True)
     engine = _build_engine(
         llm=InMemoryLLMProvider(), registry=InMemoryToolRegistry(), rc=rc
     )
@@ -132,7 +134,7 @@ def test_finalize_gate_requires_nudge_before_finalize() -> None:
 
 
 def test_finalize_terminal_only_blocks_non_finalize_after_latch() -> None:
-    rc = RuntimeConstants(model_context_window=4_096, terminal_tool_nudge_enabled=True)
+    rc = LoopConstants(model_context_window=4_096, terminal_tool_nudge_enabled=True)
     engine = _build_engine(
         llm=InMemoryLLMProvider(), registry=InMemoryToolRegistry(), rc=rc
     )
@@ -168,7 +170,7 @@ async def test_prose_attempt_is_repaired_into_finalize() -> None:
  here proses, then calls a payload-only Finalize on the re-drive, which the
  prose-gate would otherwise also intercept — that path is covered by its own
  tests below)."""
-    rc = RuntimeConstants(
+    rc = LoopConstants(
         model_context_window=4_096,
         terminal_tool_nudge_enabled=True,
         finalize_prose_gate_enabled=False,
@@ -269,7 +271,7 @@ async def test_analytic_answer_finalizes_directly() -> None:
  ``finalize_prose_gate_enabled=False`` isolates the analytic-direct path: a
  truly prose-less analytic Finalize is exactly what the prose-gate intercepts (covered by its own tests below); here we assert the
  PRE-prose-gate direct-finalize behaviour."""
-    rc = RuntimeConstants(
+    rc = LoopConstants(
         model_context_window=4_096,
         terminal_tool_nudge_enabled=True,
         finalize_prose_gate_enabled=False,
@@ -313,7 +315,7 @@ async def test_analytic_answer_finalizes_directly() -> None:
 def _build_prose_gate_engine(
     *, llm: InMemoryLLMProvider, registry: InMemoryToolRegistry, **rc_kwargs: Any
 ) -> QueryEngine:
-    rc = RuntimeConstants(
+    rc = LoopConstants(
         model_context_window=4_096,
         terminal_tool_nudge_enabled=False,
         **rc_kwargs,
@@ -324,7 +326,7 @@ def _build_prose_gate_engine(
 def test_prose_gate_predicate_payload_only_vs_prose_after_work() -> None:
     """The prose predicate: prose AFTER the latest non-terminal work counts;
     prose only BEFORE the work (or none) does not."""
-    rc = RuntimeConstants(model_context_window=4_096)
+    rc = LoopConstants(model_context_window=4_096)
     engine = _build_engine(
         llm=InMemoryLLMProvider(), registry=InMemoryToolRegistry(), rc=rc
     )
@@ -365,7 +367,7 @@ def test_prose_gate_predicate_payload_only_vs_prose_after_work() -> None:
 
 def test_prose_gate_short_prose_below_floor_does_not_satisfy() -> None:
     """Prose shorter than ``finalize_prose_gate_min_chars`` does NOT count."""
-    rc = RuntimeConstants(model_context_window=4_096, finalize_prose_gate_min_chars=100)
+    rc = LoopConstants(model_context_window=4_096, finalize_prose_gate_min_chars=100)
     engine = _build_engine(
         llm=InMemoryLLMProvider(), registry=InMemoryToolRegistry(), rc=rc
     )
@@ -590,7 +592,7 @@ def _background_registry() -> InMemoryToolRegistry:
 def test_prose_gate_applies_predicate_gating() -> None:
     """``_finalize_prose_gate_applies`` honours: RC enable, terminal-tool match,
     one-shot latch, and the BACKGROUND-schema condition."""
-    rc = RuntimeConstants(model_context_window=4_096)
+    rc = LoopConstants(model_context_window=4_096)
     engine = _build_engine(
         llm=InMemoryLLMProvider(), registry=_background_registry(), rc=rc
     )
@@ -604,7 +606,7 @@ def test_prose_gate_applies_predicate_gating() -> None:
     assert _finalize_prose_gate_applies(engine, finalize_call) is False
     engine._finalize_prose_gate_used = False
     # RC disabled → no gate.
-    rc_off = RuntimeConstants(
+    rc_off = LoopConstants(
         model_context_window=4_096, finalize_prose_gate_enabled=False
     )
     engine_off = _build_engine(
@@ -642,7 +644,7 @@ def test_message_carrying_terminal_is_exempt_even_without_prose() -> None:
     """A MESSAGE-CARRYING terminal tool (schema declares ``message``)
     is EXEMPT from the prose-gate even when the run has no assistant prose: it
     legitimately answers via its args, so the gate must NOT withhold it."""
-    rc = RuntimeConstants(model_context_window=4_096)
+    rc = LoopConstants(model_context_window=4_096)
     registry = InMemoryToolRegistry()
     registry.register(
         _MessageCarryingTerminalTool(tool_name="Finalize", description="answer")
@@ -660,7 +662,7 @@ def test_unknown_schema_terminal_is_exempt() -> None:
     """A terminal tool unknown to the core registry (a host-backend
     tool whose contract core does not hold) is EXEMPT for multi-tenant safety
     (we cannot prove it is background)."""
-    rc = RuntimeConstants(model_context_window=4_096)
+    rc = LoopConstants(model_context_window=4_096)
     engine = _build_engine(
         llm=InMemoryLLMProvider(),
         registry=InMemoryToolRegistry(),  # nothing registered
@@ -722,7 +724,7 @@ def test_seeded_prior_run_prose_does_not_satisfy_gate() -> None:
     """assistant prose tagged ``SESSION_HISTORY_SEED_METADATA_KEY``
     (a PRIOR-RUN turn the executor seeded into this run) is SKIPPED, so a
     payload-only terminal in the CURRENT run still trips the gate."""
-    rc = RuntimeConstants(model_context_window=4_096, finalize_prose_gate_min_chars=10)
+    rc = LoopConstants(model_context_window=4_096, finalize_prose_gate_min_chars=10)
     engine = _build_engine(
         llm=InMemoryLLMProvider(), registry=_background_registry(), rc=rc
     )
@@ -930,7 +932,7 @@ def test_is_non_terminal_tool_activity_named_result_branches() -> None:
 def test_prose_gate_just_injected_empty_and_non_repair_tail() -> None:
     """``_prose_gate_just_injected`` — False on empty history, False when the
     tail is not the prose-gate repair turn, True when it is."""
-    rc = RuntimeConstants(model_context_window=4_096)
+    rc = LoopConstants(model_context_window=4_096)
     engine = _build_engine(
         llm=InMemoryLLMProvider(), registry=InMemoryToolRegistry(), rc=rc
     )
@@ -965,7 +967,7 @@ def test_prose_gate_just_injected_empty_and_non_repair_tail() -> None:
 def test_terminal_tool_carries_answer_field_no_registry_is_exempt() -> None:
     """``_terminal_tool_carries_answer_field`` — an engine whose ``tools`` has no
     ``.get`` (no usable registry) fails SAFE → exempt (True)."""
-    rc = RuntimeConstants(model_context_window=4_096)
+    rc = LoopConstants(model_context_window=4_096)
     engine = _build_engine(
         llm=InMemoryLLMProvider(), registry=InMemoryToolRegistry(), rc=rc
     )
@@ -978,7 +980,7 @@ def test_prose_gate_disabled_predicate_short_circuits() -> None:
     """``_finalize_prose_gate_applies`` returns False immediately when the RC
     flag is off (covers the enable short-circuit) and when no terminal tool is
     configured."""
-    rc_off = RuntimeConstants(
+    rc_off = LoopConstants(
         model_context_window=4_096, finalize_prose_gate_enabled=False
     )
     engine_off = _build_engine(
@@ -988,9 +990,10 @@ def test_prose_gate_disabled_predicate_short_circuits() -> None:
     assert _finalize_prose_gate_applies(engine_off, call) is False
 
     # No expected_terminal_tool configured → never intercept.
-    rc_on = RuntimeConstants(model_context_window=4_096)
+    rc_on = LoopConstants(model_context_window=4_096)
     engine_no_term = QueryEngine(
         config=QueryEngineConfig(
+            tool_roles=CONVENTIONAL_TOOL_ROLES,
             run_id="r",
             tenant_id="t",
             session_id="s",

@@ -19,7 +19,7 @@ from collections.abc import AsyncIterator
 import pytest
 
 from protocore.contracts.llm import ProviderDelta, ProviderDeltaKind
-from protocore.contracts.runtime_constants import RuntimeConstants
+from protocore.contracts.runtime_constants import LoopConstants
 from protocore.contracts.types import (
     PENDING_READS_METADATA_KEY,
     Message,
@@ -36,8 +36,14 @@ from protocore.runtime.context.budgets import derive_budgets
 from protocore.runtime.context.manager import ContextBundle
 from protocore.runtime.events import EventType
 from protocore.runtime.query import _drive_one_stream, _StreamAttemptResult
+from protocore.runtime.query_engine import QueryEngine
 
 DELEGATED_FILES = ["reports/findings-a.md", "reports/findings-b.md"]
+
+
+def _pending(engine: QueryEngine) -> tuple[str, ...]:
+    """The paths the engine still owes a read, in declaration order."""
+    return tuple(engine._pending_read_paths)
 
 
 def _tool_def(name: str) -> ToolDefinition:
@@ -127,7 +133,7 @@ def _released_reasons(events: list[object]) -> list[str]:
 @pytest.fixture
 def leader(engine_factory):
     """An engine mid-run, with a recorder wired in place of the provider."""
-    engine = engine_factory(rc=RuntimeConstants(model_context_window=4_096, pending_reads_enabled=True))
+    engine = engine_factory(rc=LoopConstants(model_context_window=4_096, pending_reads_enabled=True))
     engine.history.append(
         Message(
             role=MessageRole.user,
@@ -161,7 +167,7 @@ async def test_no_answer_until_both_declared_files_are_read(leader) -> None:
     _observe_read(engine, DELEGATED_FILES[1], call_id="read-2")
     await _run_one_stream(engine)
     assert recorder.forced_choice() is None
-    assert _pending_reads.pending_paths(engine) == ()
+    assert _pending(engine) == ()
 
     # Three streams, and the gate spoke on exactly the two that owed a read.
     assert [recorder.forced_choice(i) for i in range(3)] == ["Read", "Read", None]
@@ -183,7 +189,7 @@ async def test_kill_switch_off_is_byte_identical(engine_factory) -> None:
     """An operator can disable the whole mechanism; a disabled build forces
     nothing and tracks nothing."""
     engine = engine_factory(
-        rc=RuntimeConstants(model_context_window=4_096, pending_reads_enabled=False)
+        rc=LoopConstants(model_context_window=4_096, pending_reads_enabled=False)
     )
     engine.history.append(
         Message(role=MessageRole.user, content_blocks=[TextBlock(text="go")])
@@ -195,7 +201,7 @@ async def test_kill_switch_off_is_byte_identical(engine_factory) -> None:
     await _run_one_stream(engine)
 
     assert recorder.forced_choice() is None
-    assert _pending_reads.pending_paths(engine) == ()
+    assert _pending(engine) == ()
 
 
 @pytest.mark.asyncio
@@ -205,7 +211,7 @@ async def test_a_precondition_wins_the_slot_and_the_debt_survives(
     """A run-level precondition is a promise with a deadline; the read-back
     debt is not, so it waits its turn — untouched, uncharged, still owed."""
     engine = engine_factory(
-        rc=RuntimeConstants(model_context_window=4_096, pending_reads_enabled=True),
+        rc=LoopConstants(model_context_window=4_096, pending_reads_enabled=True),
         tool_preconditions=(ToolPrecondition(tool="Grep", calls=1),),
     )
     engine.history.append(
@@ -218,7 +224,7 @@ async def test_a_precondition_wins_the_slot_and_the_debt_survives(
     await _run_one_stream(engine)
 
     assert recorder.forced_choice() == "Grep"
-    assert _pending_reads.pending_paths(engine) == tuple(DELEGATED_FILES)
+    assert _pending(engine) == tuple(DELEGATED_FILES)
     # No attempt was charged for a stream the gate never owned.
     assert engine._pending_reads_forced_attempts == 0
 
@@ -236,7 +242,7 @@ async def test_the_convergence_hint_wins_the_slot_and_the_debt_survives(
     await _run_one_stream(engine, tools=(*FULL_SURFACE, _tool_def("AppendFile")))
 
     assert recorder.forced_choice() == "AppendFile"
-    assert _pending_reads.pending_paths(engine) == tuple(DELEGATED_FILES)
+    assert _pending(engine) == tuple(DELEGATED_FILES)
     assert engine._pending_reads_forced_attempts == 0
 
 
@@ -252,7 +258,7 @@ async def test_read_missing_from_the_surface_consumes_nothing(leader) -> None:
     await _run_one_stream(engine, tools=clipped)
 
     assert recorder.forced_choice() is None
-    assert _pending_reads.pending_paths(engine) == tuple(DELEGATED_FILES)
+    assert _pending(engine) == tuple(DELEGATED_FILES)
     assert engine._pending_reads_forced_attempts == 0
 
     # A later stream whose surface DOES advertise the tool still forces it.
@@ -268,7 +274,7 @@ async def test_the_attempt_bound_releases_the_run_rather_than_wedging_it(
     reads something else every time — costs a bounded number of turns and then
     releases, saying so on the run's event stream."""
     engine = engine_factory(
-        rc=RuntimeConstants(
+        rc=LoopConstants(
             model_context_window=4_096,
             pending_reads_enabled=True,
             pending_reads_max_forced_attempts=2,
@@ -290,7 +296,7 @@ async def test_the_attempt_bound_releases_the_run_rather_than_wedging_it(
 
     assert recorder.forced_choice() is None
     assert "pending_reads_released" in _released_reasons(events)
-    assert _pending_reads.pending_paths(engine) == ()
+    assert _pending(engine) == ()
 
     # And it stays released: the abandoned path is never forced again.
     await _run_one_stream(engine)
@@ -375,7 +381,7 @@ async def test_giving_up_names_the_files_it_abandoned(engine_factory, caplog) ->
     """The released state, with the paths that were never opened — the run
     continues without them, and the log says which ones."""
     engine = engine_factory(
-        rc=RuntimeConstants(
+        rc=LoopConstants(
             model_context_window=4_096,
             pending_reads_enabled=True,
             pending_reads_max_forced_attempts=1,

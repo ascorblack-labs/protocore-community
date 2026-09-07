@@ -41,7 +41,8 @@ from typing import Any
 import pytest
 
 from protocore.contracts.llm import LLMRequest, LLMStreamEvent
-from protocore.contracts.runtime_constants import RuntimeConstants
+from protocore.contracts.runtime_constants import LoopConstants
+from protocore.contracts.tool_roles import ToolRole
 from protocore.contracts.tools import Tool, ToolContext
 from protocore.contracts.types import (
     TERMINAL_TOOL_METADATA_KEY,
@@ -55,6 +56,7 @@ from protocore.contracts.types import (
     ToolResultBlock,
     ToolUseBlock,
 )
+from protocore.prompts import bundled_prompt_provider
 from protocore.runtime import soft_stop as _soft_stop
 from protocore.runtime.events import EventType, TurnEvent
 from protocore.runtime.loop_state import LoopState
@@ -84,7 +86,7 @@ READ_TOOL = "Read"
 # ---------------------------------------------------------------------------
 def _build_engine(
     *,
-    rc: RuntimeConstants,
+    rc: LoopConstants,
     llm: object,
     expected_terminal_tool: str | None = TERMINAL_TOOL,
     pre_terminal_self_verify_trigger: object | None = None,
@@ -363,7 +365,7 @@ async def test_self_verify_injection_grants_fresh_max_messages_slot() -> None:
     the fix it yields COMPLETED with TWO LLM calls (the corrective end-turn
     runs). ``max_turns_per_run=2`` would make this NON-pinning.
     """
-    rc = RuntimeConstants(
+    rc = LoopConstants(
         model_context_window=4_096,
         max_turns_per_run=1,
         pre_terminal_self_verify_enabled=True,
@@ -414,7 +416,7 @@ async def test_self_verify_disabled_remains_bit_identical_no_bump() -> None:
     without a corrective turn: terminal-tool submission → COMPLETED, no extra
     LLM stream. The bump is conditional on the gate actually firing.
     """
-    rc = RuntimeConstants(
+    rc = LoopConstants(
         model_context_window=4_096,
         max_turns_per_run=2,
         # pre_terminal_self_verify_enabled defaults to False; the trigger
@@ -449,7 +451,7 @@ async def test_terminal_completed_synthesises_orphan_sibling_results() -> None:
     terminal-tool-completed exit so the durable history is pairing-valid for
     session consumers.
     """
-    rc = RuntimeConstants(model_context_window=4_096)
+    rc = LoopConstants(model_context_window=4_096)
     terminal_call_id = "toolu_term"
     read_call_id = "toolu_read"
 
@@ -565,7 +567,7 @@ async def test_max_turns_failed_exit_e2e_synthesises_orphan() -> None:
     # Wind-down off: it would grant the run more turns before the FAILED exit,
     # and the seam under test is the exit's orphan synthesis, not how many turns
     # precede it.
-    rc = RuntimeConstants(
+    rc = LoopConstants(
         model_context_window=4_096, max_turns_per_run=1, soft_stop_enabled=False
     )
 
@@ -669,7 +671,7 @@ async def test_max_turns_failed_exit_e2e_synthesises_orphan() -> None:
     ]
     assert len(synth) == 1
     assert synth[0].is_error is True
-    assert synth[0].content == rc.tool_result_interrupted_placeholder
+    assert synth[0].content == bundled_prompt_provider().render("tool_result_interrupted")
 
 
 def test_synthesise_helper_contract() -> None:
@@ -731,7 +733,7 @@ def _longfile_engine() -> QueryEngine:
 
     Mirrors ``test_terminal_finalize.py::_build_terminal_engine``.
     """
-    rc = RuntimeConstants(
+    rc = LoopConstants(
         model_context_window=4_096,
         agent_max_seconds=30.0,
         agent_deadline_finalize_slack_seconds=5.0,
@@ -851,7 +853,7 @@ async def test_longfile_convergence_skips_under_terminal_only_enforcement() -> N
     # pure decision; the latch is real for the actual call below.)
     import protocore.runtime.longfile_convergence as _lf
 
-    assert _lf.decide_next_forced_tool(engine) == "FinalizeFile"
+    assert _lf.decide_next_forced_tool(engine) is ToolRole.finalizes_path
     assert _terminal_only_enforced(engine) is True
 
     pre_history_len = len(engine.history)

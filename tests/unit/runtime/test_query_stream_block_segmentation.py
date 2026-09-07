@@ -21,7 +21,7 @@ from collections.abc import AsyncIterator
 import pytest
 
 from protocore.contracts.llm import ProviderDelta, ProviderDeltaKind
-from protocore.contracts.runtime_constants import RuntimeConstants
+from protocore.contracts.runtime_constants import LoopConstants
 from protocore.contracts.types import Message, MessageRole, TextBlock
 from protocore.runtime.events import EventType, TurnEvent
 from protocore.runtime.query import (
@@ -98,7 +98,7 @@ def _assert_blocks_are_single_kind(events: list[TurnEvent]) -> None:
 async def test_thinking_then_text_lands_in_two_typed_blocks(engine_factory) -> None:
     """Canonical reasoning-then-answer shape — the answer MUST open its own
     ``kind=text`` block instead of riding the ``kind=thinking`` one."""
-    engine = engine_factory(rc=RuntimeConstants(model_context_window=4_096))
+    engine = engine_factory(rc=LoopConstants(model_context_window=4_096))
     engine.history.append(_user_message("hi"))
     deltas = [
         ProviderDelta(kind=ProviderDeltaKind.thinking, content="let me "),
@@ -132,7 +132,7 @@ async def test_thinking_then_text_lands_in_two_typed_blocks(engine_factory) -> N
 async def test_text_then_thinking_does_not_retag_text_block(engine_factory) -> None:
     """Reverse order — already-streamed answer text must not be swallowed
     into a thinking block; the thinking deltas open a new block."""
-    engine = engine_factory(rc=RuntimeConstants(model_context_window=4_096))
+    engine = engine_factory(rc=LoopConstants(model_context_window=4_096))
     engine.history.append(_user_message("hi"))
     deltas = [
         ProviderDelta(kind=ProviderDeltaKind.text, content="answer"),
@@ -152,7 +152,7 @@ async def test_text_then_thinking_does_not_retag_text_block(engine_factory) -> N
 @pytest.mark.asyncio
 async def test_interleaved_kinds_open_a_block_per_run(engine_factory) -> None:
     """Each contiguous same-kind run gets exactly one block."""
-    engine = engine_factory(rc=RuntimeConstants(model_context_window=4_096))
+    engine = engine_factory(rc=LoopConstants(model_context_window=4_096))
     engine.history.append(_user_message("hi"))
     deltas = [
         ProviderDelta(kind=ProviderDeltaKind.thinking, content="t1"),
@@ -185,7 +185,7 @@ async def test_interleaved_kinds_open_a_block_per_run(engine_factory) -> None:
 @pytest.mark.asyncio
 async def test_single_kind_stream_keeps_one_block(engine_factory) -> None:
     """No kind transition — behaviour unchanged: one block, one stop."""
-    engine = engine_factory(rc=RuntimeConstants(model_context_window=4_096))
+    engine = engine_factory(rc=LoopConstants(model_context_window=4_096))
     engine.history.append(_user_message("hi"))
     deltas = [
         ProviderDelta(kind=ProviderDeltaKind.text, content="a"),
@@ -207,7 +207,7 @@ async def test_single_kind_stream_keeps_one_block(engine_factory) -> None:
 @pytest.mark.asyncio
 async def test_tool_use_after_thinking_closes_open_block(engine_factory) -> None:
     """A tool_use_start after thinking deltas still closes the open block."""
-    engine = engine_factory(rc=RuntimeConstants(model_context_window=4_096))
+    engine = engine_factory(rc=LoopConstants(model_context_window=4_096))
     engine.history.append(_user_message("hi"))
     deltas = [
         ProviderDelta(kind=ProviderDeltaKind.thinking, content="plan"),
@@ -251,7 +251,7 @@ async def test_text_after_tool_use_start_uses_fresh_block_idx(
     violation) and the chat reducer replaces the ``tool_use`` placeholder
     with the text block.
     """
-    engine = engine_factory(rc=RuntimeConstants(model_context_window=4_096))
+    engine = engine_factory(rc=LoopConstants(model_context_window=4_096))
     engine.history.append(_user_message("hi"))
     deltas = [
         ProviderDelta(
@@ -293,7 +293,7 @@ async def test_thinking_after_tool_use_stop_uses_fresh_block_idx(
     ``tool_use_stop`` branch's ``next_block_idx()`` advance for the
     "text after tool stop" variant.
     """
-    engine = engine_factory(rc=RuntimeConstants(model_context_window=4_096))
+    engine = engine_factory(rc=LoopConstants(model_context_window=4_096))
     engine.history.append(_user_message("hi"))
     deltas = [
         ProviderDelta(

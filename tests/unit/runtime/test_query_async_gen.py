@@ -294,9 +294,9 @@ async def test_endless_tool_calls_terminate_at_max_turns(
     ``max_turns_per_run`` assistant messages and emits
     ``stop_reason=max_turns`` cleanly.
     """
-    from protocore.contracts.runtime_constants import RuntimeConstants
+    from protocore.contracts.runtime_constants import LoopConstants
 
-    rc = RuntimeConstants(model_context_window=4_096, max_turns_per_run=3)
+    rc = LoopConstants(model_context_window=4_096, max_turns_per_run=3)
     engine = engine_factory(rc=rc)
     in_memory_runtime["tools"].register(_NoopTool())
     in_memory_runtime["llm"].set_default_tool_call(
@@ -342,9 +342,9 @@ async def test_max_turns_transitions_to_failed_before_message_stop_yield(
  yield (the contract every other FAILED/CANCELLED site follows), and a
  ``state_changed(to=failed)`` envelope must be on the wire.
  """
-    from protocore.contracts.runtime_constants import RuntimeConstants
+    from protocore.contracts.runtime_constants import LoopConstants
 
-    rc = RuntimeConstants(model_context_window=4_096, max_turns_per_run=2)
+    rc = LoopConstants(model_context_window=4_096, max_turns_per_run=2)
     engine = engine_factory(rc=rc)
     in_memory_runtime["tools"].register(_NoopTool())
     in_memory_runtime["llm"].set_default_tool_call(
@@ -383,12 +383,12 @@ async def test_terminal_nudge_recovers_plain_text_final(
     engine_factory, in_memory_runtime
 ) -> None:
     from protocore.contracts.llm import LLMStreamEvent
-    from protocore.contracts.runtime_constants import RuntimeConstants
+    from protocore.contracts.runtime_constants import LoopConstants
 
     #  — the prose-gate stays at its DEFAULT: ``pcm_answer``
     # is a MESSAGE-CARRYING terminal (schema declares ``message``), so the
     # schema-conditioned gate exempts it automatically (no RC override needed).
-    rc = RuntimeConstants(
+    rc = LoopConstants(
         model_context_window=4_096,
         max_turns_per_run=1,
         terminal_tool_nudge_enabled=True,
@@ -435,10 +435,10 @@ async def test_terminal_nudge_recovers_plain_text_final(
 async def test_terminal_nudge_is_disabled_without_expected_terminal_tool(
     engine_factory, in_memory_runtime
 ) -> None:
-    from protocore.contracts.runtime_constants import RuntimeConstants
+    from protocore.contracts.runtime_constants import LoopConstants
 
     # No ``expected_terminal_tool`` configured -> the nudge never fires.
-    rc = RuntimeConstants(
+    rc = LoopConstants(
         model_context_window=4_096, terminal_tool_nudge_enabled=True
     )
     engine = engine_factory(rc=rc, expected_terminal_tool=None)
@@ -471,11 +471,11 @@ async def test_the_turn_cap_gives_the_model_room_to_finish(
     whatever it had produced by then — usually nothing the user could read,
     despite the evidence being in hand.
     """
-    from protocore.contracts.runtime_constants import RuntimeConstants
+    from protocore.contracts.runtime_constants import LoopConstants
 
     # prose-gate at DEFAULT: ``pcm_answer`` is a MESSAGE-CARRYING terminal
     # (schema declares ``message``) ⟹ auto-exempt.
-    rc = RuntimeConstants(model_context_window=4_096, max_turns_per_run=1)
+    rc = LoopConstants(model_context_window=4_096, max_turns_per_run=1)
     engine = engine_factory(rc=rc, expected_terminal_tool="pcm_answer")
     in_memory_runtime["tools"].register(_NoopTool())
     tool = _TerminalAnswerTool()
@@ -527,7 +527,7 @@ async def test_terminal_only_latch_persists_across_snapshot_resume(
     non-terminal tool call. The wind-down is what makes terminal-only strict,
     so it is started here too — and it has to survive the resume for the same
     reason the latch does."""
-    from protocore.contracts.runtime_constants import RuntimeConstants
+    from protocore.contracts.runtime_constants import LoopConstants
     from protocore.contracts.types import ToolCall
     from protocore.runtime import soft_stop as _soft_stop
     from protocore.runtime.query import (
@@ -535,7 +535,7 @@ async def test_terminal_only_latch_persists_across_snapshot_resume(
         _terminal_only_blocks,
     )
 
-    rc = RuntimeConstants(
+    rc = LoopConstants(
         model_context_window=4_096,
         max_turns_per_run=1,
         terminal_tool_nudge_enabled=True,
@@ -583,12 +583,12 @@ async def test_compaction_uses_rc_for_summary_caps(
  ``InMemoryLLMProvider.calls`` view to verify the Tier 2 path picked
  them up correctly.
  """
-    from protocore.contracts.runtime_constants import RuntimeConstants
+    from protocore.contracts.runtime_constants import LoopConstants
     from protocore.runtime.context.compaction import (
         build_summary_schema,
     )
 
-    rc = RuntimeConstants(
+    rc = LoopConstants(
         model_context_window=64,
         compaction_trigger_ratio=0.5,
         compaction_keep_recent_turns=1,
@@ -639,9 +639,9 @@ async def test_compaction_started_payload_uses_correct_threshold(
  ``streaming-events.md``. Additionally ``tokens_before`` was
  missing entirely.
  """
-    from protocore.contracts.runtime_constants import RuntimeConstants
+    from protocore.contracts.runtime_constants import LoopConstants
 
-    rc = RuntimeConstants(
+    rc = LoopConstants(
         model_context_window=64,
         compaction_trigger_ratio=0.5,
         compaction_keep_recent_turns=1,
@@ -678,10 +678,10 @@ async def test_compaction_completion_persists_snapshot(
  (c) message_stop. Without (b) an executor crash between compaction
  and the next LLM call would lose the freed-up history.
  """
-    from protocore.contracts.runtime_constants import RuntimeConstants
+    from protocore.contracts.runtime_constants import LoopConstants
 
     # Tiny window so a single long message triggers compaction.
-    rc = RuntimeConstants(
+    rc = LoopConstants(
         model_context_window=64,
         compaction_trigger_ratio=0.5,  # 32 tokens trigger
         compaction_keep_recent_turns=1,
@@ -733,13 +733,13 @@ async def test_max_turns_stop_reason_uses_enum(
     # The enum carries the member.
     assert StopReason.max_turns.value == "max_turns"
 
-    from protocore.contracts.runtime_constants import RuntimeConstants
+    from protocore.contracts.runtime_constants import LoopConstants
 
     # The wind-down is off here on purpose: with it on the run closes on
     # ``soft_stop``, which is a different member and has its own coverage. This
     # is the raw exhaustion terminal, which is what a deployment with the
     # wind-down disabled still gets.
-    rc = RuntimeConstants(
+    rc = LoopConstants(
         model_context_window=4_096, max_turns_per_run=2, soft_stop_enabled=False
     )
     engine = engine_factory(rc=rc)
@@ -783,12 +783,12 @@ async def test_max_turns_exhaustion_is_failure_class_terminal(
     ``test_simple_text_turn_emits_minimum_event_sequence`` and the nudge
     recovery tests).
     """
-    from protocore.contracts.runtime_constants import RuntimeConstants
+    from protocore.contracts.runtime_constants import LoopConstants
 
     # Wind-down off: this pins the RAW exhaustion terminal. The wind-down's own
     # exhaustion terminal is failure-class for the same reason and is covered
     # with the rest of the wind-down.
-    rc = RuntimeConstants(
+    rc = LoopConstants(
         model_context_window=4_096, max_turns_per_run=2, soft_stop_enabled=False
     )
     engine = engine_factory(rc=rc)
@@ -961,9 +961,9 @@ async def test_compaction_mid_turn(engine_factory, in_memory_runtime) -> None:
     events, the post-compaction snapshot, and that the subsequent LLM
     request proceeds normally to ``end_turn``.
     """
-    from protocore.contracts.runtime_constants import RuntimeConstants
+    from protocore.contracts.runtime_constants import LoopConstants
 
-    rc = RuntimeConstants(
+    rc = LoopConstants(
         model_context_window=64,
         compaction_trigger_ratio=0.5,
         compaction_keep_recent_turns=1,
@@ -1000,9 +1000,9 @@ async def test_recursion_depth_guarded(engine_factory, in_memory_runtime) -> Non
     using a slightly different RC (low cap) — explicitly verifies the
     LOW #11 description: "endless tool calls terminate at max_turns".
     """
-    from protocore.contracts.runtime_constants import RuntimeConstants
+    from protocore.contracts.runtime_constants import LoopConstants
 
-    rc = RuntimeConstants(
+    rc = LoopConstants(
         model_context_window=4_096, max_turns_per_run=4, soft_stop_enabled=False
     )
     engine = engine_factory(rc=rc)

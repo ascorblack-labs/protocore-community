@@ -24,7 +24,7 @@ from typing import Any
 import pytest
 
 from protocore.contracts.llm import LLMRequest, LLMStreamEvent
-from protocore.contracts.runtime_constants import RuntimeConstants
+from protocore.contracts.runtime_constants import LoopConstants
 from protocore.contracts.tools import Tool, ToolContext
 from protocore.contracts.types import (
     Message,
@@ -48,6 +48,7 @@ from protocore.tests_support.adapters import (
     InMemorySkillStore,
     InMemoryToolRegistry,
 )
+from tests._fixtures.tool_roles import CONVENTIONAL_TOOL_ROLES
 
 WRITE = "Write"
 APPEND = "AppendFile"
@@ -56,7 +57,7 @@ READ = "Read"
 TARGET = "/workspace/big.py"
 
 
-def _rc(**overrides: object) -> RuntimeConstants:
+def _rc(**overrides: object) -> LoopConstants:
     base: dict[str, object] = {
         "model_context_window": 4_096,
         "longfile_convergence_enabled": True,
@@ -70,7 +71,7 @@ def _rc(**overrides: object) -> RuntimeConstants:
         "longfile_tail_anchor_chars": 200,
     }
     base.update(overrides)
-    return RuntimeConstants(**base)
+    return LoopConstants(**base)
 
 
 def _write_call(path: str, content: str = "x") -> ToolCall:
@@ -324,6 +325,7 @@ class _ByteReportingFileTool(Tool):
 def _build_engine(llm: object) -> QueryEngine:
     return QueryEngine(
         config=QueryEngineConfig(
+            tool_roles=CONVENTIONAL_TOOL_ROLES,
             run_id="run-f12-09",
             tenant_id="tenant-test",
             session_id="sess-f12-09",

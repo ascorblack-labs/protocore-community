@@ -17,7 +17,7 @@ from protocore.contracts.llm import (
     LLMStreamEvent,
     LLMStreamIdleError,
 )
-from protocore.contracts.runtime_constants import RuntimeConstants
+from protocore.contracts.runtime_constants import LoopConstants
 from protocore.contracts.types import (
     PARTIAL_ASSISTANT_ATTEMPT_METADATA_KEY,
     Message,
@@ -25,6 +25,7 @@ from protocore.contracts.types import (
     StopReason,
     TextBlock,
 )
+from protocore.prompts import bundled_prompt_provider
 from protocore.runtime.events import EventType, TurnEvent
 from protocore.runtime.loop_state import LoopState
 
@@ -249,7 +250,7 @@ async def test_context_window_exceeded_triggers_force_compaction(
     6. Re-open the LLM stream.
     7. Terminate cleanly in COMPLETED.
     """
-    rc = RuntimeConstants(
+    rc = LoopConstants(
         model_context_window=4096,
         compaction_keep_recent_turns=1,
     )
@@ -291,7 +292,7 @@ async def test_context_window_exceeded_triggers_force_compaction(
 async def test_context_window_retry_persists_streamed_partial_attempt(
     engine_factory, in_memory_runtime
 ) -> None:
-    rc = RuntimeConstants(model_context_window=4096, compaction_keep_recent_turns=1)
+    rc = LoopConstants(model_context_window=4096, compaction_keep_recent_turns=1)
     engine = engine_factory(rc=rc)
     llm = _PartialTextThenFailLLM(
         exception=LLMContextWindowExceeded("stream exceeded context"),
@@ -321,7 +322,7 @@ async def test_context_window_retry_persists_streamed_partial_attempt(
 async def test_unclassified_stream_failure_persists_streamed_partial_attempt(
     engine_factory, in_memory_runtime
 ) -> None:
-    engine = engine_factory(rc=RuntimeConstants(model_context_window=4096))
+    engine = engine_factory(rc=LoopConstants(model_context_window=4096))
     llm = _PartialTextThenFailLLM(
         exception=RuntimeError("parser crashed"),
         partial_text="visible before parser failure",
@@ -347,7 +348,7 @@ async def test_unclassified_stream_failure_persists_streamed_partial_attempt(
 async def test_partial_attempt_marker_survives_snapshot_resume(
     engine_factory, in_memory_runtime
 ) -> None:
-    source = engine_factory(rc=RuntimeConstants(model_context_window=4096))
+    source = engine_factory(rc=LoopConstants(model_context_window=4096))
     source.history.append(
         Message(
             role=MessageRole.assistant,
@@ -355,7 +356,7 @@ async def test_partial_attempt_marker_survives_snapshot_resume(
             metadata={PARTIAL_ASSISTANT_ATTEMPT_METADATA_KEY: True},
         )
     )
-    resumed = engine_factory(rc=RuntimeConstants(model_context_window=4096))
+    resumed = engine_factory(rc=LoopConstants(model_context_window=4096))
 
     await resumed.resume_from_snapshot(source.snapshot())
 
@@ -373,7 +374,7 @@ async def test_context_window_exceeded_second_failure_is_terminal(
     The recovery budget is one attempt; a second PTL in the same
     message drives terminal FAILED.
     """
-    rc = RuntimeConstants(model_context_window=4096, compaction_keep_recent_turns=1)
+    rc = LoopConstants(model_context_window=4096, compaction_keep_recent_turns=1)
     engine = engine_factory(rc=rc)
     failing_llm = _ScriptedFailureLLM(
         exceptions=[
@@ -416,7 +417,7 @@ async def test_force_compaction_runs_both_tiers_unconditionally(
     from protocore.runtime.context.compaction import CompactionState
     from protocore.runtime.context.manager import ContextManager
 
-    rc = RuntimeConstants(
+    rc = LoopConstants(
         model_context_window=128,
         compaction_keep_recent_turns=1,
     )
@@ -464,7 +465,7 @@ async def test_force_compaction_exhaustion_raises(
     )
     from protocore.runtime.context.manager import ContextManager
 
-    rc = RuntimeConstants(
+    rc = LoopConstants(
         model_context_window=128,
         compaction_keep_recent_turns=1,
         compaction_failed_max_retries=1,
@@ -608,7 +609,7 @@ async def test_provider_error_with_chain_swaps_provider(
     engine_factory, in_memory_runtime
 ) -> None:
     """A 5xx with a rung left → step down + re-stream."""
-    rc = RuntimeConstants(model_context_window=4096)
+    rc = LoopConstants(model_context_window=4096)
     engine = engine_factory(rc=rc)
     failing_llm = _ScriptedFailureLLM(
         exceptions=[_classified(LLMProviderError("primary 5xx"), "server_error")],
@@ -643,7 +644,7 @@ async def test_provider_error_without_fallback_is_terminal(
     deliver an answer, which is a different behaviour with its own coverage.
     This pins the terminal a deployment gets with the wind-down disabled.
     """
-    rc = RuntimeConstants(model_context_window=4096, soft_stop_enabled=False)
+    rc = LoopConstants(model_context_window=4096, soft_stop_enabled=False)
     engine = engine_factory(rc=rc)
     failing_llm = _ScriptedFailureLLM(
         exceptions=[LLMProviderError("provider down")],
@@ -666,7 +667,7 @@ async def test_last_rung_failure_is_terminal(
 
     Wind-down off so the call count measures the chain, not the wind-down.
     """
-    rc = RuntimeConstants(model_context_window=4096, soft_stop_enabled=False)
+    rc = LoopConstants(model_context_window=4096, soft_stop_enabled=False)
     engine = engine_factory(rc=rc)
     failing_llm = _ScriptedFailureLLM(
         exceptions=[
@@ -699,7 +700,7 @@ async def test_chain_step_persists_partial_text_to_history(
     divergent live-vs-snapshot, with the first attempt's text
     silently dropped from durable state.
     """
-    rc = RuntimeConstants(model_context_window=4096)
+    rc = LoopConstants(model_context_window=4096)
     engine = engine_factory(rc=rc)
     llm = _PartialTextThenFailLLM(
         exception=_classified(LLMProviderError("primary 5xx"), "server_error"),
@@ -742,7 +743,7 @@ async def test_provider_error_backstop_persists_partial_text_to_history(
     into a history carrying no record of what the user had already been shown —
     so the live view and a reload disagree about the same turn.
     """
-    rc = RuntimeConstants(
+    rc = LoopConstants(
         model_context_window=4096,
         terminal_tool_nudge_enabled=True,
     )
@@ -790,7 +791,7 @@ async def test_stream_idle_backstop_persists_partial_text_to_history(
 
     Mirrors the provider-error backstop test for the watchdog exit path.
     """
-    rc = RuntimeConstants(
+    rc = LoopConstants(
         model_context_window=4096,
         # See :func:`_terminal_tool_nudge_required` — the backstop rides
         # on the universal terminal-tool nudge gate. Without this the
@@ -825,7 +826,7 @@ async def test_max_output_recovery_succeeds_within_budget(
     engine_factory, in_memory_runtime
 ) -> None:
     """``finish_reason='length'`` once → recovery prompt + re-stream → success."""
-    rc = RuntimeConstants(model_context_window=4096, max_output_recovery_rounds=3)
+    rc = LoopConstants(model_context_window=4096, max_output_recovery_rounds=3)
     engine = engine_factory(rc=rc)
     llm = _LengthFinishLLM(length_rounds=1, partial_text="abc", final_text="xyz")
     engine.llm = llm  # type: ignore[assignment]
@@ -867,7 +868,7 @@ async def test_max_output_recovery_exhaustion_is_terminal(
 
     Wind-down off so the call count measures the recovery budget alone.
     """
-    rc = RuntimeConstants(
+    rc = LoopConstants(
         model_context_window=4096,
         max_output_recovery_rounds=2,
         soft_stop_enabled=False,
@@ -904,7 +905,7 @@ async def test_max_output_recovery_zero_disables_recovery(
 
     Wind-down off — "immediately" is the property under test.
     """
-    rc = RuntimeConstants(
+    rc = LoopConstants(
         model_context_window=4096,
         max_output_recovery_rounds=0,
         soft_stop_enabled=False,
@@ -938,7 +939,7 @@ async def test_max_output_recovery_zero_disables_recovery(
 
 def test_new_rc_fields_have_correct_defaults_recovery() -> None:
     """Recovery RC fields default to spec-mandated values."""
-    rc = RuntimeConstants()
+    rc = LoopConstants()
     assert rc.max_output_recovery_rounds == 3
     assert rc.llm_provider_chain_max_advances == 2
 
@@ -1131,7 +1132,7 @@ async def test_stream_idle_drives_terminal_via_engine(
     engine_factory, in_memory_runtime
 ) -> None:
     """Engine path: hung LLM → ``LLMStreamIdleError`` → FAILED."""
-    rc = RuntimeConstants(
+    rc = LoopConstants(
         model_context_window=4096,
         llm_stream_idle_timeout_seconds=0.2,
         llm_stream_stall_threshold_seconds=0.05,
@@ -1153,12 +1154,12 @@ async def test_stream_idle_drives_terminal_via_engine(
 def test_stall_threshold_must_be_below_idle_timeout() -> None:
     """RC validator rejects stall_threshold >= idle_timeout."""
     with pytest.raises(ValueError):
-        RuntimeConstants(
+        LoopConstants(
             llm_stream_idle_timeout_seconds=30.0,
             llm_stream_stall_threshold_seconds=30.0,
         )
     with pytest.raises(ValueError):
-        RuntimeConstants(
+        LoopConstants(
             llm_stream_idle_timeout_seconds=30.0,
             llm_stream_stall_threshold_seconds=60.0,
         )
@@ -1166,7 +1167,7 @@ def test_stall_threshold_must_be_below_idle_timeout() -> None:
 
 def test_new_rc_fields_have_correct_defaults() -> None:
     """The idle/stall RC fields default to spec-mandated values."""
-    rc = RuntimeConstants()
+    rc = LoopConstants()
     assert rc.llm_stream_idle_timeout_seconds == 90.0
     assert rc.llm_stream_stall_threshold_seconds == 5.0
 
@@ -1178,14 +1179,14 @@ def test_new_rc_fields_have_correct_defaults() -> None:
 
 def test_reasoning_idle_timeout_default_is_300s() -> None:
     """Default extended budget is 5 minutes."""
-    rc = RuntimeConstants()
+    rc = LoopConstants()
     assert rc.llm_stream_reasoning_idle_timeout_seconds == 300.0
 
 
 def test_reasoning_idle_timeout_must_be_ge_idle_timeout() -> None:
     """RC validator rejects reasoning_idle_timeout < idle_timeout."""
     with pytest.raises(ValueError):
-        RuntimeConstants(
+        LoopConstants(
             llm_stream_idle_timeout_seconds=60.0,
             llm_stream_stall_threshold_seconds=10.0,
             llm_stream_reasoning_idle_timeout_seconds=30.0,
@@ -1297,7 +1298,7 @@ async def test_death_spiral_guard_set_on_provider_error(
     Wind-down off so the failure IS terminal: with it on the run gets a narrowed
     turn to still answer, and a run that answers never reaches the guard.
     """
-    rc = RuntimeConstants(model_context_window=4096, soft_stop_enabled=False)
+    rc = LoopConstants(model_context_window=4096, soft_stop_enabled=False)
     engine = engine_factory(rc=rc)
     engine.llm = _ScriptedFailureLLM(  # type: ignore[assignment]
         exceptions=[LLMProviderError("burst error")],
@@ -1316,7 +1317,7 @@ async def test_death_spiral_guard_set_on_stream_idle(
     engine_factory, in_memory_runtime
 ) -> None:
     """Terminal :class:`LLMStreamIdleError` MUST set ``engine.skip_terminal_hooks``."""
-    rc = RuntimeConstants(
+    rc = LoopConstants(
         model_context_window=4096,
         llm_stream_idle_timeout_seconds=0.2,
         llm_stream_stall_threshold_seconds=0.05,
@@ -1337,7 +1338,7 @@ async def test_death_spiral_guard_set_on_max_output_exhaustion(
     engine_factory, in_memory_runtime
 ) -> None:
     """``output_length_exhausted`` terminal path MUST set the guard."""
-    rc = RuntimeConstants(
+    rc = LoopConstants(
         model_context_window=4096,
         max_output_recovery_rounds=0,
     )
@@ -1359,7 +1360,7 @@ async def test_death_spiral_guard_set_on_post_retry_ptl(
     engine_factory, in_memory_runtime
 ) -> None:
     """``LLMContextWindowExceeded`` after the recovery retry MUST set the guard."""
-    rc = RuntimeConstants(model_context_window=4096, compaction_keep_recent_turns=1)
+    rc = LoopConstants(model_context_window=4096, compaction_keep_recent_turns=1)
     engine = engine_factory(rc=rc)
     failing_llm = _ScriptedFailureLLM(
         exceptions=[
@@ -1388,7 +1389,7 @@ async def test_death_spiral_guard_disabled_via_rc(
     Diagnostic mode — Stop / SessionEnd hooks SHOULD see the failure
     (e.g. error-classifier hooks).
     """
-    rc = RuntimeConstants(
+    rc = LoopConstants(
         model_context_window=4096,
         skip_terminal_hooks_on_llm_error=False,
         soft_stop_enabled=False,
@@ -1414,7 +1415,7 @@ def test_fresh_engine_skip_terminal_hooks_is_false(engine_factory) -> None:
 
 def test_new_rc_field_skip_terminal_hooks_default_true() -> None:
     """``rc.skip_terminal_hooks_on_llm_error`` defaults to ``True``."""
-    rc = RuntimeConstants()
+    rc = LoopConstants()
     assert rc.skip_terminal_hooks_on_llm_error is True
 
 
@@ -1501,7 +1502,7 @@ async def test_continue_prompt_recovers_from_thinking_only_response(
     engine_factory, in_memory_runtime
 ) -> None:
     """2 empty + 1 healthy → recovery converges, run COMPLETED."""
-    rc = RuntimeConstants(
+    rc = LoopConstants(
         model_context_window=4_096,
         max_consecutive_empty_responses=3,
     )
@@ -1555,7 +1556,7 @@ async def test_continue_prompt_budget_exhaustion_terminal(
     ``thinking_eats_all_tokens`` kind.
     """
     # Wind-down off so the attempt count measures the empty-response budget.
-    rc = RuntimeConstants(
+    rc = LoopConstants(
         model_context_window=4_096,
         max_consecutive_empty_responses=3,
         soft_stop_enabled=False,
@@ -1592,7 +1593,7 @@ async def test_continue_prompt_disabled_when_budget_zero(
     Backwards-compatible escape hatch — a tenant that prefers the v1
     behaviour (empty response = end_turn) can flip the RC to 0.
     """
-    rc = RuntimeConstants(
+    rc = LoopConstants(
         model_context_window=4_096,
         max_consecutive_empty_responses=0,
     )
@@ -1619,13 +1620,13 @@ async def test_continue_prompt_disabled_when_budget_zero(
 
 def test_new_rc_field_max_consecutive_empty_responses_default() -> None:
     """``rc.max_consecutive_empty_responses`` defaults to 3."""
-    rc = RuntimeConstants()
+    rc = LoopConstants()
     assert rc.max_consecutive_empty_responses == 3
 
 
 def test_new_rc_field_continue_prompt_text_default() -> None:
     """``rc.continue_prompt_text`` defaults to a non-empty string."""
-    rc = RuntimeConstants()
+    rc = LoopConstants()
     assert rc.continue_prompt_text
     # Generic English nudge — multilingual deployments override.
     assert "continue" in rc.continue_prompt_text.lower()
@@ -1761,7 +1762,7 @@ async def test_finish_reason_length_text_only_uses_existing_recovery(
     call carries ``truncated_by_output_cap=True``; pure text truncation has
     none, so the older ``max_output_token_recovery`` reason is emitted.
     """
-    rc = RuntimeConstants(model_context_window=4096, max_output_recovery_rounds=3)
+    rc = LoopConstants(model_context_window=4096, max_output_recovery_rounds=3)
     engine = engine_factory(rc=rc)
     engine.llm = _LengthFinishLLM(  # type: ignore[assignment]
         length_rounds=1, partial_text="abc", final_text="xyz"
@@ -1803,7 +1804,7 @@ async def test_finish_reason_length_mid_tool_call_sets_truncated_flag(
     threaded all the way from the SSE parser delta to the :class:`ToolCall`
     that the loop reasons over.
     """
-    rc = RuntimeConstants(model_context_window=4096, max_output_recovery_rounds=3)
+    rc = LoopConstants(model_context_window=4096, max_output_recovery_rounds=3)
     engine = engine_factory(rc=rc)
     llm = _MidToolCallTruncatedLLM(truncated_rounds=1)
     engine.llm = llm  # type: ignore[assignment]
@@ -1840,7 +1841,7 @@ async def test_query_recovers_truncated_tool_call_via_resume_nudge(
  the convergence driver is DISABLED here (salvage is part of the driver); the
  NEW salvage behaviour is covered in test_longfile_convergence_loop.py.
  """
-    rc = RuntimeConstants(
+    rc = LoopConstants(
         model_context_window=4096,
         max_output_recovery_rounds=3,
         longfile_convergence_enabled=False,
@@ -1887,7 +1888,7 @@ async def test_resume_nudge_appends_partial_assistant_message_to_history(
     truncated Write carries a partial ``content`` body that the salvage path would
     otherwise dispatch to disk instead of re-prompting.
     """
-    rc = RuntimeConstants(
+    rc = LoopConstants(
         model_context_window=4096,
         max_output_recovery_rounds=3,
         longfile_convergence_enabled=False,
@@ -1941,7 +1942,7 @@ async def test_max_output_recovery_rounds_cap_enforced(
     after exactly 2 recovery rounds (3 LLM calls total).
     """
     # Wind-down off so the call count measures the recovery budget alone.
-    rc = RuntimeConstants(
+    rc = LoopConstants(
         model_context_window=4096,
         max_output_recovery_rounds=2,
         soft_stop_enabled=False,
@@ -1988,7 +1989,7 @@ async def test_telemetry_counter_increments_on_recovery(
     consecutive truncations should produce two events with rounds 1
     and 2 respectively.
     """
-    rc = RuntimeConstants(model_context_window=4096, max_output_recovery_rounds=3)
+    rc = LoopConstants(model_context_window=4096, max_output_recovery_rounds=3)
     engine = engine_factory(rc=rc)
     llm = _MidToolCallTruncatedLLM(truncated_rounds=2)
     engine.llm = llm  # type: ignore[assignment]
@@ -2017,18 +2018,20 @@ def test_tool_call_truncated_by_output_cap_field_default_false() -> None:
     assert tc.truncated_by_output_cap is False
 
 
-def test_rc_tool_call_truncation_resume_prompt_default_has_placeholder() -> None:
-    """Slice C — default template references the ``{tool_name}`` placeholder.
+def test_the_generic_resume_template_names_the_truncated_tool() -> None:
+    """The resume text is rendered with the name of the call that was cut.
 
-    The recovery branch formats this template via ``.format(tool_name=...)``
-    so the placeholder presence is part of the public RC contract. The
-    default also mentions the cap + COMPLETE-arguments instruction so
-    multilingual deployments overriding it have a reference point.
+    A template that ignored ``tool_name`` would tell the model to re-issue
+    something it cannot identify, so the rendered text has to carry the name.
+    The wording also states the cap and asks for COMPLETE arguments, which is
+    the reference an operator overriding the template writes against.
     """
-    rc = RuntimeConstants()
-    assert "{tool_name}" in rc.tool_call_truncation_resume_prompt
-    assert "COMPLETE" in rc.tool_call_truncation_resume_prompt
-    assert "truncated" in rc.tool_call_truncation_resume_prompt.lower()
+    rendered = bundled_prompt_provider().render(
+        "tool_call_truncation_resume", {"tool_name": "Write"}
+    )
+    assert "Write" in rendered
+    assert "COMPLETE" in rendered
+    assert "truncated" in rendered.lower()
 
 
 def test_rc_max_output_recovery_rounds_doc_mentions_shared_budget() -> None:
@@ -2039,7 +2042,7 @@ def test_rc_max_output_recovery_rounds_doc_mentions_shared_budget() -> None:
     The RC field description must document this so tenants who tune
     it understand they are budgeting BOTH recovery paths together.
     """
-    field_info = RuntimeConstants.model_fields["max_output_recovery_rounds"]
+    field_info = LoopConstants.model_fields["max_output_recovery_rounds"]
     description = field_info.description or ""
     assert "shared" in description.lower() or "share" in description.lower()
 
@@ -2248,7 +2251,7 @@ async def test_truncated_tool_call_surfaces_error(
     ``ToolResultBlock(is_error=True)`` to history so the agent reads
     the recovery instructions on the next turn.
     """
-    rc = RuntimeConstants(model_context_window=4096)
+    rc = LoopConstants(model_context_window=4096)
     engine = engine_factory(rc=rc)
     llm = _TruncatedToolCallStopLLM(truncated_rounds=1)
     engine.llm = llm  # type: ignore[assignment]
@@ -2313,7 +2316,7 @@ async def test_complete_tool_call_does_not_trigger_truncation_error(
     dispatcher. The synthetic ``tool_call_truncated`` envelope must
     not appear.
     """
-    rc = RuntimeConstants(model_context_window=4096)
+    rc = LoopConstants(model_context_window=4096)
     engine = engine_factory(rc=rc)
     llm = _CleanCompleteToolCallLLM()
     engine.llm = llm  # type: ignore[assignment]
@@ -2376,7 +2379,7 @@ def test_rc_tool_call_max_input_chunk_bytes_default_1024() -> None:
  1024 chars mirrors ~20 lines of typical code or markdown and almost
  always fits in one tool call without re-truncating for typical models.
  """
-    rc = RuntimeConstants()
+    rc = LoopConstants()
     assert rc.tool_call_max_input_chunk_bytes == 1024
 
 
@@ -2398,32 +2401,35 @@ def test_rc_tool_call_max_truncation_recoveries_per_message_default_4() -> None:
  The budget of 4 gives the model headroom to split a ~3-chunk write after
  the first two re-emit attempts trigger the more-directive recovery message.
  """
-    rc = RuntimeConstants()
+    rc = LoopConstants()
     assert rc.tool_call_max_truncation_recoveries_per_message == 4
 
 
-def test_rc_tool_call_truncation_recovery_messages_include_placeholders() -> None:
-    """Contract: both halves of the bilingual recovery template carry
- all five required placeholders.
+def test_both_recovery_halves_spend_every_variable_they_are_given() -> None:
+    """Both halves of the bilingual recovery message use all five variables.
 
- The loop formats both messages with the same placeholders and
- concatenates EN + RU per the multilingual rule.
- A template missing one placeholder would silently emit a literal
- ``{partial_length}`` token in production. The required placeholders:
- ``{tool_name}`` (directive "do not retry the same X" framing),
- ``{chunk_bytes_lines}`` (line-count proxy), and
- ``{chunk_count_estimate}`` (concrete chunk ceiling for a 10 KB target).
- """
-    rc = RuntimeConstants()
-    for half in (
-        rc.tool_call_truncation_recovery_message_en,
-        rc.tool_call_truncation_recovery_message_ru,
+    The loop renders the two halves with the same context and concatenates
+    them EN + RU per the multilingual rule. A half that dropped one of the
+    numbers would leave the model without the measurement it needs to size
+    the next chunk — and, unlike a missing variable, an unused one is silent.
+    So each is given a value that cannot occur by accident and looked for in
+    the output.
+    """
+    context = {
+        "tool_name": "Writeable",
+        "partial_length": 4242,
+        "chunk_bytes": 5353,
+        "chunk_bytes_lines": 6464,
+        "chunk_count_estimate": 7575,
+    }
+    prompts = bundled_prompt_provider()
+    for name in (
+        "tool_call_truncation_recovery_en",
+        "tool_call_truncation_recovery_ru",
     ):
-        assert "{tool_name}" in half
-        assert "{partial_length}" in half
-        assert "{chunk_bytes}" in half
-        assert "{chunk_bytes_lines}" in half
-        assert "{chunk_count_estimate}" in half
+        rendered = prompts.render(name, dict(context))
+        for value in context.values():
+            assert str(value) in rendered, f"{name} never spends {value}"
 
 
 def test_new_engine_has_tool_call_truncated_recovery_count_at_zero(
@@ -2492,7 +2498,7 @@ async def test_truncated_tool_call_recovery_message_is_bilingual(
     that teaches it the chunked-write pattern; emitting only one language
     would leave half the production traffic without recovery guidance.
     """
-    rc = RuntimeConstants(model_context_window=4096)
+    rc = LoopConstants(model_context_window=4096)
     engine = engine_factory(rc=rc)
     llm = _TruncatedToolCallStopLLM(truncated_rounds=1)
     engine.llm = llm  # type: ignore[assignment]
@@ -2548,7 +2554,7 @@ async def test_recovery_message_includes_chunk_lines_and_count_estimate(
     synthetic TOOL_RESULT body — otherwise the format() call dropped
     the placeholders silently and the model sees only abstract guidance.
     """
-    rc = RuntimeConstants(model_context_window=4096)
+    rc = LoopConstants(model_context_window=4096)
     engine = engine_factory(rc=rc)
     llm = _TruncatedToolCallStopLLM(truncated_rounds=1)
     engine.llm = llm  # type: ignore[assignment]
@@ -2605,7 +2611,7 @@ async def test_recovery_message_chunk_lines_and_count_scale_with_rc_override(
     With ``chunk_bytes=2048``: lines=40 (``2048 // 50``),
     chunks=6 (``10240 // 2048 + 1``).
     """
-    rc = RuntimeConstants(
+    rc = LoopConstants(
         model_context_window=4096,
         tool_call_max_input_chunk_bytes=2048,
     )
@@ -2641,7 +2647,7 @@ async def test_truncated_tool_call_budget_exhaustion_terminates(
     ``tool_call_max_truncation_recoveries_per_message`` (default 2)
     and surfaces a terminal LLM error so the run fails fast.
     """
-    rc = RuntimeConstants(
+    rc = LoopConstants(
         model_context_window=4096,
         # Allow plenty of headroom on the outer cap so the budget guard
         # is what stops the run, not ``max_turns_per_run``.
@@ -2789,7 +2795,7 @@ async def test_truncated_tool_call_mixed_batch_dispatches_both(
     4. The run completes normally — both tool_results land in history
        and the recovery round consumes the second LLM call.
     """
-    rc = RuntimeConstants(model_context_window=4096)
+    rc = LoopConstants(model_context_window=4096)
     engine = engine_factory(rc=rc)
     llm = _MixedBatchTruncatedAndCleanLLM()
     engine.llm = llm  # type: ignore[assignment]

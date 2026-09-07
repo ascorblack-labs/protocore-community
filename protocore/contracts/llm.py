@@ -76,8 +76,14 @@ class LLMStreamIdleError(LLMError):
 
     Raised by the watchdog wrapping :meth:`ILLMProvider.stream_with_tools`
     when no provider event arrived within
-    :attr:`RuntimeConstants.llm_stream_idle_timeout_seconds`. Drives
-    terminal FAILED via the same path as :class:`LLMProviderError`.
+    :attr:`LoopConstants.llm_stream_idle_timeout_seconds`.
+
+    A stream that stops speaking is a statement about the endpoint, not about
+    the request, so it is answered first by the provider chain: the run moves
+    to the next configured provider carrying the partial text it had already
+    streamed. Only when there is no further provider to move to does it wind
+    the run down, and drive terminal FAILED, via the same path as
+    :class:`LLMProviderError`.
     """
 
 
@@ -85,7 +91,7 @@ class MaxOutputTokensExhausted(LLMError):
     """Max-output-token recovery loop exhausted ``max_output_recovery_rounds``.
 
     Raised after the loop synthesised a "Resume directly" continuation
-    nudge :attr:`RuntimeConstants.max_output_recovery_rounds` times and
+    nudge :attr:`LoopConstants.max_output_recovery_rounds` times and
     the model still terminated with ``finish_reason="length"``. Drives
     terminal FAILED with ``reason="output_length_exhausted"``.
     """

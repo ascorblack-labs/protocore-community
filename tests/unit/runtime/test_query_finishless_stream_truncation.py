@@ -38,7 +38,7 @@ from protocore.contracts.llm import (
     ProviderDelta,
     ProviderDeltaKind,
 )
-from protocore.contracts.runtime_constants import RuntimeConstants
+from protocore.contracts.runtime_constants import LoopConstants
 from protocore.contracts.types import (
     Message,
     MessageRole,
@@ -93,7 +93,7 @@ async def test_finishless_stream_leaves_finish_reason_none(engine_factory) -> No
     """A text stream that ends with NO ``finish`` delta (clean EOF / ``[DONE]``)
     leaves ``finish_reason is None`` — the signal the caller must treat as a
     truncated, incomplete turn (not a normal completion)."""
-    engine = engine_factory(rc=RuntimeConstants(model_context_window=4_096))
+    engine = engine_factory(rc=LoopConstants(model_context_window=4_096))
     engine.history.append(_user_message("write a long answer"))
     deltas = [
         ProviderDelta(kind=ProviderDeltaKind.text, content="The answer begins "),
@@ -121,7 +121,7 @@ async def test_finishless_stream_closes_open_content_block(engine_factory) -> No
 
     FAILS before the fix: the lone CONTENT_BLOCK_START has no matching STOP.
     """
-    engine = engine_factory(rc=RuntimeConstants(model_context_window=4_096))
+    engine = engine_factory(rc=LoopConstants(model_context_window=4_096))
     engine.history.append(_user_message("hi"))
     deltas = [
         ProviderDelta(kind=ProviderDeltaKind.text, content="partial "),
@@ -149,7 +149,7 @@ async def test_stop_requested_break_closes_open_content_block(
     """The ``stop_requested`` per-delta break is the OTHER finish-less exit; it
     must also close the open block. The interrupt lands after the first text
     delta opened the block."""
-    engine = engine_factory(rc=RuntimeConstants(model_context_window=4_096))
+    engine = engine_factory(rc=LoopConstants(model_context_window=4_096))
     engine.history.append(_user_message("hi"))
 
     def _stream_with_tools(request: object) -> AsyncIterator[ProviderDelta]:
@@ -243,7 +243,7 @@ async def test_finishless_truncated_turn_recovers_instead_of_completing(
     prefix (only one LLM call), because ``finish_reason is None`` fell into the
     no-tool ``end_turn`` branch.
     """
-    rc = RuntimeConstants(model_context_window=4_096, max_output_recovery_rounds=3)
+    rc = LoopConstants(model_context_window=4_096, max_output_recovery_rounds=3)
     llm = _TruncatedThenCompleteLLM(
         prefix="The total is EUR 12",
         full="The total is EUR 1234.56 and the answer is complete.",
@@ -316,7 +316,7 @@ async def test_finishless_truncation_exhausted_goes_terminal_not_complete(
     truncated prefix COMPLETED the run (no recovery, no terminal error).
     """
     # Wind-down off so the call count measures the recovery budget alone.
-    rc = RuntimeConstants(
+    rc = LoopConstants(
         model_context_window=4_096,
         max_output_recovery_rounds=2,
         soft_stop_enabled=False,
@@ -381,7 +381,7 @@ async def test_clean_end_turn_still_completes_unchanged(engine_factory) -> None:
             return max(1, len(text) // 4)
 
     llm = _CleanEndTurnLLM()
-    engine = engine_factory(rc=RuntimeConstants(model_context_window=4_096))
+    engine = engine_factory(rc=LoopConstants(model_context_window=4_096))
     engine.llm = llm  # type: ignore[assignment]
 
     events: list[TurnEvent] = []

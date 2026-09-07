@@ -3,7 +3,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-from protocore.contracts.runtime_constants import RuntimeConstants
+from protocore.contracts.runtime_constants import LoopConstants
 
 MAIN = "main"
 
@@ -46,7 +46,7 @@ def create_lane(
     cursor: int,
     model: str,
     toolset: tuple[str, ...],
-    rc: RuntimeConstants,
+    rc: LoopConstants,
 ) -> list[Lane]:
     refuse_lanes_when_disabled(rc.lanes_enabled)
     current = ensure_main(lanes, model=model, toolset=toolset)

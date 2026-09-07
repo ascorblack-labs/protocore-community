@@ -38,11 +38,11 @@
  (defaulting to None); ``| default(none)`` at the call site keeps the
  pure-core templates renderable when a test omits it.
  finalization_contract_block: str | None — appended verbatim when
- the finalization gate is enabled; built by
- ``protocore.runtime.finalization_contract.build_finalization_contract_block``.
+ the finalization gate is enabled; supplied by the host's context
+ builder.
  workspace_visible_to_user: bool | None — whether the person reading the
  reply can browse the workspace and open the files the agent wrote
- (``RuntimeConstants.workspace_visible_to_user``). Defaults TRUE, which
+ (``LoopConstants.workspace_visible_to_user``). Defaults TRUE, which
  renders byte-identically to the pre-flag template: on a surface with a
  file browser, answering with a path IS an answer, so the file-receipt
  and large-output directives keep their original wording. FALSE is the

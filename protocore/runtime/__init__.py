@@ -5,7 +5,9 @@ wire-format placeholders, chain parser, BM25 tool retrieval.
 
  ships:
  - :class:`~protocore.runtime.query_engine.QueryEngine` per-conversation engine
- - :func:`~protocore.runtime.query.query` per-turn entry, returns an async iterator
+ - :func:`~protocore.runtime.query.resume` pick a stored run back up and drive it
+ - :func:`~protocore.runtime.query.resume_approved_tool` run a call held for approval
+ - :func:`~protocore.runtime.query.resume_interrupts` answer everything a run waits on
  - :class:`~protocore.runtime.context.manager.ContextManager` + two-tier compaction
  - :class:`~protocore.runtime.events.types.EventType` + :class:`~protocore.runtime.events.envelope.TurnEvent`
  - :class:`~protocore.runtime.loop_state.LoopState` state machine
@@ -32,13 +34,13 @@ from protocore.runtime.loop_state import (
     assert_transition,
     is_terminal,
 )
-from protocore.runtime.query import query
+from protocore.runtime.query import resume, resume_approved_tool, resume_interrupts
 from protocore.runtime.query_engine import QueryEngine, QueryEngineConfig
 from protocore.runtime.tool_dispatch import (
     DispatchErrorKind,
     DispatchOutcome,
     ToolDispatcher,
-    consume_sandbox_down_injection_signal,
+    consume_transport_down_injection_signal,
 )
 from protocore.runtime.tool_permission import (
     HttpDnsAllowlistPolicy,
@@ -48,10 +50,6 @@ from protocore.runtime.tool_permission import (
     ToolPermissionGate,
     ToolPermissionOutcome,
     WorkspacePathPolicy,
-)
-from protocore.runtime.tool_pool import (
-    assemble_tool_pool,
-    assemble_tool_pool_from_concrete,
 )
 from protocore.runtime.tool_registry import ToolRegistry
 from protocore.runtime.usage import TokenUsage
@@ -85,11 +83,11 @@ __all__ = [
     "ToolRegistry",
     "TurnEvent",
     "WorkspacePathPolicy",
-    "assemble_tool_pool",
-    "assemble_tool_pool_from_concrete",
     "assert_transition",
-    "consume_sandbox_down_injection_signal",
+    "consume_transport_down_injection_signal",
     "derive_budgets",
     "is_terminal",
-    "query",
+    "resume",
+    "resume_approved_tool",
+    "resume_interrupts",
 ]

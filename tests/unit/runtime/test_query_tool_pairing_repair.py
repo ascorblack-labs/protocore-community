@@ -21,7 +21,7 @@ from typing import Any
 
 import pytest
 
-from protocore.contracts.runtime_constants import RuntimeConstants
+from protocore.contracts.runtime_constants import LoopConstants
 from protocore.contracts.tools import Tool
 from protocore.contracts.types import (
     COMPACTION_SUMMARY_METADATA_KEY,
@@ -32,6 +32,7 @@ from protocore.contracts.types import (
     ToolResultBlock,
     ToolUseBlock,
 )
+from protocore.prompts import bundled_prompt_provider
 from protocore.runtime.events import EventType, TurnEvent
 from protocore.runtime.loop_state import LoopState
 from protocore.runtime.query import (
@@ -1291,7 +1292,7 @@ async def test_compaction_exhausted_teardown_pairs_dangling_tool_use(
     from protocore.runtime.context.compaction import CompactionExhaustedError
 
     # Force compaction to trigger then fail.
-    engine = engine_factory(rc=RuntimeConstants(model_context_window=64))
+    engine = engine_factory(rc=LoopConstants(model_context_window=64))
     engine.history.append(
         Message(
             role=MessageRole.assistant,
@@ -1320,16 +1321,14 @@ async def test_compaction_exhausted_teardown_pairs_dangling_tool_use(
 
 
 # ---------------------------------------------------------------------------
-# RC plumbing — placeholders are configurable (no inline magic strings)
+# Plumbing — the placeholders are templates, not inline magic strings
 # ---------------------------------------------------------------------------
 
 
-def test_rc_pairing_placeholder_fields_exist() -> None:
-    rc = RuntimeConstants()
-    assert isinstance(rc.tool_result_pairing_repair_placeholder, str)
-    assert rc.tool_result_pairing_repair_placeholder.strip()
-    assert isinstance(rc.tool_result_interrupted_placeholder, str)
-    assert rc.tool_result_interrupted_placeholder.strip()
+def test_the_pairing_placeholders_render_from_templates() -> None:
+    prompts = bundled_prompt_provider()
+    assert prompts.render("tool_result_pairing_repair").strip()
+    assert prompts.render("tool_result_interrupted").strip()
 
 
 # ---------------------------------------------------------------------------

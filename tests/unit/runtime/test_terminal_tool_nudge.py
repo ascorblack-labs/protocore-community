@@ -8,7 +8,8 @@ negative cases (kill-switch off, no tool configured).
 """
 from __future__ import annotations
 
-from protocore.contracts.runtime_constants import RuntimeConstants
+from protocore.contracts.prompts import IPromptTemplateProvider
+from protocore.contracts.runtime_constants import LoopConstants
 from protocore.contracts.tools import Tool
 from protocore.contracts.types import (
     SYNTHETIC_RECOVERY_METADATA_KEY,
@@ -21,6 +22,7 @@ from protocore.contracts.types import (
     ToolResultBlock,
     ToolUseBlock,
 )
+from protocore.prompts import JinjaPromptTemplateProvider, bundled_prompt_provider
 from protocore.runtime.query import (
     _append_terminal_tool_nudge,
     _history_has_file_write_result,
@@ -42,21 +44,25 @@ from protocore.tests_support.adapters import (
     InMemorySkillStore,
     InMemoryToolRegistry,
 )
+from tests._fixtures.tool_roles import CONVENTIONAL_TOOL_ROLES
 
 
 def _build_engine(
     *,
-    rc: RuntimeConstants,
+    rc: LoopConstants,
     expected_terminal_tool: str | None = None,
+    prompt_provider: IPromptTemplateProvider | None = None,
 ) -> QueryEngine:
     return QueryEngine(
         config=QueryEngineConfig(
+            tool_roles=CONVENTIONAL_TOOL_ROLES,
             run_id="run-test",
             tenant_id="tenant-test",
             session_id="sess-test",
             model_name="qwen3.6-35b-a3b",
             rc=rc,
             expected_terminal_tool=expected_terminal_tool,
+            prompt_provider=prompt_provider,
         ),
         llm_provider=InMemoryLLMProvider(),
         tool_registry=InMemoryToolRegistry(),
@@ -111,7 +117,7 @@ def test_terminal_tool_nudge_fires_for_configured_tool() -> None:
     """Universal path — a tenant declaring a terminal tool and flipping
     ``terminal_tool_nudge_enabled`` MUST trigger the nudge predicate when
     the run is about to finish without that tool's result."""
-    rc = RuntimeConstants(
+    rc = LoopConstants(
         model_context_window=4_096,
         terminal_tool_nudge_enabled=True,
     )
@@ -121,7 +127,7 @@ def test_terminal_tool_nudge_fires_for_configured_tool() -> None:
 
 
 def test_terminal_tool_nudge_message_is_marked_synthetic() -> None:
-    rc = RuntimeConstants(
+    rc = LoopConstants(
         model_context_window=4_096,
         terminal_tool_nudge_enabled=True,
     )
@@ -138,7 +144,7 @@ def test_terminal_tool_nudge_message_is_marked_synthetic() -> None:
 def test_terminal_tool_nudge_skipped_when_disabled() -> None:
     """RC kill-switch ``terminal_tool_nudge_enabled=False`` blocks the
     nudge even when ``expected_terminal_tool`` is configured."""
-    rc = RuntimeConstants(
+    rc = LoopConstants(
         model_context_window=4_096,
         terminal_tool_nudge_enabled=False,
     )
@@ -149,7 +155,7 @@ def test_terminal_tool_nudge_skipped_when_disabled() -> None:
 def test_terminal_tool_nudge_skipped_when_no_tool_configured() -> None:
     """Default tenant (no ``expected_terminal_tool``) MUST NOT trigger the
     nudge — universal-core philosophy: opt-in only."""
-    rc = RuntimeConstants(model_context_window=4_096)
+    rc = LoopConstants(model_context_window=4_096)
     engine = _build_engine(rc=rc, expected_terminal_tool=None)
     assert _terminal_tool_nudge_required(engine) is False
     assert _resolved_terminal_tool_name(engine) is None
@@ -160,7 +166,7 @@ def test_history_has_terminal_tool_result_per_tool_name() -> None:
     a foreign tool's terminal-metadata-flagged result. A matching tool
     name satisfies the check."""
 
-    rc = RuntimeConstants(
+    rc = LoopConstants(
         model_context_window=4_096,
         terminal_tool_nudge_enabled=True,
     )
@@ -189,31 +195,48 @@ def test_history_has_terminal_tool_result_per_tool_name() -> None:
 # ---------------------------------------------------------------------------
 
 
-def test_terminal_tool_nudge_text_universal_wins() -> None:
-    """Operator-supplied universal text takes precedence over the templated
-    fallback. ``terminal_tool_nudge_write_first_enabled=False`` isolates the
-    universal-text precedence from the write-first prefix (default on),
-    which would otherwise prepend the deliverable-write instruction."""
+def test_a_host_provider_replaces_the_bundled_nudge_wording(tmp_path) -> None:
+    """The wording an operator supplies is a template, and it wins.
 
-    rc = RuntimeConstants(
+    This is the whole reason the nudge stopped being a configuration string:
+    a host that wants different wording — or the same wording in a third
+    language — overrides the template, and the loop renders whatever the
+    provider hands back. ``terminal_tool_nudge_write_first_enabled=False``
+    isolates the body from the write-first prefix (default on), which would
+    otherwise be prepended to it.
+    """
+
+    (tmp_path / "terminal_tool_nudge.j2").write_text(
+        "Call {{ terminal_tool }} now.", encoding="utf-8"
+    )
+    provider = JinjaPromptTemplateProvider(
+        template_dir=tmp_path,
+        registry={"terminal_tool_nudge": "terminal_tool_nudge.j2"},
+    )
+    rc = LoopConstants(
         model_context_window=4_096,
         terminal_tool_nudge_enabled=True,
-        terminal_tool_nudge_text="Call final_answer now.",
         terminal_tool_nudge_write_first_enabled=False,
     )
-    engine = _build_engine(rc=rc, expected_terminal_tool="final_answer")
+    engine = _build_engine(
+        rc=rc, expected_terminal_tool="final_answer", prompt_provider=provider
+    )
     assert _resolved_terminal_tool_nudge_text(engine) == "Call final_answer now."
 
 
-def test_terminal_tool_nudge_text_generic_fallback() -> None:
-    """Tenant flips ``terminal_tool_nudge_enabled`` but leaves the text
-    empty — the templated message keys on the declared tool name."""
+def test_the_bundled_nudge_keys_on_the_declared_tool_name() -> None:
+    """A host that configures no provider still gets a usable nudge.
 
-    rc = RuntimeConstants(
+    The bundled template names the tool the run is expected to finish with,
+    so flipping ``terminal_tool_nudge_enabled`` is enough on its own.
+    """
+
+    rc = LoopConstants(
         model_context_window=4_096,
         terminal_tool_nudge_enabled=True,
     )
     engine = _build_engine(rc=rc, expected_terminal_tool="final_answer")
+    assert engine.prompt_provider is bundled_prompt_provider()
     text = _resolved_terminal_tool_nudge_text(engine)
     assert "final_answer" in text
 
@@ -264,7 +287,7 @@ def test_history_has_file_write_result_detects_write_and_appendfile() -> None:
     and recognises a successful write result; an errored write does not
     count."""
 
-    rc = RuntimeConstants(model_context_window=4_096)
+    rc = LoopConstants(model_context_window=4_096)
 
     engine_none = _build_engine(rc=rc, expected_terminal_tool="Finalize")
     assert _history_has_file_write_result(engine_none) is False
@@ -288,7 +311,7 @@ def test_no_tool_end_on_file_deliverable_triggers_forced_write_nudge() -> None:
     is steered to the ACTUAL deliverable write tool, not just the terminal
     tool. Default RC arms this (write_first_enabled defaults True)."""
 
-    rc = RuntimeConstants(
+    rc = LoopConstants(
         model_context_window=4_096,
         terminal_tool_nudge_enabled=True,
     )
@@ -299,18 +322,18 @@ def test_no_tool_end_on_file_deliverable_triggers_forced_write_nudge() -> None:
     # the terminal tool.
     assert "Write" in text
     assert "AppendFile" in text
-    assert rc.terminal_tool_nudge_write_first_text.split("\n")[0] in text
+    assert engine.prompt_text("terminal_tool_nudge_write_first") in text
 
 
 def test_write_first_prefix_text_is_conditional_not_false_premise() -> None:
-    """Review the write-first prefix fires on ANY no-tool end with no
+    """The write-first prefix fires on ANY no-tool end with no
     file in history (incl. Q&A/coding runs under the now-default Finalize
     contract). Its text MUST therefore be CONDITIONAL ('if the task asked … then
     finish with the terminal tool'), never a declarative false premise ('you
     declared work that produces a file'), which would (a) be factually wrong on
     a Q&A run and (b) contradict the terminal-tool nudge body. Bilingual."""
 
-    default_text = RuntimeConstants().terminal_tool_nudge_write_first_text
+    default_text = bundled_prompt_provider().render("terminal_tool_nudge_write_first")
     lowered = default_text.lower()
     # Conditional framing present (EN + RU).
     assert "if the task asked" in lowered
@@ -331,7 +354,7 @@ def test_full_resolved_nudge_is_internal_control_framed_no_echo_wording() -> Non
     must open with the ``[internal control — …]`` marker (EN+RU), and the old
     user-facing imperatives the model used to echo MUST be gone."""
 
-    rc = RuntimeConstants(
+    rc = LoopConstants(
         model_context_window=4_096,
         terminal_tool_nudge_enabled=True,
     )
@@ -368,7 +391,7 @@ def test_write_first_prefix_suppressed_once_file_written() -> None:
     """A run that already wrote its deliverable does NOT get the write-first
     prefix — strong-model no-op path (the plain terminal nudge stands)."""
 
-    rc = RuntimeConstants(
+    rc = LoopConstants(
         model_context_window=4_096,
         terminal_tool_nudge_enabled=True,
     )
@@ -376,7 +399,7 @@ def test_write_first_prefix_suppressed_once_file_written() -> None:
     _append_file_write_result(engine, tool_name="Write")
 
     text = _resolved_terminal_tool_nudge_text(engine)
-    assert rc.terminal_tool_nudge_write_first_text.split("\n")[0] not in text
+    assert engine.prompt_text("terminal_tool_nudge_write_first") not in text
     # The plain terminal nudge body is preserved.
     assert "Finalize" in text
 
@@ -385,14 +408,14 @@ def test_write_first_disabled_by_rc_kill_switch() -> None:
     """``terminal_tool_nudge_write_first_enabled=False`` restores the plain
     terminal nudge even with no file written."""
 
-    rc = RuntimeConstants(
+    rc = LoopConstants(
         model_context_window=4_096,
         terminal_tool_nudge_enabled=True,
         terminal_tool_nudge_write_first_enabled=False,
     )
     engine = _build_engine(rc=rc, expected_terminal_tool="Finalize")
     text = _resolved_terminal_tool_nudge_text(engine)
-    assert rc.terminal_tool_nudge_write_first_text.split("\n")[0] not in text
+    assert engine.prompt_text("terminal_tool_nudge_write_first") not in text
 
 
 # ---------------------------------------------------------------------------
@@ -413,7 +436,7 @@ def test_terminal_only_enforces_once_the_wind_down_has_withdrawn_the_tools() -> 
     """
     from protocore.runtime import soft_stop as _soft_stop
 
-    rc = RuntimeConstants(
+    rc = LoopConstants(
         model_context_window=4_096,
         terminal_tool_nudge_enabled=True,
     )
@@ -452,7 +475,7 @@ def test_terminal_only_is_not_enforced_by_the_per_turn_latch_alone() -> None:
     model is still free to work in. Strict-blocking that turn would break the
     repair it exists to perform.
     """
-    rc = RuntimeConstants(
+    rc = LoopConstants(
         model_context_window=4_096,
         terminal_tool_nudge_enabled=True,
     )
@@ -471,7 +494,7 @@ def test_terminal_only_inert_for_default_tenant() -> None:
 
     from protocore.runtime import soft_stop as _soft_stop
 
-    rc = RuntimeConstants(model_context_window=4_096)
+    rc = LoopConstants(model_context_window=4_096)
     engine = _build_engine(rc=rc, expected_terminal_tool=None)
     _soft_stop.enter(engine, cause_name=_soft_stop.CAUSE_DEADLINE)
     engine._terminal_only_active = True
@@ -561,7 +584,7 @@ class _MessageCarryingTerminalTool(Tool):
         )
 
 
-def _build_finalize_engine(rc: RuntimeConstants) -> QueryEngine:
+def _build_finalize_engine(rc: LoopConstants) -> QueryEngine:
     """An engine whose terminal tool is a registered BACKGROUND ``Finalize`` —
     the live shape under ``agent_finalize_tool_as_terminal=True``."""
 
@@ -615,7 +638,7 @@ def test_meta_text_suppressed_when_substantive_answer_already_exists() -> None:
     active``). The turn's visible TEXT is the redundant META narration → suppress
     it. The nudge itself STILL fired (``_terminal_tool_nudge_required`` is True)."""
 
-    rc = RuntimeConstants(
+    rc = LoopConstants(
         model_context_window=4_096,
         terminal_tool_nudge_enabled=True,
         finalize_prose_gate_min_chars=1,
@@ -635,7 +658,7 @@ def test_meta_text_not_suppressed_before_nudge_fires() -> None:
     nudge has not fired yet) the real answer's TEXT MUST stream normally. The
     suppression predicate only engages on the post-nudge terminal-only turn."""
 
-    rc = RuntimeConstants(
+    rc = LoopConstants(
         model_context_window=4_096,
         terminal_tool_nudge_enabled=True,
         finalize_prose_gate_min_chars=1,
@@ -651,7 +674,7 @@ def test_meta_text_suppressed_for_terse_answer_min_chars_one() -> None:
     as substantive under ``finalize_prose_gate_min_chars=1``, so the terminal-only
     turn's text is suppressed (the duplicate-fix floor of 1 is preserved)."""
 
-    rc = RuntimeConstants(
+    rc = LoopConstants(
         model_context_window=4_096,
         terminal_tool_nudge_enabled=True,
         finalize_prose_gate_min_chars=1,
@@ -667,7 +690,7 @@ def test_meta_text_suppressed_after_work_then_answer() -> None:
     the real answer, so the terminal-only turn's text is suppressed (the
     Remember/Read-then-answer shape from the forensics)."""
 
-    rc = RuntimeConstants(
+    rc = LoopConstants(
         model_context_window=4_096,
         terminal_tool_nudge_enabled=True,
         finalize_prose_gate_min_chars=1,
@@ -686,7 +709,7 @@ def test_meta_text_not_suppressed_when_no_prior_answer() -> None:
     answers in the terminal turn), so it MUST stay visible. Here only progress
     narration exists BEFORE the work, with no answer after it."""
 
-    rc = RuntimeConstants(
+    rc = LoopConstants(
         model_context_window=4_096,
         terminal_tool_nudge_enabled=True,
         finalize_prose_gate_min_chars=1,
@@ -703,7 +726,7 @@ def test_meta_text_not_suppressed_for_empty_run() -> None:
     """An empty run (no prior assistant prose at all) is not suppressed;
     the terminal-only turn's text would be the run's only answer."""
 
-    rc = RuntimeConstants(
+    rc = LoopConstants(
         model_context_window=4_096,
         terminal_tool_nudge_enabled=True,
         finalize_prose_gate_min_chars=1,
@@ -721,7 +744,7 @@ def test_meta_text_not_suppressed_for_message_carrying_terminal() -> None:
     ``test_terminal_nudge_recovers_plain_text_final`` depends on the text + nudge
     surviving for ``pcm_answer``.)"""
 
-    rc = RuntimeConstants(
+    rc = LoopConstants(
         model_context_window=4_096,
         terminal_tool_nudge_enabled=True,
         finalize_prose_gate_min_chars=1,
@@ -738,7 +761,7 @@ def test_meta_text_not_suppressed_when_terminal_tool_unknown_to_core() -> None:
     introspect its schema), the suppression EXEMPTS it (returns False, keeps the
     text), matching the prose-gate's multi-tenant fail-safe."""
 
-    rc = RuntimeConstants(
+    rc = LoopConstants(
         model_context_window=4_096,
         terminal_tool_nudge_enabled=True,
         finalize_prose_gate_min_chars=1,
@@ -752,7 +775,7 @@ def test_meta_text_not_suppressed_when_terminal_tool_unknown_to_core() -> None:
 def test_meta_text_suppression_inert_for_default_tenant() -> None:
     """With no resolvable terminal tool the suppression is inert."""
 
-    rc = RuntimeConstants(
+    rc = LoopConstants(
         model_context_window=4_096,
         terminal_tool_nudge_enabled=True,
         finalize_prose_gate_min_chars=1,

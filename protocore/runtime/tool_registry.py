@@ -12,7 +12,7 @@ Thread / async safety
 ---------------------
 * In-memory state is guarded by a single :class:`threading.RLock` — the
  registry is mutated from background tasks (tool installation hooks)
- AND queried from the per-turn ``query`` async generator; both must
+ AND queried from the per-turn driver async generator; both must
  see a consistent catalogue.
 * Snapshot reads (``list_all`` / ``compute_effective_surface``) take a
  copy under the lock and operate lock-free thereafter — keeps the hot

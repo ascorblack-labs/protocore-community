@@ -11,8 +11,9 @@ from typing import Any, Final
 
 from pydantic import BaseModel, ConfigDict, Field
 
+from protocore.contracts.evidence import EvidenceProducerBinding, ToolEvidenceContext
+from protocore.contracts.run_state import RunScopedState
 from protocore.contracts.types import ToolDefinition, ToolResult
-from protocore.contracts.verification import EvidenceProducerBinding, RunTreeOrigin
 
 #: ``ToolContext.metadata`` key carrying a delegation child's position in its
 #: concurrently-dispatched batch (0-based, LLM-requested order). Set only on the
@@ -33,12 +34,52 @@ SUBAGENT_DISPATCH_GROUP_METADATA_KEY: Final[str] = "protocore.subagent_dispatch_
 #: ``ToolContext.metadata`` key carrying the executing child's tree-budget permit
 #: handle (a :class:`~protocore.runtime.subagent_budget.SubagentTreePermit`, an
 #: in-memory object — not serialized, like the cancel ``asyncio.Event`` on the
-#: helper bag). The parent acquires a tree slot at the dispatch site and stamps
-#: the handle here so the host runner can lodge it in the CHILD's helper bag;
+#: run state). The parent acquires a tree slot at the dispatch site and stamps
+#: the handle here so the host runner can put it on the CHILD's run state as
+#: :attr:`~protocore.contracts.run_state.RunScopedState.subagent_tree_permit`;
 #: the child engine then release-while-awaits around its OWN nested delegation
 #: gather. Absent on serial/single dispatch and on the root leader (which owns no
 #: permit) ⇒ the child simply never releases/reacquires a tree slot.
 SUBAGENT_TREE_PERMIT_METADATA_KEY: Final[str] = "protocore.subagent_tree_permit"
+
+
+#: Every ``ToolContext.metadata`` key the core READS. The bag belongs to the
+#: host — it carries the run's own envelope and whatever else a host spells —
+#: and core reaches into it only for what is named here. :func:`read_metadata`
+#: is the only way core reads it, and it refuses a key absent from this set, so
+#: the channel between a host and the loop is this list and nothing else.
+#:
+#: Stated as literals rather than assembled from the constants that name them,
+#: because those constants live in the modules that read them and a contract
+#: module may not import upward from any of those. The test beside this module
+#: pins every such constant against this set, so the two cannot drift.
+CORE_TOOL_CONTEXT_METADATA_KEYS: Final[frozenset[str]] = frozenset(
+    {
+        "tool_call_id",
+        "memory_default_scope",
+        "memory_default_scope_key",
+        "memory_allowed_scopes",
+        "memory_scope_keys",
+        "memory_enabled",
+        "memory_write_similarity_threshold",
+        "memory_max_records_per_scope",
+    }
+)
+
+#: The keys core STAMPS on the bag for a tool or a host to read back. The other
+#: direction of the same channel, and listed for the same reason: a value core
+#: writes here is one a host may branch on, so it is part of the contract even
+#: though core never reads it again.
+CORE_STAMPED_TOOL_CONTEXT_METADATA_KEYS: Final[frozenset[str]] = frozenset(
+    {
+        "tool_call_id",
+        "tool_visibility_policy",
+        "protocore.subagent_dispatch_order",
+        "protocore.subagent_dispatch_group",
+        "protocore.subagent_tree_permit",
+        "protocore.synthetic_recovery",
+    }
+)
 
 
 class ToolError(Exception):
@@ -62,35 +103,42 @@ class ToolContext(BaseModel):
     model_config = ConfigDict(frozen=True, arbitrary_types_allowed=True)
 
     tenant_id: str
-    """Scope id (``tenants.id``). Keys hooks, secrets, RC, workspace, sessions."""
-    account_id: str = ""
-    """Owning account id (``tenants.account_id``).
+    """The run's scope, as an opaque key.
 
-    The skill bank is ACCOUNT-WIDE and flat (``skills.account_id``), so the
-    ``Skill`` tool and any skill-store read MUST key on this — NOT ``tenant_id``,
-    which is the (possibly different) scope id. Empty only when no account could
-    be resolved for the scope; a skill lookup then resolves nothing rather than
-    silently keying on the wrong id.
+    Core neither parses it nor knows what a host addresses with it: it keys
+    hooks, secrets, constants, workspace and sessions, and every one of those
+    is reached through a contract the host implements. Whatever else a host
+    knows about the scope — who owns it, what it is billed to — stays with the
+    host, in :attr:`RunScopedState.host` or under a host key in
+    :attr:`metadata`.
     """
     run_id: str
     session_id: str
-    workspace_id: str | None = None
-    evidence_origin: RunTreeOrigin | None = None
-    """Trusted immutable run-tree identity for evidence produced by this tool.
+    work_scope: str = ""
+    """The pool scope work this call starts belongs to, or ``""`` for the session's.
 
-    Root callers retain the historical minimal context shape.  QueryEngine
-    always supplies the complete origin, including parent/subagent identifiers
-    for descendants, so tools never infer provenance from text or metadata.
+    A tool that launches background work files it under this scope, so the run
+    that started it is the run that can stop it. A delegated run shares the
+    session — same workspace, same wake delivery — while owning the work it
+    starts on its own; every other run leaves this empty and its work is the
+    session's, exactly as it was before a run could be delegated.
     """
-    evidence_producer_binding: EvidenceProducerBinding | None = None
-    """Immutable registered producer binding for this execution.
+    evidence: ToolEvidenceContext | None = None
+    """Provenance for evidence this invocation produces, or ``None`` for none.
 
-    The dispatcher installs it after resolving the actual registered tool.
-    Tools may read this identity to construct an observation, but the
-    dispatcher stamps it again before ledger admission.
+    One value rather than three loose fields, because they are only meaningful
+    together: see
+    :class:`~protocore.contracts.evidence.ToolEvidenceContext`. A tool that
+    produces no evidence never reads it.
     """
-    evidence_admission_deferred: bool = False
-    """Whether a parallel replay owns ordered admission for this invocation."""
+    run_state: RunScopedState | None = None
+    """The run's own state, shared by reference with every call in the run.
+
+    Typed and named — a tool reads an allowance off an attribute, and a reader
+    that asks for one this run does not carry gets a type error rather than a
+    silently missing value. ``None`` only where a caller invokes a tool outside
+    a run at all; every path the loop takes supplies one.
+    """
     metadata: dict[str, Any] = Field(default_factory=dict)
 
 
@@ -139,10 +187,62 @@ class Tool(ABC):
         """
 
 
+def read_metadata(context: ToolContext, key: str, default: Any = None) -> Any:
+    """The value a host put under ``key``, or ``default``.
+
+    The one way core reads the metadata bag, and it refuses a key core has not
+    declared in :data:`CORE_TOOL_CONTEXT_METADATA_KEYS`. Without that, reading
+    the bag is an open channel: any module could start depending on a string a
+    host happened to spell, and nothing anywhere would say so — least of all
+    the host, which would learn it had been supplying an input the day it
+    stopped.
+    """
+    if key not in CORE_TOOL_CONTEXT_METADATA_KEYS:
+        raise KeyError(
+            f"{key!r} is not a metadata key the core declares; add it to "
+            "CORE_TOOL_CONTEXT_METADATA_KEYS if the core is to read it"
+        )
+    return (context.metadata or {}).get(key, default)
+
+
+def has_metadata(context: ToolContext, key: str) -> bool:
+    """Whether the host stated anything at all under ``key``.
+
+    Distinct from a ``None`` value on purpose: "the host has no opinion" and
+    "the host said no" are different answers, and several guards turn on which
+    one they got. Refuses an undeclared key exactly as :func:`read_metadata`
+    does.
+    """
+    if key not in CORE_TOOL_CONTEXT_METADATA_KEYS:
+        raise KeyError(
+            f"{key!r} is not a metadata key the core declares; add it to "
+            "CORE_TOOL_CONTEXT_METADATA_KEYS if the core is to read it"
+        )
+    return key in (context.metadata or {})
+
+
+def copy_metadata(context: ToolContext) -> dict[str, Any]:
+    """A mutable copy of the whole bag, for a caller building the next one.
+
+    The dispatcher stamps its own keys onto a copy before it hands the context
+    to a tool. It carries the host's keys through untouched and reads none of
+    them, which is why this is not a read and needs no declaration.
+    """
+    return dict(context.metadata)
+
+
 __all__ = [
+    "CORE_STAMPED_TOOL_CONTEXT_METADATA_KEYS",
+    "CORE_TOOL_CONTEXT_METADATA_KEYS",
+    "SUBAGENT_DISPATCH_GROUP_METADATA_KEY",
+    "SUBAGENT_DISPATCH_ORDER_METADATA_KEY",
+    "SUBAGENT_TREE_PERMIT_METADATA_KEY",
     "Tool",
     "ToolContext",
     "ToolError",
     "ToolInvocationError",
     "ToolPolicyDenied",
+    "copy_metadata",
+    "has_metadata",
+    "read_metadata",
 ]

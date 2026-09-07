@@ -1,17 +1,36 @@
 """Compaction as a retained-tail checkpoint the next LLM request cannot read through."""
 from __future__ import annotations
 
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 
-from protocore.contracts.runtime_constants import RuntimeConstants
+from protocore.contracts.runtime_constants import LoopConstants
+from protocore.contracts.tool_roles import (
+    EMPTY_TOOL_ROLE_MAP,
+    WORKSPACE_INSPECTION_ROLES,
+    WORKSPACE_MUTATION_ROLES,
+    ToolRoleMap,
+)
 from protocore.contracts.types import Message, MessageRole
 
-FILE_OP_ROLES = frozenset({MessageRole.tool, MessageRole.assistant})
 
-#: Fallback for callers that predate ``compaction_tracked_tool_names``. The
-#: live set is read from RuntimeConstants; this only names the historical default.
-DEFAULT_TRACKED_TOOL_NAMES: tuple[str, ...] = ("Write", "Edit", "Read", "Glob", "Grep")
+def tracked_tool_names(
+    rc: LoopConstants, roles: ToolRoleMap = EMPTY_TOOL_ROLE_MAP
+) -> tuple[str, ...]:
+    """The tool calls whose bare fact must outlive compaction.
+
+    A tenant may name them outright (``compaction_tracked_tool_names``). When
+    it does not, they are every tool that touched the workspace — read or
+    written — as the host declared its own tools, so an installation that
+    renamed its file tools keeps its file history across a compaction instead
+    of losing it to a name the core guessed.
+    """
+    configured = tuple(rc.compaction_tracked_tool_names)
+    if configured:
+        return configured
+    return tuple(
+        sorted(roles.names_with(*WORKSPACE_MUTATION_ROLES, *WORKSPACE_INSPECTION_ROLES))
+    )
 
 
 @dataclass(slots=True)
@@ -33,15 +52,37 @@ class CompactCheckpoint:
             "reason": self.reason,
         }
 
+    @classmethod
+    def from_dict(cls, raw: Mapping[str, object]) -> CompactCheckpoint:
+        """Read back a checkpoint this class wrote.
+
+        The folded-away turns survive nowhere else, so a checkpoint that
+        crosses a process boundary has to come back as the object the loop
+        reads rather than as the row it travelled as. A row missing a field is
+        read at the value a checkpoint that never had one would carry, so a
+        partial row is a poorer checkpoint rather than a refusal.
+        """
+        raw_index = raw.get("retained_from_index")
+        index = raw_index if isinstance(raw_index, int) and not isinstance(raw_index, bool) else 0
+        facts = raw.get("file_op_facts")
+        return cls(
+            entry_id=str(raw.get("entry_id", "")),
+            summary=str(raw.get("summary", "")),
+            retained_from_index=index,
+            file_op_facts=[str(fact) for fact in facts] if isinstance(facts, list) else [],
+            instructions=str(raw.get("instructions", "")),
+            reason=str(raw.get("reason", "manual")),
+        )
+
 
 def collect_file_op_facts(
     history: list[Message],
-    tracked_tool_names: Sequence[str] = DEFAULT_TRACKED_TOOL_NAMES,
+    tracked_tool_names: Sequence[str] = (),
 ) -> list[str]:
     """Keep one line per tracked tool call so the bare fact outlives compaction.
 
     ``tracked_tool_names`` is a tenant policy
-    (:attr:`RuntimeConstants.compaction_tracked_tool_names`), not a core
+    (:attr:`LoopConstants.compaction_tracked_tool_names`), not a core
     invariant: a non-coding backend names its own domain verbs here.
     """
     tracked = frozenset(tracked_tool_names)
@@ -64,7 +105,7 @@ def build_checkpoint(
     instructions: str,
     reason: str,
     enabled: bool,
-    tracked_tool_names: Sequence[str] = DEFAULT_TRACKED_TOOL_NAMES,
+    tracked_tool_names: Sequence[str] = (),
 ) -> CompactCheckpoint | None:
     if not enabled:
         return None
@@ -118,7 +159,7 @@ def apply_checkpoint(
     return prefix + tail
 
 
-def overflow_should_compact(*, used_tokens: int, window: int, rc: RuntimeConstants) -> bool:
+def overflow_should_compact(*, used_tokens: int, window: int, rc: LoopConstants) -> bool:
     return used_tokens > max(0, window - rc.compaction_reserve_tokens)
 
 
@@ -128,4 +169,5 @@ __all__ = [
     "build_checkpoint",
     "collect_file_op_facts",
     "overflow_should_compact",
+    "tracked_tool_names",
 ]

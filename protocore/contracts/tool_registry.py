@@ -18,8 +18,7 @@ from protocore.contracts.types import ToolDefinition
 #: per-run :class:`ToolVisibilityPolicy` so policy-aware tools (ToolSearch)
 #: can honour the same visible/blocked contract the dispatch gate enforces
 #: (tools-initiative A2 — closes the blocked-schema info leak). The value is
-#: the policy MODEL instance (metadata already carries live objects, e.g.
-#: the ``protocore.helpers`` bag), never a serialised copy.
+#: the policy MODEL instance — a live object, never a serialised copy.
 TOOL_VISIBILITY_POLICY_METADATA_KEY: Final[str] = "tool_visibility_policy"
 
 
@@ -46,7 +45,7 @@ class ToolVisibilityPolicy(BaseModel):
 
     Tools that bypass the BM25 clip unconditionally — the per-turn surface
     ALWAYS carries them, regardless of query language or score. Built by
-    the host from :attr:`RuntimeConstants.tool_surface_forced_pins`
+    the host from :attr:`LoopConstants.tool_surface_forced_pins`
     (default: ``Agent`` plus the six core file tools
     ``Read/Write/Edit/Bash/Glob/Grep``).
 

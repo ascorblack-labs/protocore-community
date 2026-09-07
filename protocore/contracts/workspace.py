@@ -31,7 +31,7 @@ Design north-star (all behaviours below are the *contract*, not hints)
   ``project`` is durable across sessions for a repo/workspace;
   ``knowledge_base`` is a durable per-knowledge-base tree whose planes carry
   different write permissions (see :class:`WorkspaceScope`). Controlled
-  per-tenant via RuntimeConstants, never hard-coded. This deliberately mirrors
+  per-tenant via LoopConstants, never hard-coded. This deliberately mirrors
   a SUBSET of
   :class:`~protocore.contracts.memory.MemoryScope` so a tenant gets ONE
   consistent scoping mental model across memory + workspace.
@@ -599,7 +599,7 @@ class IWorkspace(Protocol):
 
         The ``max_*`` knobs and ``searchable_text_max_bytes`` default (when
         ``None``) to the values the host adapter resolves from the
-        per-tenant RuntimeConstants (``workspace_max_bytes`` /
+        per-tenant LoopConstants (``workspace_max_bytes`` /
         ``workspace_max_units_per_scope`` / ``workspace_max_scope_bytes`` /
         ``workspace_searchable_text_max_bytes``) — core never hard-codes the
         numbers; the per-tenant runtime passes the RESOLVED values in per call so

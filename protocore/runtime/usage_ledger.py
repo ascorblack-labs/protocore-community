@@ -3,7 +3,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-from protocore.contracts.runtime_constants import RuntimeConstants
+from protocore.contracts.runtime_constants import LoopConstants
 
 UsageKind = str
 
@@ -43,7 +43,7 @@ def append_usage(
     output_tokens: int,
     success: bool,
     operation_id: str | None = None,
-    rc: RuntimeConstants,
+    rc: LoopConstants,
 ) -> list[UsageRow]:
     if not rc.usage_ledger_enabled:
         return list(rows)

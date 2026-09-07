@@ -183,7 +183,9 @@ def terminal_surface(engine: QueryEngine) -> frozenset[str]:
     # rather than restating the conditions keeps one definition of when an
     # artifact is open.
     if _longfile.terminal_seal_required(engine):
-        names.add(_longfile.FINALIZE_FILE_TOOL_NAME)
+        sealing_tool = _longfile.sealing_tool_name(engine)
+        if sealing_tool is not None:
+            names.add(sealing_tool)
     return frozenset(names)
 
 

@@ -36,7 +36,7 @@ MAX_ARTIFACTS: Final[int] = 500
 MAX_STRUCTURED_JSON_CHARS: Final[int] = 1_000_000
 
 # Nesting-depth ceiling for model-supplied data structures: tool-call argument
-# JSON, message/tool-result metadata, helper-bag snapshots. Every walk over one
+# JSON, message/tool-result metadata, run-state snapshots. Every walk over one
 # of those is depth-bounded so a pathologically nested payload raises a named,
 # catchable error instead of exhausting the interpreter stack — a ``RecursionError``
 # thrown from inside a Pydantic validator or a streaming JSON parser unwinds
@@ -45,9 +45,9 @@ MAX_STRUCTURED_JSON_CHARS: Final[int] = 1_000_000
 # produces and far below CPython's default 1000-frame limit, so the guard fires
 # while there is still stack left to raise on.
 #
-# This is the STRUCTURAL floor, used where no RuntimeConstants snapshot is in
+# This is the STRUCTURAL floor, used where no LoopConstants snapshot is in
 # scope (Pydantic field validators, the pure JSON utilities). It is also the
-# default of ``RuntimeConstants.max_data_nesting_depth``, which is what the
+# default of ``LoopConstants.max_data_nesting_depth``, which is what the
 # engine-driven paths read so the ceiling stays dashboard-tunable.
 MAX_DATA_NESTING_DEPTH: Final[int] = 200
 
@@ -58,6 +58,13 @@ PROTOCOL_COMPACTED_TOOL_RESULT_V1: Final[str] = "PROTOCOL_COMPACTED_TOOL_RESULT_
 
 # Default model name used in test fixtures and bench. NOT a runtime default.
 DEFAULT_MODEL: Final[str] = "qwen3.6-35b-a3b"
+
+# How many per-message token estimates one estimator remembers. Entries hold a
+# weak reference to the message, so the bound is about slot count, not retained
+# history: a run whose messages are gone leaves entries that can never hit and
+# are displaced by the next ones. Sized well past the longest history a single
+# run carries, so a full re-estimate of that history never evicts its own head.
+MAX_TOKEN_ESTIMATE_CACHE_ENTRIES: Final[int] = 4096
 
 # Protocol version string surfaced in envelopes. Bumped whenever wire format breaks.
 PROTOCOL_VERSION: Final[str] = "2.0.0"
@@ -73,6 +80,7 @@ __all__ = [
     "MAX_REPORT_EVENTS",
     "MAX_STRUCTURED_JSON_CHARS",
     "MAX_SUBAGENT_RUNS",
+    "MAX_TOKEN_ESTIMATE_CACHE_ENTRIES",
     "MAX_TOOL_CALL_ARGUMENT_BYTES",
     "MAX_TOOL_CALL_DETAILS",
     "MAX_WARNINGS",

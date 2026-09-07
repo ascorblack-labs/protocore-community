@@ -69,8 +69,8 @@ def test_whitespace_query_returns_first_k() -> None:
 def test_empty_query_catalog_exceeds_top_k_returns_top_k() -> None:
     """Catalog > top_k + empty query must still advertise ``top_k`` tools.
 
- Regression for : the clip path used by ``compute_effective_surface``
- and ``assemble_tool_pool`` triggers exactly when the policy-filtered
+ Regression: the clip path used by ``compute_effective_surface``
+ triggers exactly when the policy-filtered
  catalog exceeds ``top_k``. With an empty/whitespace query (no user
  message yet, autonomous batch, synthetic resume) the model must still
  receive ``top_k`` tools, not an empty tools array.

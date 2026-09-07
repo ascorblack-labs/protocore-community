@@ -26,7 +26,7 @@ def _utcnow_ms() -> int:
 
 
 class TurnEvent(BaseModel):
-    """Per-turn streaming envelope produced by ``query``.
+    """Per-turn streaming envelope produced by the turn driver.
 
  ``payload`` schema is type-discriminated; documented in
  . Callers should treat :class:`TurnEvent` as

@@ -30,10 +30,11 @@ their permit to completion and then release it, which is exactly what lets a
 waiting parent reacquire and resume. Hence no deadlock.
 
 The budget object is minted lazily at the FIRST parallel fan-out (the first run
-that dispatches a concurrent delegation group with no budget yet in its helper
-bag) and shared by reference from there down — across the maximal
-parallel-dispatched subtree, threaded through the helper bag (see
-:mod:`protocore.runtime.tool_dispatch` helper keys). That first fan-out need not
+that dispatches a concurrent delegation group with no budget yet on its run
+state) and shared by reference from there down — across the maximal
+parallel-dispatched subtree, carried as
+:attr:`~protocore.contracts.run_state.RunScopedState.subagent_tree_budget`.
+That first fan-out need not
 be the process root: if the root only ever does serial single-call delegations
 the budget is minted deeper. This is not a concurrency gap — any two runs that
 execute concurrently necessarily branched at a common parallel-fan-out ancestor,
@@ -126,7 +127,7 @@ class SubagentTreeBudget:
     Constructed once at the first parallel fan-out (from
     ``rc.max_concurrent_subagents_per_tree``, read from the minting run's scope)
     and threaded by reference to every descendant of that maximal
-    parallel-dispatched subtree via the helper bag. The cap is CAPTURED at mint
+    parallel-dispatched subtree on their run state. The cap is CAPTURED at mint
     time: an in-flight tree does not resize to a mid-flight RC edit — only trees
     minted afterward pick up the new value. ``cap == 0`` selects the UNLIMITED
     no-op mode:
@@ -139,21 +140,42 @@ class SubagentTreeBudget:
     groups so depth no longer multiplies the effective concurrency.
     """
 
-    __slots__ = ("_cap", "_semaphore")
+    __slots__ = ("_cap", "_in_use", "_semaphore")
 
-    def __init__(self, cap: int) -> None:
+    def __init__(self, cap: int, *, in_use: int = 0) -> None:
         self._cap = cap
+        held = max(0, in_use)
+        self._in_use = held
         # A cap of 0 (or any non-positive value, defensively) is the unlimited
         # sentinel: no semaphore, so acquire/release are pure bookkeeping and the
         # tree bound never blocks.
+        #
+        # ``in_use`` reconstructs a budget whose slots were already taken when
+        # the count was recorded. A live semaphore cannot cross a process
+        # boundary, so what is durable is the PAIR (capacity, slots taken) and a
+        # rebuilt budget starts with that many permits already withdrawn.
         self._semaphore: asyncio.Semaphore | None = (
-            asyncio.Semaphore(cap) if cap > _UNLIMITED_TREE_CAP else None
+            asyncio.Semaphore(max(0, cap - held)) if cap > _UNLIMITED_TREE_CAP else None
         )
 
     @property
     def unlimited(self) -> bool:
         """True when this budget imposes no tree-wide bound (cap==0 sentinel)."""
         return self._semaphore is None
+
+    @property
+    def capacity(self) -> int:
+        """The cap this budget was minted with."""
+        return self._cap
+
+    @property
+    def in_use(self) -> int:
+        """How many slots are held right now.
+
+        Counted under the unlimited sentinel too, so the figure stays meaningful
+        for diagnostics and for the durable (capacity, slots taken) pair.
+        """
+        return self._in_use
 
     async def acquire(self) -> SubagentTreePermit:
         """Acquire one tree slot and return the owning child's permit handle.
@@ -167,7 +189,9 @@ class SubagentTreeBudget:
     async def _acquire_slot(self) -> None:
         if self._semaphore is not None:
             await self._semaphore.acquire()
+        self._in_use += 1
 
     def _release_slot(self) -> None:
         if self._semaphore is not None:
             self._semaphore.release()
+        self._in_use = max(0, self._in_use - 1)

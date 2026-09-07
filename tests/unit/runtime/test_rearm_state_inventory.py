@@ -21,7 +21,13 @@ from pathlib import Path
 
 import pytest
 
-from protocore.contracts.runtime_constants import RuntimeConstants
+from protocore.contracts.evidence import VerificationState
+from protocore.contracts.run_state import (
+    ConsecutiveErrorStreak,
+    SignatureStreak,
+    ToolStreak,
+)
+from protocore.contracts.runtime_constants import LoopConstants
 from protocore.contracts.tools import ToolInvocationError
 from protocore.contracts.types import (
     Message,
@@ -29,11 +35,9 @@ from protocore.contracts.types import (
     TextBlock,
     ToolCall,
 )
-from protocore.contracts.verification import VerificationState
 from protocore.runtime.loop_state import LoopState
 from protocore.runtime.query import _block_identical_tools, _dispatch_tool
 from protocore.runtime.query_engine import QueryEngine
-from protocore.runtime.tool_dispatch import RUN_SCOPED_HELPER_KEYS
 
 from ._tool_fixtures import MockTool
 
@@ -63,7 +67,7 @@ _RESET_ON_REARM: frozenset[str] = frozenset(
         "_block_idx",
         "_wire_round_seq",
         "_pending_tool_call_names",
-        "_pending_approval_tool_call_id",
+        "_pending_interrupts",
         "_pending_public_message_start",
         "_pending_public_reader_turn_events",
         "_holding_reader_message",
@@ -82,6 +86,10 @@ _RESET_ON_REARM: frozenset[str] = frozenset(
         "_post_tool_empty_nudge_count",
         "_transient_stream_retry_count",
         "_empty_completion_redrive_count",
+        # Fire-once report that the session's background pool cannot speak for
+        # the session. A run re-armed onto a pool that is still detached is
+        # entitled to be told again.
+        "_background_detach_reported",
         # The death-spiral flag. Left raised, every later turn skips the
         # terminal hooks its caller is waiting on.
         "skip_terminal_hooks",
@@ -175,7 +183,7 @@ class _Poison:
 def _attached_attributes() -> set[str]:
     """Attribute names the package puts on an engine outside ``__init__``.
 
-    The constructor is not the only writer. The host attaches its helper bag and
+    The constructor is not the only writer. The host attaches its run state and
     the run loop caches things on first use, and none of that is visible to
     ``vars()`` of a freshly built engine — which is exactly why a re-arm that
     copies from a fresh engine cannot reach them. Finding them means reading the
@@ -296,7 +304,7 @@ def test_the_same_opening_tool_call_is_never_a_loop(engine_factory) -> None:
     reclassified a habit as a loop: the tool stopped executing on the turn after
     the limit and every turn after that.
     """
-    rc = RuntimeConstants(model_context_window=4_096, loop_guard_enabled=True)
+    rc = LoopConstants(model_context_window=4_096, loop_guard_enabled=True)
     engine = engine_factory(rc=rc)
     call = ToolCall(id="c1", name="Observe", arguments={})
 
@@ -382,7 +390,7 @@ def test_terminal_hooks_are_not_skipped_forever(engine_factory) -> None:
 @pytest.mark.asyncio
 async def test_a_long_life_of_turns_stays_the_agent_it_was(engine_factory) -> None:
     """Continuity and allowances pull in opposite directions; both must hold."""
-    rc = RuntimeConstants(model_context_window=64_000, loop_guard_enabled=True)
+    rc = LoopConstants(model_context_window=64_000, loop_guard_enabled=True)
     engine = engine_factory(rc=rc)
     engine._helpers = {}
     engine.tools.register(MockTool(tool_name="Observe", response_content="a quiet room"))
@@ -440,7 +448,7 @@ def test_rearm_drops_what_the_loop_cached_on_the_engine(engine_factory) -> None:
 
     assert not hasattr(engine, "_tool_dispatcher"), (
         "the cached dispatcher survived; it holds a tool-error counter read out "
-        "of a helper bag the host may since have replaced"
+        "of a run state the host may since have replaced"
     )
     assert not getattr(engine, "_outbound_system_normalized_warned", False), (
         "the fire-once warning latch stayed raised, so the warning it guards "
@@ -448,23 +456,43 @@ def test_rearm_drops_what_the_loop_cached_on_the_engine(engine_factory) -> None:
     )
 
 
-def test_rearm_clears_the_helper_bag_of_run_scoped_state_only(engine_factory) -> None:
-    """The bag is the host's; the per-run cells inside it are not."""
+def test_rearm_clears_the_per_run_cells_of_the_state_only(engine_factory) -> None:
+    """The state object is the run's; the per-turn cells inside it are not."""
     engine = engine_factory()
     _spend_a_turn(engine)
-    host_entries = {"rc": object(), "cancel_event": object(), "root_run_id": "r-1"}
-    bag: dict[str, object] = dict(host_entries)
-    bag.update({key: {"count": 99} for key in RUN_SCOPED_HELPER_KEYS})
-    engine._helpers = bag
+    state = engine.run_state
+    state.rc = object()
+    state.root_run_id = "r-1"
+    state.host["wired"] = object()
+    ledger = state.ensure_run_work_ledger(engine.config.rc)
+    state.consecutive_error = ConsecutiveErrorStreak(tool_name="Write", count=99)
+    state.transport_down = SignatureStreak(signature="Bash:TRANSPORT_DOWN", count=99)
+    state.transport_down_injection_pending = True
+    state.string_type = ToolStreak(tool_name="Write", count=99)
+    state.tool_call_soft_cap_state.counts["Write"] = 99
+    host_wiring = (state.rc, state.root_run_id, state.host["wired"])
 
     engine.rearm()
 
-    assert engine._helpers is bag, "the bag itself belongs to the host and must survive"
-    left = sorted(key for key in RUN_SCOPED_HELPER_KEYS if key in bag)
+    assert engine.run_state is state, (
+        "the state object is shared with subagents still drawing on its ledger "
+        "and must survive a turn boundary"
+    )
+    left = [
+        name
+        for name, value in (
+            ("consecutive_error", state.consecutive_error),
+            ("transport_down", state.transport_down),
+            ("transport_down_injection_pending", state.transport_down_injection_pending),
+            ("string_type", state.string_type),
+            ("soft_cap_counts", state.tool_call_soft_cap_state.counts or None),
+        )
+        if value
+    ]
     assert not left, (
-        f"last turn's per-run cells are still on the helper bag: {left}. An agent "
+        f"last turn's per-run cells are still on the run state: {left}. An agent "
         "that repeats one failing call each turn crosses a per-run cap no single "
         "turn ever reached."
     )
-    for key, value in host_entries.items():
-        assert bag[key] is value, f"a re-arm took the host's {key!r} with it"
+    assert state.run_work_ledger is ledger, "a re-arm refilled the tree's budget"
+    assert (state.rc, state.root_run_id, state.host["wired"]) == host_wiring

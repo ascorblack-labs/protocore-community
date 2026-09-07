@@ -6,7 +6,7 @@ import json
 import pytest
 
 from protocore.constants import PROTOCOL_COMPACTED_TOOL_RESULT_V1
-from protocore.contracts.runtime_constants import RuntimeConstants
+from protocore.contracts.runtime_constants import LoopConstants
 from protocore.contracts.types import (
     Message,
     MessageRole,
@@ -14,6 +14,7 @@ from protocore.contracts.types import (
     ToolResultBlock,
     ToolUseBlock,
 )
+from protocore.prompts import bundled_prompt_provider
 from protocore.runtime.events import EventType
 from protocore.runtime.live_control import (
     enqueue,
@@ -30,12 +31,12 @@ from protocore.runtime.loop_guard import (
     inspect_stream_repeat,
     repeating_tail_cut,
 )
-from protocore.runtime.query import query
+from protocore.runtime.query import _query as query
 from protocore.runtime.result_eviction import evict_history_for_llm
 from protocore.tests_support.adapters import InMemoryLLMProvider
 
 
-def _enabled(**overrides: object) -> RuntimeConstants:
+def _enabled(**overrides: object) -> LoopConstants:
     values: dict[str, object] = {
         "model_context_window": 4_096,
         "loop_guard_enabled": True,
@@ -46,10 +47,9 @@ def _enabled(**overrides: object) -> RuntimeConstants:
         "result_eviction_enabled": True,
         "run_settled_enabled": True,
         "steer_follow_up_enabled": True,
-        "mid_session_controls_enabled": True,
     }
     values.update(overrides)
-    return RuntimeConstants(**values)  # type: ignore[arg-type]
+    return LoopConstants(**values)  # type: ignore[arg-type]
 
 
 def test_repeating_tail_is_cut_and_not_kept() -> None:
@@ -81,7 +81,7 @@ def test_inspect_stream_repeat_off_is_noop() -> None:
     text, _reason, hit = inspect_stream_repeat(
         buffer,
         "",
-        RuntimeConstants(model_context_window=4096),
+        LoopConstants(model_context_window=4096),
     )
     assert hit is None
     assert text == buffer
@@ -94,7 +94,7 @@ def test_identical_tool_fingerprint_and_limit() -> None:
     rc = _enabled(loop_guard_identical_tool_limit=2)
     assert identical_tool_should_block(fp, counts, rc)
     assert not identical_tool_should_block(
-        fp, {}, RuntimeConstants(model_context_window=4096)
+        fp, {}, LoopConstants(model_context_window=4096)
     )
 
 
@@ -129,7 +129,7 @@ def test_eviction_keeps_marked_and_persist_full() -> None:
             )
         )
     persist = list(history)
-    view, evicted = evict_history_for_llm(history, _enabled(), pinned_ids=())
+    view, evicted = evict_history_for_llm(history, _enabled(), bundled_prompt_provider(), pinned_ids=())
     assert persist[1].content_blocks[0].content == pages[0]
     assert persist[3].content_blocks[0].content == pages[1]
     assert persist[5].content_blocks[0].content == pages[2]
@@ -158,7 +158,7 @@ def test_eviction_leaves_compacted_placeholder() -> None:
             content_blocks=[ToolResultBlock(tool_call_id="c1", content=placeholder)],
         ),
     ]
-    view, evicted = evict_history_for_llm(history, _enabled())
+    view, evicted = evict_history_for_llm(history, _enabled(), bundled_prompt_provider())
     assert evicted == []
     assert view[1].content_blocks[0].content == placeholder
 
@@ -176,7 +176,7 @@ def test_steer_places_after_tools_follow_up_stays() -> None:
     # follow-up is not inserted until settled — caller decides when to place
     assert still[0].kind == "follow_up"
     with pytest.raises(ValueError, match="steer_follow_up_disabled"):
-        enqueue([], new_queued_prompt("steer", "x"), RuntimeConstants())
+        enqueue([], new_queued_prompt("steer", "x"), LoopConstants())
 
 
 def test_deep_rejects_thinking_off() -> None:
@@ -479,7 +479,7 @@ async def test_flags_off_do_not_emit_new_events(
     assert isinstance(llm, InMemoryLLMProvider)
     phrase = "same sentence forever"
     llm.queue_response(text=" ".join([phrase] * 8))
-    engine = engine_factory(rc=RuntimeConstants(model_context_window=4096))
+    engine = engine_factory(rc=LoopConstants(model_context_window=4096))
     engine.history.append(
         Message(role=MessageRole.user, content_blocks=[TextBlock(text="hi")])
     )

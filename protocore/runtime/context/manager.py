@@ -12,7 +12,8 @@ from dataclasses import dataclass
 
 from protocore.contracts.blob import IBlobStore
 from protocore.contracts.llm import ILLMProvider, LLMObservabilityContext
-from protocore.contracts.runtime_constants import RuntimeConstants
+from protocore.contracts.prompts import IPromptTemplateProvider
+from protocore.contracts.runtime_constants import LoopConstants
 from protocore.contracts.skills import SkillBundle
 from protocore.contracts.types import Message, ToolDefinition
 from protocore.logging_utils import get_logger
@@ -21,10 +22,12 @@ from protocore.runtime.context.compaction import (
     CompactionAttempt,
     CompactionExhaustedError,
     CompactionState,
+    RequestRecorder,
     Tier1Result,
     Tier2Result,
     Tier3Result,
-    estimate_message_tokens,
+    TokenEstimator,
+    estimate_history_tokens,
     run_tier1_truncation,
     run_tier2_summarisation,
     run_tier3_fold,
@@ -67,31 +70,11 @@ def detect_active_language(latest_message: Message | None) -> str:
     return "en"
 
 
-def estimate_history_tokens(
-    history: Sequence[Message],
-    rc: RuntimeConstants,
-) -> int:
-    """Sum estimated tokens across all messages in ``history``.
-
- Used as the pre-flight cheap counter before calling
- :meth:`ILLMProvider.count_tokens` (the authoritative endpoint).
-
- Delegates per-message accounting to
- :func:`protocore.runtime.context.compaction.estimate_message_tokens`, the
- single exhaustive-by-ContentBlock estimator that covers ``TextBlock`` /
- ``ThinkingBlock`` / ``ToolUseBlock`` / ``ToolResultBlock`` / ``ImageRefBlock``
- PLUS :attr:`Message.reasoning_content` and a serialized-form catch-all so no
- block (or future kind) is ever silently counted as 0 tokens
- (/ / ).
- """
-    return sum(estimate_message_tokens(message, rc) for message in history)
-
-
 class ContextManager:
     """Builds per-turn :class:`ContextBundle` and drives compaction.
 
  The manager is stateless across calls
- with respect to context assembly — it reads :class:`RuntimeConstants`
+ with respect to context assembly — it reads :class:`LoopConstants`
  fresh and operates on the history list provided.
 
  Compaction state IS persisted on the :class:`QueryEngine` (retry
@@ -99,7 +82,7 @@ class ContextManager:
 
  pin LRU state IS persisted on the
  manager so :meth:`pin_tool` can cap the per-run pin list at
- :attr:`RuntimeConstants.pinned_tool_max_count` and evict the
+ :attr:`LoopConstants.pinned_tool_max_count` and evict the
  least-recently-pinned entry on overflow. Pin state lives on the
  manager because the QueryEngine builds at-most-one ContextManager
  per run, so the pin list is naturally per-run scoped without
@@ -109,22 +92,45 @@ class ContextManager:
     def __init__(
         self,
         *,
-        rc: RuntimeConstants,
+        rc: LoopConstants,
         blob_store: IBlobStore,
         compaction_llm: ILLMProvider,
+        prompts: IPromptTemplateProvider | None = None,
     ) -> None:
         self._rc = rc
         self._blob_store = blob_store
         self._compaction_llm = compaction_llm
+        # The provider that renders the summariser instructions. ``None`` is a
+        # caller that wired none, and the tiers fall back to the templates
+        # bundled with the package — the same fallback the engine makes, for
+        # the same reason: every call site renders unconditionally instead of
+        # carrying a branch for the host that configured nothing.
+        self._prompts = prompts
         # LRU pin tracking. OrderedDict
         # gives us O(1) ``move_to_end`` for re-pins and FIFO eviction
         # on overflow. Stored as ``dict[str, None]`` because we only
         # care about names + their relative order; the actual tool
         # descriptors live in the :class:`ToolRegistry`.
         self._pinned_tools: OrderedDict[str, None] = OrderedDict()
+        # One estimator per manager, and a manager is built once per run: two
+        # runs sharing a process never consult each other's remembered
+        # estimates, whatever object identity would have allowed.
+        self._token_estimator = TokenEstimator()
+        """This manager's own estimate cache — see :attr:`token_estimator`."""
 
     @property
-    def rc(self) -> RuntimeConstants:
+    def token_estimator(self) -> TokenEstimator:
+        """The estimate cache belonging to this run.
+
+        One per manager, so a run's remembered estimates are its own. Callers
+        that size THIS run's history reach for it rather than the module-level
+        functions, whose cache is shared by every run in the process and whose
+        capacity a long history therefore competes for.
+        """
+        return self._token_estimator
+
+    @property
+    def rc(self) -> LoopConstants:
         return self._rc
 
     # ------------------------------------------------------------------
@@ -137,7 +143,7 @@ class ContextManager:
  The ``ToolVisibilityPolicy.pinned`` set can grow unbounded without a cap —
  a latent KV-cache bloat risk (every pinned tool stays in the prompt prefix
  regardless of retrieval scoring). The cap is taken fresh from
- :attr:`RuntimeConstants.pinned_tool_max_count` so an operator
+ :attr:`LoopConstants.pinned_tool_max_count` so an operator
  tightening the value via the dashboard takes effect on the
  next pin call without a redeploy.
 
@@ -249,8 +255,17 @@ class ContextManager:
         model_name: str,
         observability: LLMObservabilityContext | None,
         protect_tail_from_index: int | None,
+        record_request: RequestRecorder | None,
     ) -> Tier3Result | None:
-        """Tier-3 after Tier-2: fold runs of old summaries and operator turns; a failure never aborts the pass."""
+        """Tier 3, after Tier 2 in both cascades.
+
+        A failure here never aborts the pass: Tier 1 and Tier 2 have already
+        freed what they could, and the fold is the part that makes a long
+        session's window shrink rather than the part that makes a request fit.
+        Returning ``None`` — for a run with no compaction LLM, or for a fold
+        the operator switched off — is how the caller tells "did not run" from
+        "ran and folded nothing".
+        """
         if self._compaction_llm is None or not self._rc.compaction_fold_enabled:
             return None
         try:
@@ -262,6 +277,8 @@ class ContextManager:
                 model_name=model_name,
                 observability=observability,
                 protect_tail_from_index=protect_tail_from_index,
+                record_request=record_request,
+                prompts=self._prompts,
             )
         except Exception as exc:
             _logger.warning("tier3 fold failed; skipping (err=%s)", exc)
@@ -276,12 +293,13 @@ class ContextManager:
         model_name: str,
         observability: LLMObservabilityContext | None = None,
         protect_tail_from_index: int | None = None,
+        record_request: RequestRecorder | None = None,
     ) -> CompactionAttempt:
         """Run Tier 1 truncation; fall through to Tier 2 if needed.
 
         Increments :attr:`CompactionState.retry_count` on every failed
         attempt; raises :class:`CompactionExhaustedError` when
-        :attr:`RuntimeConstants.compaction_failed_max_retries` is breached.
+        :attr:`LoopConstants.compaction_failed_max_retries` is breached.
 
         ``protect_tail_from_index`` (set only by the per-iteration gate)
         exempts the current just-executed tool-result batch from BOTH tiers on
@@ -290,7 +308,7 @@ class ContextManager:
         they were produced.
         """
         budgets = derive_budgets(self._rc)
-        tokens_before = estimate_history_tokens(history, self._rc)
+        tokens_before = self._token_estimator.estimate_history(history, self._rc)
 
         attempt = CompactionAttempt(tokens_before=tokens_before)
 
@@ -311,7 +329,7 @@ class ContextManager:
             # defaults to 0. Stamp the real current estimate before returning so
             # the caller's COMPACTION_COMPLETED event does not report a phantom
             # "full clear" (tokens_after=0 ≪ tokens_before).
-            attempt.tokens_after = estimate_history_tokens(history, self._rc)
+            attempt.tokens_after = self._token_estimator.estimate_history(history, self._rc)
             return attempt
 
         attempt.tier1 = tier1
@@ -334,6 +352,8 @@ class ContextManager:
                     model_name=model_name,
                     observability=observability,
                     protect_tail_from_index=protect_tail_from_index,
+                    record_request=record_request,
+                    prompts=self._prompts,
                     # Tier-2 only needs to make up the shortfall Tier-1 left
                     # against the min-clear target; bound its per-pass LLM-call
                     # count to that budget rather than summarising every eligible
@@ -347,9 +367,16 @@ class ContextManager:
                 tier2 = Tier2Result(turns_summarised=0, tokens_freed=0)
             attempt.tier2 = tier2
 
-        attempt.tier3 = await self._fold(history, compaction_state, model_name, observability, protect_tail_from_index)
+        attempt.tier3 = await self._fold(
+            history,
+            compaction_state,
+            model_name,
+            observability,
+            protect_tail_from_index,
+            record_request,
+        )
 
-        tokens_after = estimate_history_tokens(history, self._rc)
+        tokens_after = self._token_estimator.estimate_history(history, self._rc)
         attempt.tokens_after = tokens_after
 
         # Success → reset retry counter for next compaction
@@ -373,6 +400,7 @@ class ContextManager:
         model_name: str,
         observability: LLMObservabilityContext | None = None,
         protect_tail_from_index: int | None = None,
+        record_request: RequestRecorder | None = None,
     ) -> CompactionAttempt:
         """Run BOTH Tier 1 + Tier 2 unconditionally for reactive-413 recovery.
 
@@ -393,7 +421,7 @@ class ContextManager:
  batch was never wire-accepted).
  """
         budgets = derive_budgets(self._rc)
-        tokens_before = estimate_history_tokens(history, self._rc)
+        tokens_before = self._token_estimator.estimate_history(history, self._rc)
 
         attempt = CompactionAttempt(tokens_before=tokens_before)
 
@@ -427,7 +455,7 @@ class ContextManager:
             # Free aggressively but bounded — enough to bring the post-Tier-1
             # history back under the trigger threshold so the request can
             # re-stream, without summarising every eligible turn serially.
-            tokens_after_tier1 = estimate_history_tokens(history, self._rc)
+            tokens_after_tier1 = self._token_estimator.estimate_history(history, self._rc)
             free_target = tokens_after_tier1 - budgets.compaction_trigger_tokens
             try:
                 tier2 = await run_tier2_summarisation(
@@ -439,6 +467,8 @@ class ContextManager:
                     observability=observability,
                     protect_tail_from_index=protect_tail_from_index,
                     free_target_tokens=free_target if free_target > 0 else None,
+                    record_request=record_request,
+                    prompts=self._prompts,
                 )
             except Exception as exc:
                 compaction_state.retry_count += 1
@@ -449,9 +479,16 @@ class ContextManager:
                 tier2 = Tier2Result(turns_summarised=0, tokens_freed=0)
             attempt.tier2 = tier2
 
-        attempt.tier3 = await self._fold(history, compaction_state, model_name, observability, protect_tail_from_index)
+        attempt.tier3 = await self._fold(
+            history,
+            compaction_state,
+            model_name,
+            observability,
+            protect_tail_from_index,
+            record_request,
+        )
 
-        tokens_after = estimate_history_tokens(history, self._rc)
+        tokens_after = self._token_estimator.estimate_history(history, self._rc)
         attempt.tokens_after = tokens_after
 
         # Force-compaction success rule: ANY progress (tokens freed OR
@@ -495,7 +532,7 @@ class ContextManager:
         cold start (turn 1, no usage yet) and post-compaction (observed is
         reset to 0 so the freshly-shrunk history is re-measured cheaply).
         """
-        estimated = estimate_history_tokens(history, self._rc)
+        estimated = self._token_estimator.estimate_history(history, self._rc)
         return max(estimated, max(0, observed_prompt_tokens))
 
     def needs_compaction(
@@ -519,7 +556,7 @@ class ContextManager:
     ) -> bool:
         """Return ``True`` if the current prompt exceeds the emergency cliff.
 
-        Activates :attr:`RuntimeConstants.compaction_emergency_ratio`. When
+        Activates :attr:`LoopConstants.compaction_emergency_ratio`. When
         this is True the runtime should run :meth:`force_compaction` (both
         tiers, unconditional) proactively rather than waiting for the provider
         to raise a context-window-exceeded error. ``compaction_emergency_tokens``

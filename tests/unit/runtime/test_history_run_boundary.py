@@ -98,7 +98,7 @@ trusts it and stops looking.
    helper is invisible here.
 
    Its CALLER is a finding only if that caller is not itself registered. An
-   ``Any``-annotated helper called from ``_query_raw`` — which the registry
+   ``Any``-annotated helper called from ``_drive_turn`` — which the registry
    authorises ``_whole`` — passes the whole suite with nothing failing;
    measured, not reasoned about. An earlier version of this docstring said the
    call site was a finding "wherever it is written". That was false, and it is
@@ -245,7 +245,7 @@ _COMPACTION_TESTS = "tests/unit/runtime/test_compaction_intra_run.py"
 #: they are invisible, not because they do not exist.
 _WHOLE_HISTORY_BY_DESIGN: dict[str, _Declaration] = {
     # --- the transcript that goes on the wire -------------------------------
-    "protocore/runtime/query.py::_query_raw": _whole(
+    "protocore/runtime/query.py::_drive_turn": _whole(
         "wire-pairing repair before a terminal snapshot, plus prompt assembly: "
         "both are about the transcript sent to the provider"
     ),
@@ -254,6 +254,13 @@ _WHOLE_HISTORY_BY_DESIGN: dict[str, _Declaration] = {
     ),
     "protocore/runtime/query.py::_emit_dispatch_cancel_teardown": _whole(
         "pairs orphan tool_use blocks so a resumed snapshot is wire-valid"
+    ),
+    "protocore/runtime/query.py::_policy_pair_orphan_tool_calls": _whole(
+        "pairs orphan tool_use blocks so a resumed snapshot is wire-valid"
+    ),
+    "protocore/runtime/turn_policies/compaction.py::PerIterationCompactionPolicy.apply": _whole(
+        "the tool-batch protect index is an offset into the whole transcript, "
+        "because that is what compaction reads"
     ),
     "protocore/runtime/query.py::_emit_llm_terminal": _whole(
         "pairs orphan tool_use blocks so a resumed snapshot is wire-valid"
@@ -264,6 +271,28 @@ _WHOLE_HISTORY_BY_DESIGN: dict[str, _Declaration] = {
     "protocore/runtime/query.py::_emit_tool_precondition_terminal": _whole(
         "pairs orphan tool_use blocks so a resumed snapshot is wire-valid"
     ),
+    "protocore/runtime/query.py::_settle_interrupted_tool_intents": _whole(
+        "closes out calls left in flight by a stopped run: it looks for a "
+        "result anywhere in the transcript before deciding an outcome was "
+        "never recorded, and a result that landed before the tail is still a "
+        "result"
+    ),
+    "protocore/runtime/query.py::_abandon_pending_approval": _whole(
+        "closes a call that was parked at an approval gate: the result has to "
+        "go directly after the call it answers, wherever in the transcript "
+        "that call sits, which is the same pairing concern as the repairs "
+        "below"
+    ),
+    "protocore/runtime/query.py::_settle_parked_call": _whole(
+        "closes a call a person's decision answered — a denial, an answer to "
+        "the question the tool asked — and the result has to go directly "
+        "after the call it answers, wherever in the transcript that call "
+        "sits: the same pairing concern as the abandonment above"
+    ),
+    "protocore/runtime/query.py::_insert_tool_result_after_use": _whole(
+        "places a tool result directly after the call it answers, anywhere in "
+        "the sequence it is handed — a pairing concern, like the repairs above"
+    ),
     "protocore/runtime/query.py::_llm_history": _whole(
         "prompt assembly: builds the view of the transcript the provider is "
         "sent. Result eviction, the compaction checkpoint and the result split "
@@ -273,6 +302,26 @@ _WHOLE_HISTORY_BY_DESIGN: dict[str, _Declaration] = {
     "protocore/runtime/result_eviction.py::evict_history_for_llm": _whole(
         "prompt assembly over the sequence it is handed: replaces unmarked "
         "Read/Grep results in the outbound copy"
+    ),
+    "protocore/runtime/result_eviction.py::tool_names_by_call_id": _whole(
+        "identity lookups keyed on tool call ids, over the outbound view it "
+        "is handed. It answers the same question as tool_name_for_result for "
+        "every id at once, so its scope is the same: a call id names a single "
+        "call, and the view it serves includes seeded turns, whose results "
+        "must resolve too"
+    ),
+    "protocore/runtime/result_eviction.py::pins_invalidated_by_writes": _whole(
+        "pairs every result that names a path with the LATER calls that "
+        "rewrote it, over the outbound view it is handed. The transcript is "
+        "the right scope by construction: a file is rewritten once and stays "
+        "rewritten, so a pinned view of it is stale for everything that comes "
+        "after the write, and a narrower scan would go on serving the version "
+        "before it"
+    ),
+    "protocore/contracts/snapshot.py::_v4_to_v5": _whole(
+        "lifts a stored payload, not a live transcript: it walks the recorded "
+        "messages of the snapshot handed to it and states the two fields "
+        "version 5 adds to a tool result. It asks nothing of any run"
     ),
     "protocore/runtime/result_eviction.py::tool_name_for_result": _whole(
         "identity lookup keyed on a tool call id, over the outbound view it is "
@@ -317,9 +366,6 @@ _WHOLE_HISTORY_BY_DESIGN: dict[str, _Declaration] = {
         "compaction: names the file operations in the prefix it is handed so "
         "they survive that prefix being dropped"
     ),
-    "protocore/runtime/context/manager.py::estimate_history_tokens": _whole(
-        "token accounting over the sequence it is handed"
-    ),
     "protocore/runtime/context/manager.py::ContextManager.build_context": _whole(
         "prompt assembly: the provider is sent the whole transcript"
     ),
@@ -345,16 +391,11 @@ _WHOLE_HISTORY_BY_DESIGN: dict[str, _Declaration] = {
     "protocore/runtime/context/compaction.py::_effective_eligible_upper": _whole(
         "the eligibility window is a range over the whole transcript"
     ),
-    # Classified _run_scoped rather than _whole because the reason IS a
-    # run-scope argument, and it is word-for-word the reason its twin in
-    # query.py carries. Left whole-transcript and unpinned, the registry held
-    # a working demonstration that the identical argument needs no pin — an
-    # author copying the nearer precedent would have performed a downgrade
-    # with no intent to evade anything.
-    "protocore/runtime/context/compaction.py::_tool_name_by_call_id": _run_scoped(
-        "resolves each tool_call_id to its tool name; a call id identifies a "
-        "single call, so a lookup cannot land on another run's",
-        f"{_CLAIMS}::test_call_id_lookups_resolve_the_call_they_are_asked_for",
+    "protocore/runtime/context/compaction.py::estimate_history_tokens": _whole(
+        "token accounting over the sequence it is handed"
+    ),
+    "protocore/runtime/context/compaction.py::TokenEstimator.estimate_history": (
+        _whole("token accounting over the sequence it is handed")
     ),
     "protocore/runtime/context/compaction.py::run_tier1_truncation": _whole(
         "sheds bytes from the whole transcript so it fits the context window"
@@ -369,11 +410,24 @@ _WHOLE_HISTORY_BY_DESIGN: dict[str, _Declaration] = {
     "protocore/runtime/context/compaction.py::run_tier2_summarisation": _whole(
         "collapses turns anywhere in the transcript to fit the context window"
     ),
-    "protocore/runtime/context/compaction.py::run_tier2_summarisation._summarise": _whole(
+    "protocore/runtime/context/compaction.py::_summarise_unit": _whole(
         "summarises one unit of the whole transcript Tier-2 was handed"
+    ),
+    "protocore/runtime/context/compaction.py::_operator_turn_indices": _whole(
+        "the operator's turns are positions in the whole transcript; a "
+        "filtered copy has no indices into the original"
+    ),
+    "protocore/runtime/context/compaction.py::_foldable_indices": _whole(
+        "decides which positions anywhere in the transcript the fold may take"
     ),
     "protocore/runtime/context/compaction.py::_fold_spans": _whole(
         "finds runs of old summaries and operator turns anywhere in the transcript"
+    ),
+    "protocore/runtime/context/compaction.py::_fold_span": _whole(
+        "folds one span of the whole transcript Tier-3 was handed"
+    ),
+    "protocore/runtime/context/compaction.py::_fold_anchor_key": _whole(
+        "derives one durable id from the span it is handed; it asks nothing about whose run it is"
     ),
     "protocore/runtime/context/compaction.py::run_tier3_fold": _whole(
         "folds runs of old summaries and operator turns anywhere in the transcript"
@@ -395,9 +449,6 @@ _WHOLE_HISTORY_BY_DESIGN: dict[str, _Declaration] = {
         "folds the sequence it is handed into durable session memory; it "
         "reaches no engine and does no scoping of its own"
     ),
-    "protocore/runtime/context/session_memory.py::estimate_messages_tokens": _whole(
-        "token accounting over the sequence it is handed"
-    ),
     "protocore/runtime/context/session_memory.py::bound_catchup_source": _whole(
         "bounds the sequence it is handed to a byte budget"
     ),
@@ -410,6 +461,10 @@ _WHOLE_HISTORY_BY_DESIGN: dict[str, _Declaration] = {
     ),
     "protocore/runtime/loop_strategies.py::DeepStrategy._fetch_plan_fallback": _whole(
         "re-drives the provider with the outbound message list it is handed"
+    ),
+    "protocore/runtime/query.py::build_llm_request": _whole(
+        "assembles the outbound message list it is handed into one provider "
+        "request; it reaches no engine and selects nothing"
     ),
     # --- identity lookups keyed on a tool call id ---------------------------
     "protocore/runtime/query.py::_tool_name_for_call_id": _run_scoped(
@@ -425,6 +480,17 @@ _WHOLE_HISTORY_BY_DESIGN: dict[str, _Declaration] = {
         "inspects the result for ONE tool_call_id the caller just appended",
         f"{_CLAIMS}::test_call_id_lookups_resolve_the_call_they_are_asked_for",
     ),
+    "protocore/runtime/query.py::_tool_call_from_history": _run_scoped(
+        "rebuilds ONE parked call from the tool_call_id its interrupt names; "
+        "a call id identifies a single call, so the search cannot land on "
+        "another run's",
+        f"{_CLAIMS}::test_interrupt_resolution_is_keyed_on_the_parked_call",
+    ),
+    "protocore/runtime/query.py::_apply_updated_input": _run_scoped(
+        "rewrites the tool_use block of ONE parked call to the arguments a "
+        "person corrected, found by that call's id",
+        f"{_CLAIMS}::test_interrupt_resolution_is_keyed_on_the_parked_call",
+    ),
     "protocore/runtime/query.py::_assert_history_has_matching_pending_tool_use": (
         _run_scoped(
             "structural check that ONE approved tool call matches its pending tool_use block",
@@ -432,7 +498,7 @@ _WHOLE_HISTORY_BY_DESIGN: dict[str, _Declaration] = {
         )
     ),
     # --- the tail --------------------------------------------------------
-    "protocore/runtime/query.py::_prose_gate_just_injected": _run_scoped(
+    "protocore/runtime/turn_policies/sibling_walk.py::prose_gate_just_injected": _run_scoped(
         "inspects the LAST message only; the seed is prepended, so the tail always belongs to this run",
         f"{_CLAIMS}::test_prose_gate_reads_the_tail_and_not_a_seeded_turn",
     ),
@@ -470,6 +536,11 @@ _WHOLE_HISTORY_BY_DESIGN: dict[str, _Declaration] = {
         "tail-most user turn this run's",
         f"{_CLAIMS}::test_latest_user_message_is_this_runs_task_not_a_seeded_one",
     ),
+    "protocore/runtime/query_engine.py::QueryEngine._history_can_be_continued": _whole(
+        "decides whether a continuation has anything to answer: the tail turn, "
+        "plus whether a tool call on it is still unpaired — and the result "
+        "that would pair it may sit anywhere earlier in the transcript"
+    ),
     "protocore/runtime/query_engine.py::QueryEngine.snapshot": _whole(
         "serialises the whole transcript for durable resume"
     ),
@@ -499,10 +570,59 @@ _WHOLE_HISTORY_BY_DESIGN: dict[str, _Declaration] = {
         claim=_Claim.NOT_THE_TRANSCRIPT,
     ),
     # --- dynamic lookups whose attribute name this checker cannot read ------
-    "protocore/hooks/manager.py::HookManager.invoke": _Declaration(
+    "protocore/conformance/suite.py::ContractSuite.test_asynchronous_members_stay_asynchronous": _Declaration(
         reason=(
-            "getattr on the plugin-manager hook relay, keyed on the hook event "
-            "name; it reaches no engine and names no transcript"
+            "getattr over the member names a Protocol declares, on a host's "
+            "adapter; it reaches no engine and names no transcript"
+        ),
+        claim=_Claim.NOT_THE_TRANSCRIPT,
+    ),
+    "protocore/conformance/suite.py::ContractSuite.test_asynchronous_iterators_stay_asynchronous_iterators": _Declaration(
+        reason=(
+            "getattr over the member names a Protocol declares, on a host's "
+            "adapter; it reaches no engine and names no transcript"
+        ),
+        claim=_Claim.NOT_THE_TRANSCRIPT,
+    ),
+    "protocore/conformance/suite.py::ContractSuite.test_synchronous_members_stay_synchronous": _Declaration(
+        reason=(
+            "getattr over the member names a Protocol declares, on a host's "
+            "adapter; it reaches no engine and names no transcript"
+        ),
+        claim=_Claim.NOT_THE_TRANSCRIPT,
+    ),
+    "protocore/conformance/suite.py::ContractSuite.test_every_member_accepts_the_parameters_the_core_passes": _Declaration(
+        reason=(
+            "getattr over the member names a Protocol declares, on a host's "
+            "adapter; it reaches no engine and names no transcript"
+        ),
+        claim=_Claim.NOT_THE_TRANSCRIPT,
+    ),
+    "protocore/contracts/observability.py::RequestManifest.with_blob_refs": _Declaration(
+        reason=(
+            "getattr over the manifest's own value-slot names, to fill in "
+            "where a host stored each oversized body; it reaches no engine "
+            "and names no transcript"
+        ),
+        claim=_Claim.NOT_THE_TRANSCRIPT,
+    ),
+    "protocore/contracts/observability.py::_system_prompt_payload": _whole(
+        "reads the leading system messages off the outbound list of ONE "
+        "request, which its caller has already assembled; it reaches no "
+        "engine and selects nothing"
+    ),
+    "protocore/tests_support/adapters.py::InMemoryRequestManifestSink.body_of": _Declaration(
+        reason=(
+            "getattr over the manifest's own value-slot names, to fetch one "
+            "recorded body inline or out of the blob store; it reaches no "
+            "engine and names no transcript"
+        ),
+        claim=_Claim.NOT_THE_TRANSCRIPT,
+    ),
+    "protocore/conformance/test_conformance_package.py::_run_every_check": _Declaration(
+        reason=(
+            "getattr over the conformance suite's own check names, to run every "
+            "one against a subject; it reaches no engine and names no transcript"
         ),
         claim=_Claim.NOT_THE_TRANSCRIPT,
     ),
@@ -1291,13 +1411,11 @@ _SEED_KEY_DERIVED_ELSEWHERE: dict[str, str] = {
     "protocore/runtime/context/compaction.py::_session_history_seed_indices": (
         "compaction withholds the lossy Tier-2 collapse from seeded turns by INDEX into the list it is given"
     ),
-    "protocore/runtime/context/compaction.py::run_tier2_summarisation": (
-        "Tier-2 protects operator turns by INDEX into the list it is given, and a seeded prior-run "
-        "turn is not an operator turn of this run"
-    ),
     "protocore/runtime/context/compaction.py::_is_plain_operator_turn": (
-        "the Tier-3 fold classifies one message it is handed; a seeded prior-run turn is not an "
-        "operator turn to fold, and the caller works by INDEX into the whole list"
+        "classifies ONE message it is handed: a turn seeded from an earlier "
+        "run of the session is not an operator turn of this one, so neither "
+        "Tier 2 nor the fold may treat it as one. The callers work by INDEX "
+        "into the whole list, which a filtered copy cannot express"
     ),
     "protocore/runtime/context/session_memory.py::_tag_seeded": (
         "writes the tag; this is where the boundary comes from"

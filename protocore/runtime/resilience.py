@@ -61,7 +61,7 @@ from protocore.contracts.resilience import (
 )
 
 if TYPE_CHECKING:
-    from protocore.contracts.runtime_constants import RuntimeConstants
+    from protocore.contracts.runtime_constants import LoopConstants
 
 logger = logging.getLogger(__name__)
 
@@ -345,7 +345,7 @@ class TokenBucketRetryBudget:
     and mutates it under an INJECTED lock so the authority is
     process-local-per-pod (sufficient for non-amplification; A3) with NO
     module-level state — the caller owns the dict + lock lifetime (e.g.
-    a per-run helper bag guarded by the engine shared-state lock).
+    per-run state guarded by the run's shared-state lock).
 
     With budgeting OFF the caller simply never constructs/consults this —
     the transport loop is then bit-identical to a plain attempt-count loop.
@@ -510,7 +510,7 @@ class _PolicyParams:
     deadline_reserve_seconds: float
 
 
-def _resolve_policy_params(rc: RuntimeConstants | None) -> _PolicyParams:
+def _resolve_policy_params(rc: LoopConstants | None) -> _PolicyParams:
     if rc is None:
         return _PolicyParams(
             enabled=False,
@@ -546,7 +546,7 @@ class ResiliencePolicy:
     advisory backoff + finalization hint).
     """
 
-    def __init__(self, *, rc: RuntimeConstants | None = None) -> None:
+    def __init__(self, *, rc: LoopConstants | None = None) -> None:
         self._params = _resolve_policy_params(rc)
 
     @property
@@ -619,7 +619,7 @@ class ResiliencePolicy:
         # ENFORCE ``resilience_enabled``. The policy stores
         # the flag; ``decide()`` must honour it so the policy is safe as a
         # universal primitive: a caller that constructs
-        # ``ResiliencePolicy(rc=RuntimeConstants(resilience_enabled=False))``
+        # ``ResiliencePolicy(rc=LoopConstants(resilience_enabled=False))``
         # and passes ``max_attempts > 1`` must NOT retry. When disabled, every
         # non-structural class finalises on best evidence (no retry / no
         # compress / no shrink). Defensive even though the live routing
