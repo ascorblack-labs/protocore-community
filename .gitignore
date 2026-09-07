@@ -40,3 +40,8 @@ uv.lock
 # --- OS ---
 .DS_Store
 Thumbs.db
+
+# Repository rules for agents. Never committed: the file describes what must
+# not reach the public, so publishing it would publish the list.
+AGENTS.md
+CLAUDE.md
