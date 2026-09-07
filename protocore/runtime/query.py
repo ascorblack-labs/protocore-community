@@ -2426,6 +2426,7 @@ async def _run_compaction(
             "tokens_after": attempt.tokens_after,
             "tier1_freed": attempt.tier1.tokens_freed if attempt.tier1 else 0,
             "tier2_summarised": attempt.tier2.turns_summarised if attempt.tier2 else 0,
+            "tier3_folded": attempt.tier3.messages_folded if attempt.tier3 else 0,
             "blob_refs_created": (list(attempt.tier1.blob_refs_created) if attempt.tier1 else []),
         },
     )
@@ -4992,6 +4993,7 @@ async def _handle_context_window_exceeded(
             "tokens_after": attempt.tokens_after,
             "tier1_freed": attempt.tier1.tokens_freed if attempt.tier1 else 0,
             "tier2_summarised": attempt.tier2.turns_summarised if attempt.tier2 else 0,
+            "tier3_folded": attempt.tier3.messages_folded if attempt.tier3 else 0,
             "blob_refs_created": (list(attempt.tier1.blob_refs_created) if attempt.tier1 else []),
         },
     )

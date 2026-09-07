@@ -198,7 +198,11 @@ protocore (чистое ядро, ноль импортов вверх)
                                           │                 │  Tier 1: truncate/blob   │
                                           │                 │   big tool_results       │
                                           │                 │  Tier 2: summarise old   │
-                                          │                 │   turns → snapshot       │
+                                          │                 │   turns (never the       │
+                                          │                 │   operator's) → snapshot │
+                                          │                 │  Tier 3: fold runs of    │
+                                          │                 │   old summaries +        │
+                                          │                 │   old operator turns     │
                                           │                 │  COMPACTING→RUNNING      │
                                           │                 └──────────────────────────┘
    (3) UserPromptSubmit HOOK ────────────►│  _safe_hook_invoke → deny? → FAILED
@@ -319,7 +323,7 @@ protocore (чистое ядро, ноль импортов вверх)
 | IMemory subsystem | `contracts/memory.py`, `tools/memory.py` | `memory_enabled` = `False`; auto-recall is a host knob | Host-wired (tools held by core contract) | Yes |
 | Token counting | `runtime/token_counting.py` (+ опциональный оценщик `protocore-native`) | `chars_per_token_*` ratios in RC; `PROTOCORE_DISABLE_NATIVE` принудительно оставляет чисто-питоновый путь | Yes | Yes |
 | IWorkspace + read-dedup cache | `contracts/workspace.py`, кэш на стороне хоста | n/a (no snapshot toggle; the host owns the surface) | **No** (host-wired) | Yes |
-| Context management / two-tier compaction / session memory | `runtime/context/manager.py`, `runtime/context/compaction.py`, `runtime/context/budgets.py`, `runtime/context/session_memory.py`, `runtime/compact_checkpoint.py` | ratios in RC; `compaction_manual_enabled` = `False` | Compaction + `/compact`: Yes; session-memory fold: host-wired | Yes |
+| Context management / three-tier compaction / session memory | `runtime/context/manager.py`, `runtime/context/compaction.py`, `runtime/context/budgets.py`, `runtime/context/session_memory.py`, `runtime/compact_checkpoint.py` | ratios in RC; `compaction_manual_enabled` = `False` | Compaction + `/compact`: Yes; session-memory fold: host-wired | Yes |
 | Prompt caching | `runtime/prompt_caching.py` | wire translation gated by a host kill-switch | Yes (hints in core; wire translation the host) | Yes |
 | Skills routing / surfacing | `runtime/skill_index.py`, `contracts/skills.py` | data-driven (empty store = no block); `skills_hot_reload_enabled` = `False` | Yes (`_ensure_run_skill_catalog`); `list_files`/`load_file` host-only | Yes |
 | Шов жизненного цикла + injection / context_bootstrap | `contracts/middleware.py`, `hooks/manager.py`, `runtime/correctness_bind.py` | `typed_hooks_enabled` = `False`; режим отказа judge и context bootstrap — ручки хоста | Один шов, пять видов регистрации, один список координат (`HookEvent`); `decide`/`transform`/`around` падают закрыто, `observe`/`notify` изолированы | Да |
@@ -458,12 +462,55 @@ protocore (чистое ядро, ноль импортов вверх)
   действие с полной поверхностью.
 - `runtime/query.py::build_llm_request` — единственный сборщик, через который
   проходит каждый вызов провайдера: поток действий, plan-вызов глубокого
-  режима, его fallback на prompted-JSON и суммаризатор компакции Tier-2. Он
+  режима, его fallback на prompted-JSON и оба суммаризатора компакции. Он
   фиксирует три вещи, которые эти четыре пути раньше решали порознь: модель в
   силе (живое переопределение, когда оно задано), принудительный инструмент
   (один слот, `extra["forced_tool_choice"]`, несущий ИМЯ инструмента, чтобы
   адаптер отрисовал его в собственный формат провода) и температуру (указана в
   каждом запросе).
+- `runtime/context/compaction.py` — три прохода по транскрипту, по порядку,
+  каждый берёт то, что не смог взять предыдущий.
+  **Tier 1** заменяет вышедший за бюджет результат инструмента плейсхолдером,
+  а байты кладёт в blob-хранилище; содержимое восстановимо, а превью говорит,
+  что именно было сброшено. **Tier 2** суммаризует старые ходы через
+  compaction-LLM — по одному атомарному юниту: ассистентский ход `tool_use` и
+  отвечающие ему результаты стоят или падают вместе, чтобы ни одна пара не
+  осталась без половины. Ход, написанный оператором, не суммаризуется никогда:
+  инструкция коротка, поэтому её пересказ почти ничего не освобождает, и она
+  конкретна, поэтому пересказ — это переписывание: «убери поле model-name из
+  заголовка» превращается в «пользователь просил правки», и дальше прогон
+  действует уже по этому. **Tier 3** сворачивает то, что оставил Tier 2: за
+  длинную сессию по одному саммари на пакет инструментов плюс каждое
+  сообщение оператора становятся всем окном, и ни один нижний проход не может
+  снять с них ни байта. Каждый непрерывный отрезок таких сообщений длиной не
+  меньше `compaction_fold_min_messages` и весом не меньше
+  `compaction_fold_min_tokens` становится одним сводным саммари, в котором
+  инструкции оператора сохраняются точными цитатами; ход-задача и
+  `compaction_fold_keep_operator_turns` последних инструкций остаются
+  дословно, а seed-ход прошлого прогона не сворачивается никогда (свёртка
+  сняла бы тег, который и разделяет прогоны). Свёртка — такое же саммари, как
+  любое другое, поэтому более поздняя свёртка поглотит её, когда её
+  окрестность снова разрастётся.
+
+  Оба суммаризатора собирают запрос через `build_llm_request`, пишут его в
+  манифест запросов и получают два одинаковых правила, от которых зависит
+  ценность саммари: сохранять каждый идентификатор — пути, id, порты, URL,
+  числа, коды ошибок — дословно, а не подставлять правдоподобное значение, и
+  называть исход, за которым нет результата инструмента или подтверждения,
+  НЕИЗВЕСТНЫМ, а не выполненным или невыполненным. Обе инструкции — шаблоны
+  (`compaction_turn_summary`, `compaction_fold_summary`), а не литералы, так
+  что оператору, работающему на другом языке, есть куда положить перевод.
+
+  Стоимость одного прохода ограничена по всем осям: юнит меньше
+  `compaction_summary_min_unit_tokens` не отправляется вовсе (суммаризатор
+  пишет две-три фразы независимо от входа, поэтому ниже некоторого размера
+  вызов тратится на то, чтобы узнать, что саммари не меньше оригинала),
+  словарный бюджет в промпте масштабируется от размера юнита, а не задан
+  фиксированным числом предложений, вызовы уходят по
+  `compaction_summariser_parallelism` за раз, а не цепочкой, пока прогон
+  стоит в `COMPACTING`, и свёртка берёт не больше
+  `compaction_fold_max_spans_per_pass` отрезков за проход. Саммари, которое
+  вернулось не меньше заменяемого, отбрасывается, а не фиксируется.
 - `runtime/loop_state.py` — `LoopState` — это чистая машина из 7 состояний:
   `PENDING → RUNNING → {AWAITING | COMPACTING} → {COMPLETED | FAILED |
   CANCELLED}`. `assert_transition()` обеспечивает таблицу легальных рёбер;

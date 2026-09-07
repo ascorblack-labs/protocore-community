@@ -304,6 +304,11 @@ class Scenario:
     #: The provider the engine was constructed on — the scripted double above
     #: unless the scenario supplied its own. ``requests`` reads this one.
     provider: Any = None
+    #: The provider the summariser talks to, when the scenario wired a separate
+    #: one. A host may point compaction at a cheaper model than the run's, and
+    #: a scenario that does the same can count summariser calls without
+    #: separating them from the turn's own by inspection.
+    summariser: Any = None
     events: list[TurnEvent] = field(default_factory=list)
 
     # -- driving the run, only through public entry points -------------------
@@ -449,6 +454,7 @@ def scenario() -> ScenarioFactory:
         session_id: str = "sess-scenario",
         tenant_id: str = "tenant-scenario",
         llm_provider: ILLMProvider | None = None,
+        compaction_provider: ILLMProvider | None = None,
         provider_chain: Any | None = None,
         background_pool: Any | None = None,
         lifecycle_hooks: Any | None = None,
@@ -476,6 +482,7 @@ def scenario() -> ScenarioFactory:
                 **config_overrides,
             ),
             llm_provider=llm_provider or llm,
+            compaction_provider=compaction_provider,
             tool_registry=registry,
             event_stream=event_stream or InMemoryEventStream(),
             hook_manager=hooks,
@@ -497,6 +504,7 @@ def scenario() -> ScenarioFactory:
             hooks=hooks,
             blobs=blobs,
             provider=llm_provider,
+            summariser=compaction_provider,
         )
 
     return build

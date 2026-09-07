@@ -470,13 +470,15 @@ async def test_a_run_that_compacted_records_the_summariser_call_and_replays() ->
     summary = "the old turns, summarised"
 
     def _seeded(engine: QueryEngine) -> QueryEngine:
-        for index in range(2):
-            engine.history.append(
-                Message(
-                    role=MessageRole.user,
-                    content_blocks=[TextBlock(text=f"question {index} " + "y" * 1_500)],
-                )
+        # One question and three answers: an operator turn is never summarised,
+        # so the eligible units are the assistant turns.
+        engine.history.append(
+            Message(
+                role=MessageRole.user,
+                content_blocks=[TextBlock(text="question " + "y" * 1_500)],
             )
+        )
+        for index in range(3):
             engine.history.append(
                 Message(
                     role=MessageRole.assistant,

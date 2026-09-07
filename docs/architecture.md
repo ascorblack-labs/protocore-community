@@ -213,7 +213,11 @@ the emitted `TurnEvent`s out over SSE (Redis pub/sub at the host layer).
                                           │                 │  Tier 1: truncate/blob   │
                                           │                 │   big tool_results       │
                                           │                 │  Tier 2: summarise old   │
-                                          │                 │   turns → snapshot       │
+                                          │                 │   turns (never the       │
+                                          │                 │   operator's) → snapshot │
+                                          │                 │  Tier 3: fold runs of    │
+                                          │                 │   old summaries +        │
+                                          │                 │   old operator turns     │
                                           │                 │  COMPACTING→RUNNING      │
                                           │                 └──────────────────────────┘
    (3) UserPromptSubmit HOOK ────────────►│  _safe_hook_invoke → deny? → FAILED
@@ -335,7 +339,7 @@ governing `LoopConstants` field(s) and their safe/off default.
 | IMemory subsystem | `contracts/memory.py`, `tools/memory.py` | `memory_enabled` = `False`; auto-recall is a host knob | Host-wired (tools held by core contract) | Yes |
 | Token counting | `runtime/token_counting.py` (+ the optional `protocore-native` estimator) | `chars_per_token_*` ratios in RC; `PROTOCORE_DISABLE_NATIVE` forces the pure-Python path | Yes | Yes |
 | IWorkspace + read-dedup cache | `contracts/workspace.py`, host-owned cache | n/a (no snapshot toggle; the host owns the surface) | **No** (host-wired) | Yes |
-| Context management / two-tier compaction / session memory | `runtime/context/manager.py`, `runtime/context/compaction.py`, `runtime/context/budgets.py`, `runtime/context/session_memory.py`, `runtime/compact_checkpoint.py` | ratios in RC; `compaction_manual_enabled` = `False` | Compaction + `/compact`: Yes; session-memory fold: host-wired | Yes |
+| Context management / three-tier compaction / session memory | `runtime/context/manager.py`, `runtime/context/compaction.py`, `runtime/context/budgets.py`, `runtime/context/session_memory.py`, `runtime/compact_checkpoint.py` | ratios in RC; `compaction_manual_enabled` = `False` | Compaction + `/compact`: Yes; session-memory fold: host-wired | Yes |
 | Prompt caching | `runtime/prompt_caching.py` | wire translation gated by a host kill-switch | Yes (hints in core; wire translation the host) | Yes |
 | Skills routing / surfacing | `runtime/skill_index.py`, `contracts/skills.py` | data-driven (empty store = no block); `skills_hot_reload_enabled` = `False` | Yes (`_ensure_run_skill_catalog`); `list_files`/`load_file` host-only | Yes |
 | The lifecycle seam + injection / context_bootstrap | `contracts/middleware.py`, `hooks/manager.py`, `runtime/correctness_bind.py` | `typed_hooks_enabled` = `False`; judge failure mode and context bootstrap are host knobs | One seam, five registration kinds, one coordinate list (`HookEvent`); `decide`/`transform`/`around` fail closed, `observe`/`notify` are isolated | Yes |
@@ -356,7 +360,7 @@ capabilities.
 
 The tour below is the deep reference for the inventory rows that need more
 than a row. Rows it does not expand — retrieval, the precondition DAG, the
-resilience wrapper, the attempt ledger, memory, workspace, two-tier
+resilience wrapper, the attempt ledger, memory, workspace, three-tier
 compaction, token counting and prompt caching — behave as the files the table
 names, and repeating them here is how a second description comes to disagree
 with the first.
@@ -472,11 +476,51 @@ crashes. The shared assistant loop is **not** a single immutable path:
   action with the full surface.
 - `runtime/query.py::build_llm_request` — the one assembler every provider
   call passes through: the action stream, the deep loop's plan call, its
-  prompted-JSON fallback and the Tier-2 compaction summariser. It fixes the
+  prompted-JSON fallback and both compaction summarisers. It fixes the
   three things those four used to settle separately — the model in force (the
   live override when one is set), the forced tool (one slot,
   `extra["forced_tool_choice"]`, carrying the tool NAME for an adapter to
   render onto its own wire) and the temperature (stated on every request).
+- `runtime/context/compaction.py` — three passes over the transcript, in
+  order, each one taking what the pass before it could not.
+  **Tier 1** replaces an over-budget tool result with a placeholder and puts
+  the bytes in the blob store; the content is recoverable and the preview says
+  what was shed. **Tier 2** summarises old turns through the compaction LLM —
+  one atomic unit at a time, an assistant `tool_use` turn and the results
+  answering it standing or falling together so no pair is orphaned. It never
+  summarises a turn the operator wrote: an instruction is short, so
+  paraphrasing it frees almost nothing, and it is specific, so the paraphrase
+  is a rewrite — "remove the model-name field from the header" becomes "the
+  user asked for changes" and the run acts on that instead. **Tier 3** folds
+  what Tier 2 leaves: over a long session, one summary per tool batch plus
+  every operator message become the whole window, and neither pass below can
+  take a byte off them. Each contiguous run of such messages that is at least
+  `compaction_fold_min_messages` long and `compaction_fold_min_tokens` big
+  becomes one consolidated summary in which the operator's instructions
+  survive as exact quotes; the task turn and the
+  `compaction_fold_keep_operator_turns` most recent instructions stay
+  verbatim, and a seeded prior-run turn is never folded (the fold would drop
+  the tag that separates the runs). A fold is a summary like any other, so a
+  later fold absorbs it once its neighbourhood has grown again.
+
+  Both summarisers assemble their request through `build_llm_request`, record
+  it to the request manifest, and are told the same two rules the wording of a
+  summary lives or dies by: keep every identifier — paths, ids, ports, URLs,
+  numbers, error codes — verbatim rather than substituting a plausible value,
+  and state an outcome with no tool result or confirmation behind it as
+  UNKNOWN rather than as done or not done. Both instructions are templates
+  (`compaction_turn_summary`, `compaction_fold_summary`), not literals, so an
+  operator serving another language has somewhere to put the translation.
+
+  What a pass is allowed to cost is bounded on every axis: a unit below
+  `compaction_summary_min_unit_tokens` is not sent at all (a summariser writes
+  a sentence or three whatever it is handed, so below some size the call is
+  spent to discover the summary is no smaller), the word budget in the prompt
+  scales with the unit rather than being a fixed sentence count, calls go out
+  `compaction_summariser_parallelism` at a time instead of one after another
+  while the run sits in `COMPACTING`, and the fold takes at most
+  `compaction_fold_max_spans_per_pass` runs per pass. A summary that comes
+  back no smaller than what it would replace is discarded, never committed.
 - `runtime/loop_state.py` — `LoopState` is a pure 7-state machine:
   `PENDING → RUNNING → {AWAITING | COMPACTING} → {COMPLETED | FAILED |
   CANCELLED}`. `assert_transition()` enforces the legal-edge table;

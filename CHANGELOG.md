@@ -6,6 +6,49 @@ All notable changes to this project are recorded here. The format follows
 
 ## [Unreleased]
 
+### Added
+
+- **A third compaction pass, for what the first two cannot touch.** Tier 2
+  leaves one summary per tool batch and never re-summarises one, and it now
+  refuses operator turns outright, so a long session ends up with a window made
+  almost entirely of small summaries and instructions that no pass can shrink.
+  The fold replaces each contiguous run of them with a single consolidated
+  summary in which the operator's instructions survive as exact quotes. The
+  task turn and the most recent instructions stay verbatim, a turn seeded from
+  an earlier run of the session is never folded, and a fold is a summary like
+  any other — a later fold absorbs it once its neighbourhood has grown again.
+  `compaction_fold_enabled`, `compaction_fold_min_messages`,
+  `compaction_fold_min_tokens`, `compaction_fold_keep_operator_turns`,
+  `compaction_fold_max_spans_per_pass`, `compaction_fold_max_output_tokens` and
+  `compaction_fold_summary_target_words` govern it; the completion event
+  carries `tier3_folded` beside the counts the other tiers report.
+- **The summariser instructions are templates.** `compaction_turn_summary` and
+  `compaction_fold_summary` join the bundled registry, so the wording is
+  reviewable as prose and an operator serving another language has somewhere to
+  put the translation.
+
+### Changed
+
+- **Compaction summaries keep exact identifiers.** The summariser is told to
+  carry every path, id, port, URL, number and error code through verbatim
+  rather than substituting a plausible value, and to state an outcome with no
+  tool result or confirmation behind it as UNKNOWN rather than as done or not
+  done. A summary that quietly rounds an identifier is worse than no summary,
+  because the run reads it back as fact.
+- **An operator turn is never summarised.** An instruction is short enough that
+  paraphrasing it frees almost nothing and specific enough that the paraphrase
+  is a rewrite. Tier 3 is where those turns are condensed, with their wording
+  quoted rather than restated.
+- **A compaction pass no longer crawls.** Summariser calls go out
+  `compaction_summariser_parallelism` at a time instead of one after another
+  while the run sits in `COMPACTING`; a unit below
+  `compaction_summary_min_unit_tokens` is not sent at all, since a summariser
+  writes a sentence or three whatever it is handed and below some size the call
+  is spent only to discover the summary is no smaller; and the word budget in
+  the prompt scales with the unit being replaced rather than being a fixed
+  sentence count. A reply that carries no usable summary is logged with its
+  head, so the next one can be diagnosed rather than guessed at.
+
 ## [2.0.0a4]
 
 This release is the result of a long pass over the core with one question in

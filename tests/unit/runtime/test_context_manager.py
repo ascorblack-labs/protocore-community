@@ -5,6 +5,7 @@ import pytest
 
 from protocore.contracts.runtime_constants import LoopConstants
 from protocore.contracts.types import (
+    COMPACTION_SUMMARY_METADATA_KEY,
     ImageRefBlock,
     Message,
     MessageRole,
@@ -13,7 +14,7 @@ from protocore.contracts.types import (
     ToolResultBlock,
     ToolUseBlock,
 )
-from protocore.runtime.context.compaction import estimate_history_tokens
+from protocore.runtime.context.compaction import CompactionState, estimate_history_tokens
 from protocore.runtime.context.manager import (
     ContextManager,
     detect_active_language,
@@ -382,3 +383,162 @@ def test_pin_tool_empty_name_is_noop() -> None:
     mgr = _new_manager(cap=3)
     assert mgr.pin_tool("") is None
     assert mgr.pinned_tool_names() == ()
+
+
+# ---------------------------------------------------------------------------
+# The fold, as the manager runs it
+# ---------------------------------------------------------------------------
+
+
+def _foldable_history() -> list[Message]:
+    """A window that Tier 1 and Tier 2 can no longer take a byte off.
+
+    Old summaries and operator turns, which is what a long session's window
+    becomes: Tier 1 has no tool result to shed and Tier 2 refuses both kinds.
+    """
+    history: list[Message] = [
+        Message(role=MessageRole.user, content_blocks=[TextBlock(text="the task")]),
+    ]
+    for index in range(10):
+        history.append(
+            Message(
+                role=MessageRole.user,
+                content_blocks=[
+                    TextBlock(text=f"<compacted-turn id='k{index}'>summary {index} " + "w " * 60 + "</compacted-turn>")
+                ],
+                metadata={COMPACTION_SUMMARY_METADATA_KEY: True},
+            )
+        )
+    history.append(Message(role=MessageRole.assistant, content_blocks=[TextBlock(text="tail")]))
+    history.append(Message(role=MessageRole.user, content_blocks=[TextBlock(text="recent")]))
+    return history
+
+
+def _folding_manager(llm: InMemoryLLMProvider) -> ContextManager:
+    return ContextManager(
+        rc=LoopConstants(
+            model_context_window=1_024,
+            compaction_keep_recent_turns=2,
+            compaction_fold_min_messages=4,
+            compaction_fold_min_tokens=0,
+            compaction_fold_keep_operator_turns=0,
+        ),
+        blob_store=InMemoryBlobStore(),
+        compaction_llm=llm,
+    )
+
+
+@pytest.mark.asyncio
+async def test_run_compaction_folds_what_the_first_two_tiers_cannot_touch() -> None:
+    llm = InMemoryLLMProvider()
+    for _ in range(4):
+        llm.queue_response(text='{"summary": "ten steps, done"}')
+    history = _foldable_history()
+
+    attempt = await _folding_manager(llm).run_compaction(
+        history=history,
+        compaction_state=CompactionState(),
+        tenant_id="t1",
+        model_name="mock",
+    )
+
+    assert attempt.tier3 is not None
+    assert attempt.tier3.spans_folded == 1
+    assert attempt.tokens_after < attempt.tokens_before
+    assert len(history) < 13
+
+
+@pytest.mark.asyncio
+async def test_force_compaction_folds_too() -> None:
+    llm = InMemoryLLMProvider()
+    for _ in range(4):
+        llm.queue_response(text='{"summary": "ten steps, done"}')
+    history = _foldable_history()
+
+    attempt = await _folding_manager(llm).force_compaction(
+        history=history,
+        compaction_state=CompactionState(),
+        tenant_id="t1",
+        model_name="mock",
+    )
+
+    assert attempt.tier3 is not None
+    assert attempt.tier3.spans_folded == 1
+
+
+@pytest.mark.asyncio
+async def test_a_fold_that_raises_does_not_abort_the_pass(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The fold shrinks a long window; it is not what makes a request fit.
+
+    Tier 1 and Tier 2 have already freed what they could by the time it runs,
+    so a fold that fails outright costs the pass nothing that was not already
+    banked — and an exception escaping here would throw that away.
+    """
+
+    async def _explode(**_: object) -> None:
+        raise MemoryError("the fold could not be built")
+
+    monkeypatch.setattr("protocore.runtime.context.manager.run_tier3_fold", _explode)
+    llm = InMemoryLLMProvider()
+    for _ in range(4):
+        llm.queue_response(text='{"summary": "folded"}')
+
+    attempt = await _folding_manager(llm).run_compaction(
+        history=_foldable_history(),
+        compaction_state=CompactionState(),
+        tenant_id="t1",
+        model_name="mock",
+    )
+
+    assert attempt.tier3 is None
+
+
+@pytest.mark.asyncio
+async def test_a_summariser_failure_inside_the_fold_folds_nothing(
+) -> None:
+    """A provider that refuses every span leaves the window as it was."""
+
+    class _Exploding(InMemoryLLMProvider):
+        async def complete_structured(self, request, response_schema):  # type: ignore[no-untyped-def]
+            raise RuntimeError("provider down")
+
+    history = _foldable_history()
+    attempt = await _folding_manager(_Exploding()).run_compaction(
+        history=history,
+        compaction_state=CompactionState(),
+        tenant_id="t1",
+        model_name="mock",
+    )
+
+    assert attempt.tier3 is not None
+    assert attempt.tier3.spans_folded == 0
+    assert len(history) == 13
+
+
+@pytest.mark.asyncio
+async def test_the_fold_switch_stops_it_before_the_tier_is_entered() -> None:
+    llm = InMemoryLLMProvider()
+    for _ in range(4):
+        llm.queue_response(text='{"summary": "folded"}')
+    mgr = ContextManager(
+        rc=LoopConstants(
+            model_context_window=1_024,
+            compaction_keep_recent_turns=2,
+            compaction_fold_enabled=False,
+            compaction_fold_min_messages=4,
+            compaction_fold_min_tokens=0,
+        ),
+        blob_store=InMemoryBlobStore(),
+        compaction_llm=llm,
+    )
+
+    attempt = await mgr.run_compaction(
+        history=_foldable_history(),
+        compaction_state=CompactionState(),
+        tenant_id="t1",
+        model_name="mock",
+    )
+
+    assert attempt.tier3 is None

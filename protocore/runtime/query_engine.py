@@ -1351,6 +1351,7 @@ class QueryEngine:
             rc=config.rc,
             blob_store=blob_store,
             compaction_llm=self.compaction_llm,
+            prompts=self.prompt_provider,
         )
 
     # ------------------------------------------------------------------

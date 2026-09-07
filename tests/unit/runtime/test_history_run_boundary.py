@@ -410,6 +410,31 @@ _WHOLE_HISTORY_BY_DESIGN: dict[str, _Declaration] = {
     "protocore/runtime/context/compaction.py::run_tier2_summarisation": _whole(
         "collapses turns anywhere in the transcript to fit the context window"
     ),
+    "protocore/runtime/context/compaction.py::_summarise_unit": _whole(
+        "summarises one unit of the whole transcript Tier-2 was handed"
+    ),
+    "protocore/runtime/context/compaction.py::_operator_turn_indices": _whole(
+        "the operator's turns are positions in the whole transcript; a "
+        "filtered copy has no indices into the original"
+    ),
+    "protocore/runtime/context/compaction.py::_foldable_indices": _whole(
+        "decides which positions anywhere in the transcript the fold may take"
+    ),
+    "protocore/runtime/context/compaction.py::_fold_spans": _whole(
+        "finds runs of old summaries and operator turns anywhere in the transcript"
+    ),
+    "protocore/runtime/context/compaction.py::_fold_span": _whole(
+        "folds one span of the whole transcript Tier-3 was handed"
+    ),
+    "protocore/runtime/context/compaction.py::_fold_anchor_key": _whole(
+        "derives one durable id from the span it is handed; it asks nothing about whose run it is"
+    ),
+    "protocore/runtime/context/compaction.py::run_tier3_fold": _whole(
+        "folds runs of old summaries and operator turns anywhere in the transcript"
+    ),
+    "protocore/runtime/context/manager.py::ContextManager._fold": _whole(
+        "hands the whole transcript to the Tier-3 fold after Tier-2"
+    ),
     # --- building the seed, from messages the caller supplies ---------------
     "protocore/runtime/context/session_memory.py::_serialize_turns": _whole(
         "renders the turns it is handed; it reaches no engine"
@@ -1385,6 +1410,12 @@ _SEED_KEY_DERIVED_ELSEWHERE: dict[str, str] = {
     ),
     "protocore/runtime/context/compaction.py::_session_history_seed_indices": (
         "compaction withholds the lossy Tier-2 collapse from seeded turns by INDEX into the list it is given"
+    ),
+    "protocore/runtime/context/compaction.py::_is_plain_operator_turn": (
+        "classifies ONE message it is handed: a turn seeded from an earlier "
+        "run of the session is not an operator turn of this one, so neither "
+        "Tier 2 nor the fold may treat it as one. The callers work by INDEX "
+        "into the whole list, which a filtered copy cannot express"
     ),
     "protocore/runtime/context/session_memory.py::_tag_seeded": (
         "writes the tag; this is where the boundary comes from"

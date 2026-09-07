@@ -357,6 +357,100 @@ class LoopConstants(BaseModel):
             "summarised (kill-switch)."
         ),
     )
+    compaction_summariser_parallelism: int = Field(
+        default=4,
+        ge=1,
+        le=16,
+        description=(
+            "How many summariser calls one compaction pass issues at a time. "
+            "A pass over a long history is otherwise a chain of sequential "
+            "calls, each of them seconds long, while the run sits in "
+            "COMPACTING and produces nothing. The cap is what keeps that "
+            "chain from becoming an unbounded fan-out at the provider."
+        ),
+    )
+    compaction_summary_min_unit_tokens: int = Field(
+        default=0,
+        ge=0,
+        description=(
+            "A unit estimated below this many tokens is not sent to the "
+            "summariser at all. A summariser writes a sentence or three "
+            "whatever it is given, so a small unit comes back no smaller and "
+            "the call bought nothing; the net-gain guard discards such a "
+            "summary, but only after paying for it. 0 leaves the floor at the "
+            "empty-wrapper size, which is the smallest it can ever be."
+        ),
+    )
+    compaction_summary_min_words: int = Field(
+        default=25,
+        ge=1,
+        description=(
+            "Floor on the word budget handed to the per-turn summariser. The "
+            "budget is derived from the size of the unit being replaced, and "
+            "a small unit would otherwise be given a budget too small to hold "
+            "the identifiers the summary must keep verbatim."
+        ),
+    )
+    compaction_summary_tokens_per_word: int = Field(
+        default=6,
+        ge=1,
+        description=(
+            "Tokens of the original a summary may spend one word on: the word "
+            "budget in the summariser prompt is the unit's estimated size "
+            "divided by this. Room to keep identifiers, not enough to restate "
+            "the turn."
+        ),
+    )
+    compaction_fold_enabled: bool = Field(
+        default=True,
+        description=(
+            "When true (default), a third pass folds runs of old compaction "
+            "summaries and old operator turns into one consolidated summary. "
+            "Tier-2 leaves one summary per tool batch and never re-summarises "
+            "one, and it never summarises an operator turn at all, so a long "
+            "session accumulates hundreds of small summaries and every "
+            "message the operator ever sent until the window is full of them. "
+            "The fold keeps the first user turn (the task) and the most recent "
+            "operator turns verbatim; older operator instructions survive "
+            "inside the fold as exact quotes. Set false to leave those "
+            "messages alone (kill-switch)."
+        ),
+    )
+    compaction_fold_min_messages: int = Field(
+        default=8,
+        ge=2,
+        description=(
+            "A contiguous run of foldable messages (old summaries and old "
+            "operator turns) shorter than this is left alone: folding a "
+            "handful of summaries costs a summariser call and frees little."
+        ),
+    )
+    compaction_fold_min_tokens: int = Field(
+        default=1_500,
+        ge=0,
+        description=(
+            "A foldable run estimated below this many tokens is left alone, so "
+            "an already-folded span is not folded again and again for nothing."
+        ),
+    )
+    compaction_fold_keep_operator_turns: int = Field(
+        default=4,
+        ge=0,
+        description=(
+            "How many of the most recent operator turns are never folded, on "
+            "top of the protected first user turn: the live instructions the "
+            "model is acting on stay verbatim."
+        ),
+    )
+    compaction_fold_max_spans_per_pass: int = Field(
+        default=2,
+        ge=1,
+        description=(
+            "How many runs the fold consolidates in one pass. The rest wait "
+            "for the next pass, which is what keeps a single COMPACTING pause "
+            "short on a history with many foldable runs."
+        ),
+    )
     compaction_placeholder_preview_chars: int = Field(
         default=240,
         ge=0,
@@ -667,6 +761,26 @@ class LoopConstants(BaseModel):
         description=(
             "JSON-schema ``maxLength`` cap on the summary string field. "
             "Surfaced to XGrammar — enforces output bound at decode time."
+        ),
+    )
+    compaction_fold_max_output_tokens: int = Field(
+        default=3_000,
+        gt=0,
+        description=(
+            "Hard cap on the compaction-LLM's output for one fold summary. "
+            "Larger than the per-turn cap because a fold summary stands for "
+            "many turns at once; a fold that runs out of budget comes back "
+            "truncated and is discarded, so the pass paid for nothing."
+        ),
+    )
+    compaction_fold_summary_target_words: int = Field(
+        default=500,
+        ge=1,
+        description=(
+            "The word target stated in the fold prompt. It is what makes the "
+            "summariser merge repeated checks into one line and keep only the "
+            "last known state of each thing, rather than writing until the "
+            "output cap stops it mid-sentence."
         ),
     )
 

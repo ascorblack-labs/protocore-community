@@ -1,6 +1,7 @@
 """Tests for :mod:`protocore.runtime.context.compaction`."""
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import json
 
@@ -9,6 +10,8 @@ import pytest
 from protocore.contracts.llm import LLMObservabilityContext
 from protocore.contracts.runtime_constants import LoopConstants
 from protocore.contracts.types import (
+    COMPACTION_SUMMARY_METADATA_KEY,
+    SESSION_HISTORY_SEED_METADATA_KEY,
     ImageRefBlock,
     Message,
     MessageRole,
@@ -18,15 +21,18 @@ from protocore.contracts.types import (
     ToolUseBlock,
 )
 from protocore.runtime.context.compaction import (
+    COMPACTION_FOLD_METADATA_KEY,
     CompactionState,
     Tier1Result,
     Tier2Result,
     _message_text_for_estimation,
     _strip_injection_patterns,
+    _summary_from_response,
     build_summary_schema,
     estimate_message_tokens,
     run_tier1_truncation,
     run_tier2_summarisation,
+    run_tier3_fold,
 )
 from protocore.runtime.wire_format import (
     is_compacted_placeholder,
@@ -241,8 +247,9 @@ async def test_tier2_summarisation_propagates_observability_context() -> None:
     history = [
         # Above the empty-wrapper floor so the unit is summarised (and thus a
         # summariser call is issued) — the assertion below is on the propagated
-        # observability context of that call.
-        Message(role=MessageRole.user, content_blocks=[TextBlock(text="old turn " * 20)]),
+        # observability context of that call. Assistant-role because an
+        # operator turn is never summarised.
+        Message(role=MessageRole.assistant, content_blocks=[TextBlock(text="old turn " * 20)]),
         Message(role=MessageRole.user, content_blocks=[TextBlock(text="recent")]),
     ]
     await run_tier2_summarisation(
@@ -691,6 +698,9 @@ async def test_tier2_bounded_by_free_target_tokens() -> None:
         model_context_window=4_096,
         compaction_keep_recent_turns=1,
         compaction_protect_first_user_turn=False,
+        # One call at a time, so "stopped early" is a statement about the
+        # number of calls rather than about where a batch boundary fell.
+        compaction_summariser_parallelism=1,
     )
     llm = InMemoryLLMProvider()
     for _ in range(20):
@@ -698,7 +708,7 @@ async def test_tier2_bounded_by_free_target_tokens() -> None:
 
     # 10 large eligible turns (each well above the wrapper floor) + recent.
     history = [
-        Message(role=MessageRole.user, content_blocks=[TextBlock(text="word " * 200)])
+        Message(role=MessageRole.assistant, content_blocks=[TextBlock(text="word " * 200)])
         for _ in range(10)
     ]
     history.append(
@@ -758,7 +768,7 @@ async def test_tier2_extracts_summary_from_json_envelope() -> None:
     llm.queue_response(text=envelope)
 
     history = [
-        Message(role=MessageRole.user, content_blocks=[TextBlock(text="old turn " * 20)]),
+        Message(role=MessageRole.assistant, content_blocks=[TextBlock(text="old turn " * 20)]),
         Message(role=MessageRole.user, content_blocks=[TextBlock(text="recent")]),
     ]
     state = CompactionState()
@@ -1094,3 +1104,383 @@ async def test_tier1_states_no_digest_for_a_reference_it_did_not_mint() -> None:
     ref, _variant = parsed
     assert ref.blob_ref == "t1/elsewhere"
     assert ref.sha256 == ""
+
+
+# ---------------------------------------------------------------------------
+# Tier 2 — what it now refuses to summarise, and what it asks for
+# ---------------------------------------------------------------------------
+
+
+def _operator(text: str) -> Message:
+    """A turn as a person sends one: user role, prose, no tool result."""
+    return Message(role=MessageRole.user, content_blocks=[TextBlock(text=text)])
+
+
+def _assistant(text: str) -> Message:
+    return Message(role=MessageRole.assistant, content_blocks=[TextBlock(text=text)])
+
+
+def _summary_message(text: str, key: str) -> Message:
+    return Message(
+        role=MessageRole.user,
+        content_blocks=[TextBlock(text=f"<compacted-turn id='{key}'>{text}</compacted-turn>")],
+        metadata={COMPACTION_SUMMARY_METADATA_KEY: True},
+    )
+
+
+@pytest.mark.asyncio
+async def test_tier2_never_summarises_an_operator_turn() -> None:
+    """An instruction is short and specific; a paraphrase of it is a rewrite.
+
+    The turn is large enough that every other rule would summarise it, so
+    what keeps it verbatim can only be the operator-turn protection.
+    """
+    rc = LoopConstants(
+        model_context_window=4_096,
+        compaction_keep_recent_turns=1,
+        compaction_protect_first_user_turn=False,
+    )
+    llm = InMemoryLLMProvider()
+    llm.queue_response(text="paraphrased instruction")
+    instruction = "remove the model-name field from the header " * 20
+    history = [_operator(instruction), _assistant("recent")]
+
+    result = await run_tier2_summarisation(
+        history=history,
+        compaction_llm=llm,
+        state=CompactionState(),
+        rc=rc,
+        model_name="mock",
+    )
+
+    assert result.turns_summarised == 0
+    assert llm.calls == ()
+    assert history[0].text == instruction
+
+
+@pytest.mark.asyncio
+async def test_tier2_leaves_a_unit_below_the_operator_minimum_uncalled() -> None:
+    """Below the floor the call is spent to discover the summary is no smaller."""
+    rc = LoopConstants(
+        model_context_window=4_096,
+        compaction_keep_recent_turns=1,
+        compaction_summary_min_unit_tokens=10_000,
+    )
+    llm = InMemoryLLMProvider()
+    llm.queue_response(text="a summary nobody asked for")
+    history = [_assistant("old turn " * 50), _operator("recent")]
+
+    result = await run_tier2_summarisation(
+        history=history,
+        compaction_llm=llm,
+        state=CompactionState(),
+        rc=rc,
+        model_name="mock",
+    )
+
+    assert result.turns_summarised == 0
+    assert llm.calls == ()
+
+
+@pytest.mark.asyncio
+async def test_the_summariser_is_asked_for_a_word_budget_that_follows_the_unit() -> None:
+    """A fixed sentence count asks for the same output whatever it is handed."""
+    rc = LoopConstants(model_context_window=32_768, compaction_keep_recent_turns=1)
+    llm = InMemoryLLMProvider()
+    llm.queue_response(text="summary")
+    unit = _assistant("word " * 600)
+    history = [unit, _operator("recent")]
+    before = estimate_message_tokens(unit, rc)
+
+    await run_tier2_summarisation(
+        history=history,
+        compaction_llm=llm,
+        state=CompactionState(),
+        rc=rc,
+        model_name="mock",
+    )
+
+    expected = max(rc.compaction_summary_min_words, before // rc.compaction_summary_tokens_per_word)
+    assert f"at most {expected} words" in llm.calls[0].messages[0].text
+
+
+@pytest.mark.asyncio
+async def test_summariser_calls_go_out_in_batches_of_the_configured_width() -> None:
+    """The pass is a chain of seconds-long calls otherwise, with the run parked."""
+    rc = LoopConstants(
+        model_context_window=32_768,
+        compaction_keep_recent_turns=1,
+        compaction_protect_first_user_turn=False,
+        compaction_summariser_parallelism=3,
+    )
+    in_flight = 0
+    peak = 0
+
+    class _CountingProvider(InMemoryLLMProvider):
+        async def complete_structured(self, request, response_schema):  # type: ignore[no-untyped-def]
+            nonlocal in_flight, peak
+            in_flight += 1
+            peak = max(peak, in_flight)
+            try:
+                await asyncio.sleep(0)
+                return await super().complete_structured(request, response_schema)
+            finally:
+                in_flight -= 1
+
+    llm = _CountingProvider()
+    for index in range(9):
+        llm.queue_response(text=f"summary {index}")
+    history = [_assistant(f"turn {index} " + "word " * 200) for index in range(9)]
+    history.append(_operator("recent"))
+
+    result = await run_tier2_summarisation(
+        history=history,
+        compaction_llm=llm,
+        state=CompactionState(),
+        rc=rc,
+        model_name="mock",
+    )
+
+    assert result.turns_summarised == 9
+    assert peak == 3
+
+
+def test_an_unusable_summariser_reply_yields_no_summary() -> None:
+    assert _summary_from_response("", "unit") == ""
+    assert _summary_from_response("plain prose", "unit") == "plain prose"
+    assert _summary_from_response("{not json", "unit") == ""
+    assert _summary_from_response('{"summary": 7}', "unit") == ""
+    assert _summary_from_response('{"summary": "kept"}', "unit") == "kept"
+
+
+# ---------------------------------------------------------------------------
+# Tier 3 — folding runs of old summaries and operator turns
+# ---------------------------------------------------------------------------
+
+
+def _fold_rc(**overrides: object) -> LoopConstants:
+    values: dict[str, object] = {
+        "model_context_window": 32_768,
+        "compaction_keep_recent_turns": 2,
+        "compaction_fold_min_messages": 4,
+        "compaction_fold_min_tokens": 0,
+        "compaction_fold_keep_operator_turns": 2,
+    }
+    values.update(overrides)
+    return LoopConstants(**values)  # type: ignore[arg-type]
+
+
+def _folding_history() -> list[Message]:
+    return [
+        _operator("The task: keep the changelog current."),
+        *[_summary_message(f"summary {i} about step {i} in f{i}.py " * 6, f"k{i}") for i in range(5)],
+        _operator("Also remove the model-name field from the header."),
+        *[_summary_message(f"later summary {i} " * 8, f"m{i}") for i in range(3)],
+        _operator("recent instruction, must stay"),
+        _assistant("working"),
+        _operator("newest"),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_tier3_folds_a_run_and_keeps_the_task_and_the_recent_instructions() -> None:
+    rc = _fold_rc()
+    history = _folding_history()
+    before = len(history)
+    llm = InMemoryLLMProvider()
+    llm.queue_response(
+        text=json.dumps(
+            {
+                "summary": 'Steps 0-4 done in f0.py..f4.py. Operator said: "Also remove '
+                'the model-name field from the header."'
+            }
+        )
+    )
+
+    result = await run_tier3_fold(
+        history=history,
+        compaction_llm=llm,
+        state=CompactionState(),
+        rc=rc,
+        model_name="mock",
+    )
+
+    assert (result.spans_folded, result.messages_folded) == (1, 9)
+    assert result.tokens_freed > 0
+    assert len(history) == before - 8
+    assert history[0].text.startswith("The task:")
+    fold = history[1]
+    assert fold.metadata[COMPACTION_SUMMARY_METADATA_KEY] is True
+    assert fold.metadata[COMPACTION_FOLD_METADATA_KEY] == {"messages": 9, "operator_turns": 1}
+    assert fold.text.startswith("<compacted-turn id='fold-")
+    assert history[2].text == "recent instruction, must stay"
+    # The operator's own words went to the summariser, labelled as theirs.
+    sent = llm.calls[0].messages[0].text
+    assert "[operator said] Also remove the model-name field" in sent
+    assert "[earlier summary] summary 0" in sent
+
+
+@pytest.mark.asyncio
+async def test_a_lone_fold_summary_is_not_folded_again() -> None:
+    """The span bounds are what stop a fold from being re-folded for nothing."""
+    rc = _fold_rc()
+    history = _folding_history()
+    llm = InMemoryLLMProvider()
+    llm.queue_response(text=json.dumps({"summary": "folded once"}))
+    await run_tier3_fold(
+        history=history, compaction_llm=llm, state=CompactionState(), rc=rc, model_name="mock"
+    )
+
+    llm.queue_response(text=json.dumps({"summary": "folded twice"}))
+    again = await run_tier3_fold(
+        history=history, compaction_llm=llm, state=CompactionState(), rc=rc, model_name="mock"
+    )
+
+    assert again.spans_folded == 0
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        {"compaction_fold_enabled": False},
+        {"compaction_fold_min_messages": 50},
+        {"compaction_fold_min_tokens": 1_000_000},
+    ],
+    ids=["switched-off", "run-too-short", "run-too-small"],
+)
+async def test_tier3_does_nothing_when_the_span_is_not_worth_a_call(
+    overrides: dict[str, object],
+) -> None:
+    rc = _fold_rc(**overrides)
+    llm = InMemoryLLMProvider()
+    llm.queue_response(text=json.dumps({"summary": "folded"}))
+
+    result = await run_tier3_fold(
+        history=_folding_history(),
+        compaction_llm=llm,
+        state=CompactionState(),
+        rc=rc,
+        model_name="mock",
+    )
+
+    assert result.spans_folded == 0
+    assert llm.calls == ()
+
+
+@pytest.mark.asyncio
+async def test_tier3_folds_at_most_the_configured_number_of_spans_per_pass() -> None:
+    """A history full of foldable runs is compacted over passes, not in one pause."""
+    rc = _fold_rc(compaction_fold_max_spans_per_pass=1)
+    history = [
+        *[_summary_message(f"a{i} " * 20, f"a{i}") for i in range(5)],
+        _assistant("a turn that breaks the run"),
+        *[_summary_message(f"b{i} " * 20, f"b{i}") for i in range(5)],
+        _assistant("tail"),
+        _operator("recent"),
+    ]
+    llm = InMemoryLLMProvider()
+    for _ in range(2):
+        llm.queue_response(text=json.dumps({"summary": "folded"}))
+
+    result = await run_tier3_fold(
+        history=history,
+        compaction_llm=llm,
+        state=CompactionState(),
+        rc=rc,
+        model_name="mock",
+    )
+
+    assert result.spans_folded == 1
+    assert len(llm.calls) == 1
+
+
+@pytest.mark.asyncio
+async def test_tier3_never_folds_a_turn_seeded_from_an_earlier_run() -> None:
+    """A fold that absorbed a seeded turn would drop the tag separating the runs."""
+    rc = _fold_rc()
+    seeded = [
+        Message(
+            role=MessageRole.user,
+            content_blocks=[TextBlock(text=f"prior run turn {i} " * 10)],
+            metadata={SESSION_HISTORY_SEED_METADATA_KEY: True},
+        )
+        for i in range(6)
+    ]
+    history = [*seeded, _operator("this run's task"), _assistant("tail"), _operator("recent")]
+    llm = InMemoryLLMProvider()
+    llm.queue_response(text=json.dumps({"summary": "folded"}))
+
+    result = await run_tier3_fold(
+        history=history,
+        compaction_llm=llm,
+        state=CompactionState(),
+        rc=rc,
+        model_name="mock",
+    )
+
+    assert result.spans_folded == 0
+    assert all(
+        message.metadata.get(SESSION_HISTORY_SEED_METADATA_KEY) is True for message in history[:6]
+    )
+
+
+@pytest.mark.asyncio
+async def test_a_fold_no_smaller_than_the_run_it_replaces_is_discarded() -> None:
+    rc = _fold_rc()
+    history = _folding_history()
+    before = list(history)
+    llm = InMemoryLLMProvider()
+    llm.queue_response(text=json.dumps({"summary": "x" * 20_000}))
+
+    result = await run_tier3_fold(
+        history=history,
+        compaction_llm=llm,
+        state=CompactionState(),
+        rc=rc,
+        model_name="mock",
+    )
+
+    assert result.spans_folded == 0
+    assert [m.text for m in history] == [m.text for m in before]
+
+
+@pytest.mark.asyncio
+async def test_a_summariser_failure_leaves_the_run_intact() -> None:
+    class _Failing(InMemoryLLMProvider):
+        async def complete_structured(self, request, response_schema):  # type: ignore[no-untyped-def]
+            raise RuntimeError("provider down")
+
+    history = _folding_history()
+    before = list(history)
+
+    result = await run_tier3_fold(
+        history=history,
+        compaction_llm=_Failing(),
+        state=CompactionState(),
+        rc=_fold_rc(),
+        model_name="mock",
+    )
+
+    assert result.spans_folded == 0
+    assert [m.text for m in history] == [m.text for m in before]
+
+
+@pytest.mark.asyncio
+async def test_the_fold_prompt_states_the_word_target_and_the_quoting_rule() -> None:
+    rc = _fold_rc(compaction_fold_summary_target_words=321)
+    llm = InMemoryLLMProvider()
+    llm.queue_response(text=json.dumps({"summary": "folded"}))
+
+    await run_tier3_fold(
+        history=_folding_history(),
+        compaction_llm=llm,
+        state=CompactionState(),
+        rc=rc,
+        model_name="mock",
+    )
+
+    prompt = llm.calls[0].messages[0].text
+    assert "about 321 words" in prompt
+    assert "exact quote in a list headed 'Operator said:'" in prompt
+    assert "state unknown outcomes as unknown" in prompt

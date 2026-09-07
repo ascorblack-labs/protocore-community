@@ -10,13 +10,24 @@ Tier 2 — old-turn summarisation:
  For turns older than ``compaction_keep_recent_turns``, call
  :meth:`ILLMProvider.complete_structured` with :func:`build_summary_schema`
  and replace the turn with a system message containing the summary. Strip
- injection patterns before sending to the summariser.
+ injection patterns before sending to the summariser. An operator turn is
+ never summarised: an instruction is short, and a summary of an instruction
+ is where "remove the model-name field" becomes "the user asked for changes".
+
+Tier 3 — folding what Tier 2 leaves behind:
+ Tier 2 leaves one summary per tool batch and never touches a summary again,
+ and it keeps every operator turn verbatim, so a long session ends up with a
+ window made almost entirely of those two kinds of message. Tier 3 replaces
+ each contiguous run of them with ONE consolidated summary in which the
+ operator's own words survive as exact quotes. A fold is a summary like any
+ other, so a later fold absorbs it once its neighbourhood has grown again.
 
 Cyrillic-in-JSON-escape safety preserved via
 :mod:`protocore.runtime.token_counting`.
 """
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import json
 import re
@@ -33,6 +44,7 @@ from protocore.contracts.llm import (
     LLMObservabilityContext,
     LLMRequest,
 )
+from protocore.contracts.prompts import IPromptTemplateProvider
 from protocore.contracts.runtime_constants import LoopConstants
 from protocore.contracts.types import (
     COMPACTION_REFERENCE_METADATA_KEY,
@@ -49,6 +61,7 @@ from protocore.contracts.types import (
     ToolUseBlock,
 )
 from protocore.logging_utils import get_logger
+from protocore.prompts import bundled_prompt_provider
 from protocore.runtime.result_eviction import tool_names_by_call_id
 from protocore.runtime.token_counting import estimate_tokens
 from protocore.runtime.wire_format import (
@@ -123,6 +136,15 @@ class Tier2Result:
     tokens_freed: int
 
 
+@dataclass(frozen=True, slots=True)
+class Tier3Result:
+    """Outcome of Tier 3 — folding runs of old summaries and operator turns."""
+
+    spans_folded: int
+    messages_folded: int
+    tokens_freed: int
+
+
 @dataclass(slots=True)
 class CompactionAttempt:
     """One compaction attempt's combined outcome.
@@ -133,6 +155,7 @@ class CompactionAttempt:
 
     tier1: Tier1Result | None = None
     tier2: Tier2Result | None = None
+    tier3: Tier3Result | None = None
     tokens_before: int = 0
     tokens_after: int = 0
 
@@ -1090,6 +1113,211 @@ def _compaction_wrapper_floor_tokens(anchor_key: str, rc: LoopConstants) -> int:
 RequestRecorder = Callable[[LLMRequest], Awaitable[Any]]
 
 
+@dataclass(frozen=True, slots=True)
+class _SummaryOutcome:
+    """What one summariser call produced.
+
+    ``replacement`` is ``None`` for every way a call can fail to earn its
+    keep — the provider raised, the reply carried no usable summary, or the
+    summary came back no smaller than what it would replace. The caller commits
+    nothing in that case and the original messages stay as they are.
+    """
+
+    anchor_key: str
+    replacement: Message | None
+    tokens_freed: int
+
+
+def _is_plain_operator_turn(message: Message) -> bool:
+    """Is this a turn the operator wrote?
+
+    A user-role message that is not a summary, not a frozen reference block,
+    not a seeded turn from an earlier run of the session, and carries no tool
+    result. What is left is what a person typed: the task, a steer, a
+    correction. Compaction treats those as the one kind of message it may not
+    paraphrase, because an instruction is short enough that a summary of it
+    frees nothing and specific enough that a paraphrase changes it.
+    """
+    if message.role is not MessageRole.user or _is_compaction_summary(message):
+        return False
+    if message.metadata.get(COMPACTION_REFERENCE_METADATA_KEY) is True:
+        return False
+    if message.metadata.get(SESSION_HISTORY_SEED_METADATA_KEY) is True:
+        return False
+    return not any(isinstance(block, ToolResultBlock) for block in message.content_blocks)
+
+
+def _operator_turn_indices(history: list[Message]) -> tuple[int, ...]:
+    """Positions of every operator turn, oldest first."""
+    return tuple(idx for idx, message in enumerate(history) if _is_plain_operator_turn(message))
+
+
+def _summary_from_response(raw: str, unit_label: str) -> str:
+    """The ``summary`` string out of a structured summariser reply.
+
+    ``complete_structured`` is invoked with :func:`build_summary_schema`
+    (json_object), and the openai-compat provider's
+    ``_structured_response_from_body`` returns the model's RAW content without
+    parsing it, so ``response.message.text`` normally carries the whole
+    ``{"summary": "..."}`` envelope. Detect that by the leading ``{`` (the
+    schema is a top-level object), parse it strictly, and read the ``summary``
+    string. Any other key is ignored rather than trusted: ``additionalProperties``
+    is false, but a provider that does not enforce the grammar can still return
+    one, and an unread key must never reach the history the summary replaces. A
+    reply that is NOT a JSON object (a provider that pre-parses, or the
+    in-memory double) is taken verbatim.
+
+    An unusable reply returns ``""`` and is logged WITH ITS HEAD: "the
+    summariser returned nothing" is not diagnosable, and the first two hundred
+    characters are what tells a truncated envelope from a refusal.
+    """
+    if not raw:
+        return ""
+    if not raw.lstrip().startswith("{"):
+        return raw
+    try:
+        parsed = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        _logger.warning(
+            "summariser reply for %s looked like JSON but failed to parse (err=%s): %r",
+            unit_label,
+            exc,
+            raw[:200],
+        )
+        return ""
+    if not isinstance(parsed, dict) or not isinstance(parsed.get("summary"), str):
+        _logger.warning(
+            "summariser reply for %s carries no 'summary' string: %r", unit_label, raw[:200]
+        )
+        return ""
+    return str(parsed["summary"])
+
+
+def _summary_word_budget(before_tokens: int, rc: LoopConstants) -> int:
+    """Words the summary of a unit this size may spend.
+
+    A fixed "in 1-3 sentences" asks for the same output whatever it is given,
+    which is how a small unit comes back larger than the original and a large
+    one comes back too thin to have kept anything. The budget scales with what
+    is being replaced instead, with a floor so a short unit still has room for
+    the identifiers that must survive verbatim.
+    """
+    return max(rc.compaction_summary_min_words, before_tokens // rc.compaction_summary_tokens_per_word)
+
+
+async def _run_summariser(
+    prompt: str,
+    *,
+    anchor_key: str,
+    unit_label: str,
+    before_tokens: int,
+    max_output_tokens: int,
+    compaction_llm: ILLMProvider,
+    rc: LoopConstants,
+    model_name: str,
+    observability: LLMObservabilityContext | None,
+    record_request: RequestRecorder | None,
+) -> _SummaryOutcome:
+    """One summariser exchange, from a built prompt to a committable replacement.
+
+    Shared by the per-turn pass and the fold, because the two differ only in
+    what they put in the prompt: the request is assembled by the same builder
+    every other provider call goes through, recorded the same way, and held to
+    the same net-gain rule — a summary at or above the size of what it replaces
+    is discarded rather than committed, since committing it would GROW history
+    while the freed-token clamp hid the growth.
+    """
+    # Local import — the shared request builder lives beside the action
+    # stream, which imports this module, so the dependency is taken at call
+    # time rather than at module import.
+    from protocore.runtime.query import build_llm_request
+
+    request = build_llm_request(
+        model=model_name,
+        messages=[Message(role=MessageRole.user, content_blocks=[TextBlock(text=prompt)])],
+        tools=[],
+        max_tokens=max_output_tokens,
+        temperature=rc.compaction_summary_temperature,
+        observability=observability,
+    )
+    if record_request is not None:
+        await record_request(request)
+    try:
+        response = await compaction_llm.complete_structured(request, build_summary_schema(rc))
+    except Exception as exc:
+        _logger.warning("summariser failed for %s; skipping (err=%s)", unit_label, exc)
+        return _SummaryOutcome(anchor_key=anchor_key, replacement=None, tokens_freed=0)
+    summary_text = _summary_from_response(response.message.text, unit_label)
+    if not summary_text:
+        return _SummaryOutcome(anchor_key=anchor_key, replacement=None, tokens_freed=0)
+    wrapped = _wrap_compaction_summary(anchor_key, summary_text)
+    after_tokens = estimate_tokens(wrapped, rc)
+    if after_tokens >= before_tokens:
+        _logger.warning(
+            "summary for %s is not smaller than the original (%s >= %s tokens); kept the original",
+            unit_label,
+            after_tokens,
+            before_tokens,
+        )
+        return _SummaryOutcome(anchor_key=anchor_key, replacement=None, tokens_freed=0)
+    # vLLM-400 fix: the summary replaces an aged turn IN THE MIDDLE of
+    # history. vLLM rejects any ``system`` message past index 0 ("System
+    # message must be at the beginning."), so the summary turn is USER-role.
+    # It stays recognisable as a summary via the durable
+    # ``COMPACTION_SUMMARY_METADATA_KEY`` flag + the ``<compacted-turn>``
+    # wrapper (``_is_compaction_summary``); legacy persisted system-role
+    # summaries remain recognised too. (The request-assembly boundary in
+    # ``query._normalize_outbound_system_messages`` is the defense-in-depth
+    # backstop for those legacy snapshots.)
+    return _SummaryOutcome(
+        anchor_key=anchor_key,
+        replacement=Message(
+            role=MessageRole.user,
+            content_blocks=[TextBlock(text=wrapped)],
+            metadata={COMPACTION_SUMMARY_METADATA_KEY: True},
+        ),
+        tokens_freed=before_tokens - after_tokens,
+    )
+
+
+async def _summarise_unit(
+    unit_messages: list[Message],
+    *,
+    anchor_key: str,
+    unit_label: str,
+    before_tokens: int,
+    compaction_llm: ILLMProvider,
+    rc: LoopConstants,
+    prompts: IPromptTemplateProvider,
+    model_name: str,
+    observability: LLMObservabilityContext | None,
+    record_request: RequestRecorder | None,
+) -> _SummaryOutcome:
+    """Summarise ONE atomic unit — an assistant turn and the results answering it."""
+    raw_text = "\n".join(_message_text_for_estimation(member, rc) for member in unit_messages).strip()
+    if not raw_text:
+        return _SummaryOutcome(anchor_key=anchor_key, replacement=None, tokens_freed=0)
+    prompt = prompts.render(
+        "compaction_turn_summary",
+        {
+            "turn": _strip_injection_patterns(raw_text),
+            "max_words": _summary_word_budget(before_tokens, rc),
+        },
+    )
+    return await _run_summariser(
+        prompt,
+        anchor_key=anchor_key,
+        unit_label=unit_label,
+        before_tokens=before_tokens,
+        max_output_tokens=rc.compaction_summary_max_output_tokens,
+        compaction_llm=compaction_llm,
+        rc=rc,
+        model_name=model_name,
+        observability=observability,
+        record_request=record_request,
+    )
+
+
 async def run_tier2_summarisation(
     history: list[Message],
     compaction_llm: ILLMProvider,
@@ -1101,6 +1329,7 @@ async def run_tier2_summarisation(
     protect_tail_from_index: int | None = None,
     free_target_tokens: int | None = None,
     record_request: RequestRecorder | None = None,
+    prompts: IPromptTemplateProvider | None = None,
 ) -> Tier2Result:
     """Summarise old turns via the compaction LLM.
 
@@ -1129,7 +1358,10 @@ async def run_tier2_summarisation(
  skipped, so the per-iteration gate (A1) is idempotent.
 
  The original task user turn is protected from summarisation when
- ``rc.compaction_protect_first_user_turn`` is set.
+ ``rc.compaction_protect_first_user_turn`` is set, and EVERY operator turn is
+ protected unconditionally — see :func:`_is_plain_operator_turn`. Those are
+ what :func:`run_tier3_fold` condenses, with the operator's wording quoted
+ rather than paraphrased.
 
  ``record_request`` is called with each summariser request before it is made,
  which is what puts the summariser on the same footing as the turn's own
@@ -1155,10 +1387,15 @@ async def run_tier2_summarisation(
 
  Bounded per-pass cost — ``free_target_tokens`` (when set by the caller) is
  the freed-token budget for this pass: once that many tokens have been freed
- the loop STOPS issuing further summariser calls. A many-turn history therefore
- no longer triggers dozens of sequential ~5-11s LLM calls in one
- ``COMPACTING`` pass; the remaining eligible units are summarised on a later
- pass if still needed.
+ no further batch is issued. The remaining eligible units are summarised on a
+ later pass if still needed. Within a batch the calls go out together, up to
+ ``rc.compaction_summariser_parallelism`` at a time: the calls are seconds
+ long apiece and the run is parked in ``COMPACTING`` for the whole pass, so
+ issuing them one after another was most of that wait.
+
+ ``prompts`` renders the summariser instruction. ``None`` falls back to the
+ templates bundled with the package, so a caller that wired no provider still
+ gets the shipped wording rather than a literal built here.
 
  Mutates ``history`` in place.
  """
@@ -1175,6 +1412,15 @@ async def run_tier2_summarisation(
         first_user = _first_user_turn_index(history)
         if first_user is not None:
             protected = frozenset({first_user})
+
+    # Every operator turn stays verbatim. An instruction sent mid-run — a
+    # steer, a correction, a follow-up — is short, so summarising it frees
+    # almost nothing, and it is specific, so a paraphrase of it is exactly the
+    # loss this pass cannot afford: "remove the model-name field from the
+    # header" becomes "the user asked for changes to the header" and the run
+    # goes on to do something else. What condenses them instead is Tier 3,
+    # which keeps their wording as quotes.
+    protected = protected | frozenset(_operator_turn_indices(history))
 
     # Protect executor-seeded prior-run turns from the lossy Tier-2 collapse so
     # a summary never drops the SESSION_HISTORY_SEED tag (which the host
@@ -1197,12 +1443,8 @@ async def run_tier2_summarisation(
     if reference_indices:
         protected = protected | reference_indices
 
-    # Local import — the shared request builder lives beside the action
-    # stream, which imports this module, so the dependency is taken at call
-    # time rather than at module import.
-    from protocore.runtime.query import build_llm_request
-
     units = _build_summarisation_units(history, eligible_upper, protected_indices=protected)
+    resolved_prompts = prompts if prompts is not None else bundled_prompt_provider()
 
     summarised = 0
     freed = 0
@@ -1210,13 +1452,11 @@ async def run_tier2_summarisation(
     replacements: dict[int, Message] = {}
     indices_to_drop: set[int] = set()
 
+    # Which units are worth a call at all, decided before any call is made:
+    # not already summarised, and big enough that a summary could come back
+    # smaller than what it replaces.
+    jobs: list[tuple[_SummarisationUnit, str, list[Message], int]] = []
     for unit in units:
-        # Bounded per-pass cost — stop issuing summariser calls once this pass
-        # has freed its budget. Prevents one COMPACTING pass over a many-turn
-        # history from firing dozens of sequential ~5-11s LLM calls.
-        if free_target_tokens is not None and freed >= free_target_tokens:
-            break
-
         anchor = history[unit.anchor_idx]
         # A4 idempotency — never re-summarise an existing compaction summary
         # (would nest <compacted-turn> wrappers and decay the summary).
@@ -1225,133 +1465,61 @@ async def run_tier2_summarisation(
         anchor_key = _stable_turn_key(anchor)
         if anchor_key in state.summarised_turn_ids:
             continue
-
-        # Exhaustive text across EVERY member of the unit (assistant turn +
-        # its tool results), so the summary preserves the tool exchange.
+        # Exhaustive across EVERY member of the unit (assistant turn + its
+        # tool results), so the summary preserves the tool exchange.
         unit_messages = [history[member] for member in unit.indices]
-        raw_text = "\n".join(
-            _message_text_for_estimation(member, rc) for member in unit_messages
-        ).strip()
-        if not raw_text:
-            continue
         before_tokens = sum(estimate_message_tokens(member, rc) for member in unit_messages)
-
         # No-net-gain floor — a unit at or below the empty-wrapper size cannot
         # shrink; replacing it would only GROW history (the inflation the
-        # max(0, ...) freed clamp would mask). Skip it before spending an LLM
-        # call that cannot free tokens.
-        if before_tokens <= _compaction_wrapper_floor_tokens(anchor_key, rc):
-            continue
-
-        sanitised = _strip_injection_patterns(raw_text)
-        prompt = (
-            "<turn>\n"
-            f"{sanitised}\n"
-            "</turn>\n\n"
-            "Summarise the above turn in 1-2 sentences. Preserve tool names, "
-            "key user intent, and file paths touched. Output STRICT JSON only."
+        # max(0, ...) freed clamp would mask). The operator's own minimum sits
+        # on top of that floor: a summariser writes a sentence or three
+        # whatever it is handed, so below some size the call is spent to
+        # discover the summary is no smaller.
+        floor = max(
+            _compaction_wrapper_floor_tokens(anchor_key, rc),
+            rc.compaction_summary_min_unit_tokens,
         )
-
-        request = build_llm_request(
-            model=model_name,
-            messages=[Message(role=MessageRole.user, content_blocks=[TextBlock(text=prompt)])],
-            tools=[],
-            max_tokens=rc.compaction_summary_max_output_tokens,
-            temperature=rc.compaction_summary_temperature,
-            observability=observability,
-        )
-
-        if record_request is not None:
-            await record_request(request)
-
-        try:
-            response = await compaction_llm.complete_structured(
-                request, build_summary_schema(rc)
-            )
-        except Exception as exc:
-            _logger.warning(
-                "tier2 summariser failed for unit anchor_idx=%s; skipping (err=%s)",
-                unit.anchor_idx,
-                exc,
-            )
+        if before_tokens <= floor:
             continue
+        jobs.append((unit, anchor_key, unit_messages, before_tokens))
 
-        # Reconstruct the summary text from the structured response.
-        # ``complete_structured`` is invoked with :func:`build_summary_schema`
-        # (json_object), and the openai-compat provider's
-        # ``_structured_response_from_body`` returns the model's RAW content
-        # without parsing it. ``response.message.text`` therefore carries the
-        # full JSON envelope — ``{"summary": "..."}``. Detect it by the leading
-        # ``{`` (the schema is a top-level object), parse it strictly, and read
-        # the ``summary`` string. Any other key is ignored rather than trusted:
-        # ``additionalProperties`` is false, but a provider that does not enforce
-        # the grammar can still return one, and an unread key must never reach
-        # the history the summary replaces. A response that is NOT a JSON object
-        # (a future provider that pre-parses, or the test-only
-        # InMemoryLLMProvider) is taken verbatim as the summary — that path is
-        # exercised by the existing tests.
-        raw = response.message.text
-        if not raw:
-            continue
-        if raw.lstrip().startswith("{"):
-            try:
-                parsed = json.loads(raw)
-            except json.JSONDecodeError as exc:
-                _logger.warning(
-                    "tier2 summary response looked like JSON but failed to parse "
-                    "for unit anchor_idx=%s; skipping (err=%s)",
-                    unit.anchor_idx,
-                    exc,
+    # Calls go out in small parallel batches, oldest unit first, and stop once
+    # the pass has freed its budget. Sequentially this was one chain of
+    # seconds-long calls with the run parked in COMPACTING for the length of
+    # it; the cap is what keeps the alternative from being an unbounded
+    # fan-out at the provider.
+    batch_size = rc.compaction_summariser_parallelism
+    for offset in range(0, len(jobs), batch_size):
+        if free_target_tokens is not None and freed >= free_target_tokens:
+            break
+        batch = jobs[offset : offset + batch_size]
+        outcomes = await asyncio.gather(
+            *(
+                _summarise_unit(
+                    unit_messages,
+                    anchor_key=anchor_key,
+                    unit_label=f"tier2 unit anchor_idx={unit.anchor_idx}",
+                    before_tokens=before_tokens,
+                    compaction_llm=compaction_llm,
+                    rc=rc,
+                    prompts=resolved_prompts,
+                    model_name=model_name,
+                    observability=observability,
+                    record_request=record_request,
                 )
-                continue
-            if not isinstance(parsed, dict) or not isinstance(parsed.get("summary"), str):
-                _logger.warning(
-                    "tier2 summary response missing 'summary' string field "
-                    "for unit anchor_idx=%s; skipping",
-                    unit.anchor_idx,
-                )
-                continue
-            summary_text: str = parsed["summary"]
-        else:
-            summary_text = raw
-        if not summary_text:
-            continue
-
-        wrapped = _wrap_compaction_summary(anchor_key, summary_text)
-        after_tokens = estimate_tokens(wrapped, rc)
-        # Net-gain guard — a verbose summary can come back at or above the
-        # original even when the unit cleared the empty-wrapper floor. Committing
-        # such a replacement would GROW history while the max(0, ...) freed clamp
-        # masked it (and could tip run_compaction's tokens_after over
-        # tokens_before into a no-progress retry). Discard it: leave the original
-        # turn intact rather than inflate. The turn is NOT marked summarised, so
-        # a later pass may retry it.
-        if after_tokens >= before_tokens:
-            continue
-        # vLLM-400 fix: the summary replaces an aged turn IN THE MIDDLE of
-        # history. vLLM rejects any ``system`` message past index 0
-        # ("System message must be at the beginning."), so the summary turn is
-        # USER-role. It stays recognisable as a summary via the durable
-        # ``COMPACTION_SUMMARY_METADATA_KEY`` flag + the ``<compacted-turn>``
-        # wrapper (``_is_compaction_summary``); legacy persisted system-role
-        # summaries remain recognised too. (The request-assembly boundary in
-        # ``query._normalize_outbound_system_messages`` is the defense-in-depth
-        # backstop for those legacy snapshots.)
-        replacements[unit.anchor_idx] = Message(
-            role=MessageRole.user,
-            content_blocks=[TextBlock(text=wrapped)],
-            metadata={COMPACTION_SUMMARY_METADATA_KEY: True},
+                for unit, anchor_key, unit_messages, before_tokens in batch
+            )
         )
-        # Every non-anchor member of the unit (the matching tool results) is
-        # removed so the dropped ToolUseBlock leaves no orphaned tool_result.
-        indices_to_drop.update(member for member in unit.indices if member != unit.anchor_idx)
-
-        state.summarised_turn_ids.add(anchor_key)
-        summarised += 1
-        # after_tokens < before_tokens is guaranteed by the net-gain guard above,
-        # so the delta is always a real positive freeing (the clamp is now only a
-        # defensive floor).
-        freed += max(0, before_tokens - after_tokens)
+        for (unit, _key, _members, _before), outcome in zip(batch, outcomes, strict=True):
+            if outcome.replacement is None:
+                continue
+            replacements[unit.anchor_idx] = outcome.replacement
+            # Every non-anchor member of the unit (the matching tool results) is
+            # removed so the dropped ToolUseBlock leaves no orphaned tool_result.
+            indices_to_drop.update(member for member in unit.indices if member != unit.anchor_idx)
+            state.summarised_turn_ids.add(outcome.anchor_key)
+            summarised += 1
+            freed += outcome.tokens_freed
 
     if replacements or indices_to_drop:
         rebuilt: list[Message] = []
@@ -1364,14 +1532,242 @@ async def run_tier2_summarisation(
     return Tier2Result(turns_summarised=summarised, tokens_freed=freed)
 
 
+COMPACTION_FOLD_METADATA_KEY: Final[str] = "protocore.compaction_fold"
+"""On a fold summary: how many messages it stands for, and how many were the operator's."""
+
+
+def _foldable_indices(history: list[Message], eligible_upper: int, rc: LoopConstants) -> frozenset[int]:
+    """Positions the fold may consolidate.
+
+    A message qualifies when it is an old compaction summary or an old operator
+    turn, and is none of the things every tier protects: the first user turn
+    (this run's task), one of the ``compaction_fold_keep_operator_turns`` most
+    recent operator turns, a turn seeded from an earlier run of the session, or
+    a frozen reference block. The seed exclusion is not cosmetic — a fold that
+    absorbed a seeded turn would drop the tag that separates this run's
+    messages from the previous run's, which is the one thing distinguishing
+    them.
+    """
+    first_user = _first_user_turn_index(history) if rc.compaction_protect_first_user_turn else None
+    keep = rc.compaction_fold_keep_operator_turns
+    operators = _operator_turn_indices(history)
+    recent_operators = frozenset(operators[-keep:]) if keep else frozenset()
+    protected = recent_operators | _session_history_seed_indices(history) | _compaction_reference_indices(history)
+    return frozenset(
+        idx
+        for idx in range(min(eligible_upper, len(history)))
+        if idx != first_user
+        and idx not in protected
+        and (_is_compaction_summary(history[idx]) or _is_plain_operator_turn(history[idx]))
+    )
+
+
+def _fold_spans(history: list[Message], eligible_upper: int, rc: LoopConstants) -> list[tuple[int, int]]:
+    """Contiguous runs ``[start, end)`` of foldable messages, long and heavy enough to be worth a call.
+
+    A run must be at least ``compaction_fold_min_messages`` long and
+    ``compaction_fold_min_tokens`` big. Both bounds exist so a span that has
+    already been folded is not folded again for nothing: one fold summary
+    standing alone is neither long enough nor heavy enough to qualify.
+    """
+    foldable = _foldable_indices(history, eligible_upper, rc)
+    spans: list[tuple[int, int]] = []
+    start: int | None = None
+    for idx in range(len(history) + 1):
+        if idx in foldable:
+            if start is None:
+                start = idx
+            continue
+        if start is not None:
+            end = idx
+            if end - start >= rc.compaction_fold_min_messages:
+                tokens = sum(estimate_message_tokens(history[j], rc) for j in range(start, end))
+                if tokens >= rc.compaction_fold_min_tokens:
+                    spans.append((start, end))
+            start = None
+    return spans
+
+
+def _fold_item_text(message: Message) -> str:
+    """One span member as the fold prompt shows it.
+
+    The two kinds are labelled apart because the instruction that follows
+    treats them differently: an earlier summary may be condensed further, an
+    operator's words must come back out as a quote.
+    """
+    text = message.text.strip()
+    if _is_compaction_summary(message):
+        inner = re.sub(r"^<compacted-turn[^>]*>", "", text).removesuffix("</compacted-turn>").strip()
+        return f"[earlier summary] {inner}"
+    return f"[operator said] {text}"
+
+
+def _fold_anchor_key(members: Sequence[Message]) -> str:
+    """A durable id for the span, derived from its members.
+
+    Content-addressed like every other summary key, so the same span folded
+    after a snapshot and resume produces the same id and the dedup set
+    recognises it.
+    """
+    digest = hashlib.sha256("|".join(_stable_turn_key(m) for m in members).encode("utf-8")).hexdigest()
+    return f"fold-{digest[:16]}"
+
+
+async def _fold_span(
+    members: list[Message],
+    *,
+    compaction_llm: ILLMProvider,
+    rc: LoopConstants,
+    prompts: IPromptTemplateProvider,
+    model_name: str,
+    observability: LLMObservabilityContext | None,
+    record_request: RequestRecorder | None,
+) -> _SummaryOutcome:
+    """Fold ONE run of old summaries and operator turns into a single summary."""
+    anchor_key = _fold_anchor_key(members)
+    before_tokens = sum(estimate_message_tokens(member, rc) for member in members)
+    operator_count = sum(1 for member in members if _is_plain_operator_turn(member))
+    prompt = prompts.render(
+        "compaction_fold_summary",
+        {
+            "items": "\n\n".join(_strip_injection_patterns(_fold_item_text(m)) for m in members),
+            "item_count": len(members),
+            "operator_count": operator_count,
+            "max_words": rc.compaction_fold_summary_target_words,
+        },
+    )
+    outcome = await _run_summariser(
+        prompt,
+        anchor_key=anchor_key,
+        unit_label=f"tier3 span of {len(members)} messages",
+        before_tokens=before_tokens,
+        max_output_tokens=rc.compaction_fold_max_output_tokens,
+        compaction_llm=compaction_llm,
+        rc=rc,
+        model_name=model_name,
+        observability=observability,
+        record_request=record_request,
+    )
+    if outcome.replacement is None:
+        return outcome
+    # A fold says what it stands for. Nothing in the loop branches on this; it
+    # is what makes a window of folds readable afterwards, when the question is
+    # how much of the session one message is now carrying.
+    return _SummaryOutcome(
+        anchor_key=outcome.anchor_key,
+        replacement=outcome.replacement.model_copy(
+            update={
+                "metadata": {
+                    **outcome.replacement.metadata,
+                    COMPACTION_FOLD_METADATA_KEY: {
+                        "messages": len(members),
+                        "operator_turns": operator_count,
+                    },
+                }
+            }
+        ),
+        tokens_freed=outcome.tokens_freed,
+    )
+
+
+async def run_tier3_fold(
+    history: list[Message],
+    compaction_llm: ILLMProvider,
+    state: CompactionState,
+    rc: LoopConstants,
+    *,
+    model_name: str,
+    observability: LLMObservabilityContext | None = None,
+    protect_tail_from_index: int | None = None,
+    record_request: RequestRecorder | None = None,
+    prompts: IPromptTemplateProvider | None = None,
+) -> Tier3Result:
+    """Fold runs of old summaries and old operator turns into one summary each.
+
+    Tier 2 leaves one ``<compacted-turn>`` per tool batch and never touches a
+    summary again, and it keeps every operator turn verbatim. Over a long
+    session those two become the window: a run measured here reached 184
+    summaries and 35 operator turns in 344 messages, and neither tier below
+    this one could take a byte off it. This pass replaces each contiguous run
+    of such messages in the eligible region (see :func:`_fold_spans`) with a
+    single consolidated summary in which operator instructions survive as exact
+    quotes. The result is a summary like any other — same wrapper, same
+    metadata flag — so a later fold absorbs it once its neighbourhood has grown
+    again.
+
+    Bounded on purpose: at most ``rc.compaction_fold_max_spans_per_pass`` runs
+    are folded, in batches of ``rc.compaction_summariser_parallelism``. A
+    history with many foldable runs is compacted over several passes rather
+    than in one long ``COMPACTING`` pause.
+
+    Mutates ``history`` in place.
+    """
+    if not history or not rc.compaction_fold_enabled:
+        return Tier3Result(spans_folded=0, messages_folded=0, tokens_freed=0)
+    eligible_upper = _effective_eligible_upper(
+        history, rc.compaction_keep_recent_turns, protect_tail_from_index
+    )
+    if eligible_upper == 0:
+        return Tier3Result(spans_folded=0, messages_folded=0, tokens_freed=0)
+    spans = _fold_spans(history, eligible_upper, rc)[: rc.compaction_fold_max_spans_per_pass]
+    if not spans:
+        return Tier3Result(spans_folded=0, messages_folded=0, tokens_freed=0)
+
+    resolved_prompts = prompts if prompts is not None else bundled_prompt_provider()
+    replacements: dict[int, Message] = {}
+    drop: set[int] = set()
+    folded_spans = 0
+    folded_messages = 0
+    freed = 0
+
+    batch_size = rc.compaction_summariser_parallelism
+    for offset in range(0, len(spans), batch_size):
+        batch = spans[offset : offset + batch_size]
+        outcomes = await asyncio.gather(
+            *(
+                _fold_span(
+                    history[start:end],
+                    compaction_llm=compaction_llm,
+                    rc=rc,
+                    prompts=resolved_prompts,
+                    model_name=model_name,
+                    observability=observability,
+                    record_request=record_request,
+                )
+                for start, end in batch
+            )
+        )
+        for (start, end), outcome in zip(batch, outcomes, strict=True):
+            if outcome.replacement is None:
+                continue
+            replacements[start] = outcome.replacement
+            drop.update(range(start + 1, end))
+            state.summarised_turn_ids.add(outcome.anchor_key)
+            folded_spans += 1
+            folded_messages += end - start
+            freed += outcome.tokens_freed
+
+    if replacements:
+        rebuilt: list[Message] = []
+        for idx in range(len(history)):
+            if idx in drop:
+                continue
+            rebuilt.append(replacements.get(idx, history[idx]))
+        history[:] = rebuilt
+    return Tier3Result(spans_folded=folded_spans, messages_folded=folded_messages, tokens_freed=freed)
+
+
 __all__ = [
+    "COMPACTION_FOLD_METADATA_KEY",
     "CompactionAttempt",
     "CompactionExhaustedError",
     "CompactionState",
     "Tier1Result",
     "Tier2Result",
+    "Tier3Result",
     "TokenEstimator",
     "build_summary_schema",
     "run_tier1_truncation",
     "run_tier2_summarisation",
+    "run_tier3_fold",
 ]

@@ -1,4 +1,4 @@
-"""``ContextManager`` + token-budget derivation + two-tier compaction.
+"""``ContextManager`` + token-budget derivation + three-tier compaction.
 
 """
 from __future__ import annotations
@@ -10,6 +10,7 @@ from protocore.runtime.context.compaction import (
     CompactionState,
     Tier1Result,
     Tier2Result,
+    Tier3Result,
     TokenEstimator,
     estimate_history_tokens,
     estimate_message_tokens,
@@ -41,6 +42,7 @@ __all__ = [
     "SessionMemory",
     "Tier1Result",
     "Tier2Result",
+    "Tier3Result",
     "TokenBudgets",
     "TokenEstimator",
     "build_seed",

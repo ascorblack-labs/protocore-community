@@ -78,6 +78,11 @@ BUNDLED_TEMPLATE_DIR: Final[Path] = Path(
 # operator who wanted to say any of it in a third language had nowhere to put
 # the translation and no template engine to reach for. They are prompts; they
 # belong where the prompts are.
+#
+# The last two are what compaction says to the summariser — the per-turn
+# instruction and the fold's. They are the longest-lived prose in the loop:
+# what they ask for is what survives of a conversation once the turns
+# themselves are gone.
 BUNDLED_TEMPLATES: Final[Mapping[str, str]] = MappingProxyType(
     {
         "leader_system": "leader_system.j2",
@@ -94,6 +99,8 @@ BUNDLED_TEMPLATES: Final[Mapping[str, str]] = MappingProxyType(
         "tool_result_interrupted": "tool_result_interrupted.j2",
         "tool_result_pairing_repair": "tool_result_pairing_repair.j2",
         "result_eviction": "result_eviction.j2",
+        "compaction_turn_summary": "compaction_turn_summary.j2",
+        "compaction_fold_summary": "compaction_fold_summary.j2",
     }
 )
 
