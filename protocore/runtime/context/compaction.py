@@ -1202,7 +1202,13 @@ def _summary_word_budget(before_tokens: int, rc: LoopConstants) -> int:
     is being replaced instead, with a floor so a short unit still has room for
     the identifiers that must survive verbatim.
     """
-    return max(rc.compaction_summary_min_words, before_tokens // rc.compaction_summary_tokens_per_word)
+    scaled = before_tokens // rc.compaction_summary_tokens_per_word
+    # The prompt must not ask for more than the reply may hold: a budget above the
+    # output cap is a summary that is always truncated, never parsed and never
+    # committed, so the largest units are exactly the ones that never shrink.
+    # Two tokens per word leaves room for the structure around the words.
+    ceiling = rc.compaction_summary_max_output_tokens // 2
+    return max(rc.compaction_summary_min_words, min(scaled, ceiling))
 
 
 async def _run_summariser(
