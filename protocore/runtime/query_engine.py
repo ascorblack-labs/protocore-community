@@ -903,6 +903,8 @@ class QueryEngine:
         # Only one force_compaction attempt allowed per message
         # before the run goes terminal FAILED.
         self._compaction_attempted_for_current_turn: bool = False
+        # Iterations the per-iteration compaction gate still skips after a pass that freed nothing.
+        self.compaction_backoff_left: int = 0
         # Max-output-tokens recovery: count of "Resume directly" retries
         # already issued in the current message stream.
         self._max_output_recovery_count: int = 0
@@ -2094,6 +2096,7 @@ class QueryEngine:
         constraint applies to exactly that one message.
         """
         self._compaction_attempted_for_current_turn = False
+        self.compaction_backoff_left = 0
         if self._terminal_backstop_turn_active:
             self._terminal_backstop_turn_active = False
         else:

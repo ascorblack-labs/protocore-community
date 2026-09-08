@@ -133,6 +133,10 @@ class ContextManager:
     def rc(self) -> LoopConstants:
         return self._rc
 
+    def update_rc(self, rc: LoopConstants) -> None:
+        """Take a refreshed snapshot: the loop recalibrated the token estimate mid-run."""
+        self._rc = rc
+
     # ------------------------------------------------------------------
     # pin LRU
     # ------------------------------------------------------------------

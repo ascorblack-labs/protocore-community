@@ -245,6 +245,7 @@ def _token_estimate_signature(rc: LoopConstants) -> tuple[float, ...]:
         rc.token_count_chars_per_token_cjk,
         rc.token_count_chars_per_token_json_struct,
         rc.token_count_image_tokens,
+        rc.token_estimate_calibration,
     )
 
 
@@ -257,7 +258,8 @@ def _estimate_message_tokens_uncached(message: Message, rc: LoopConstants) -> in
         total += estimate_tokens(_block_text_for_estimation(block), rc)
     if message.reasoning_content:
         total += estimate_tokens(message.reasoning_content, rc)
-    return total
+    # In the provider's tokens, not the heuristic's: see LoopConstants.token_estimate_calibration.
+    return round(total * rc.token_estimate_calibration)
 
 
 class _CachedEstimate:

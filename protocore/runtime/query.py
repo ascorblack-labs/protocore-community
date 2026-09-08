@@ -151,6 +151,7 @@ from protocore.runtime.answer_narration import leading_narration_span
 from protocore.runtime.context.compaction import (
     CompactionExhaustedError,
     current_tool_batch_protect_index,
+    estimate_history_tokens,
 )
 from protocore.runtime.context.manager import ContextBundle
 from protocore.runtime.error_kinds import (
@@ -205,6 +206,7 @@ from protocore.runtime.skill_index import (
     render_skills_catalog,
 )
 from protocore.runtime.subagent_budget import SubagentTreeBudget, SubagentTreePermit
+from protocore.runtime.token_counting import estimate_tokens
 from protocore.runtime.tool_arguments import argument_names, string_argument
 from protocore.runtime.tool_dispatch import (
     DISPATCH_POST_TOOL_OUTPUT_MODIFIED_METADATA_KEY,
@@ -4664,6 +4666,7 @@ async def _drive_one_stream(
             # char heuristic, which under-counts adversarial content 2-3x.
             if input_tokens > 0:
                 engine.last_observed_prompt_tokens = input_tokens
+                _calibrate_token_estimate(engine, request, input_tokens)
             # Feed the optional cache observer one observation per usage
             # envelope. Core cannot import the host's metrics module (import
             # boundary); the host injects a concrete ``CacheObserverProtocol``
@@ -4899,6 +4902,39 @@ async def _drive_one_stream(
             },
         )
         open_block_kind = None
+
+
+def _calibrate_token_estimate(engine: QueryEngine, request: LLMRequest, observed: int) -> None:
+    """Scale the token heuristic to the size the provider just reported for this request.
+
+    The heuristic sizes everything the tiers decide on — which units are worth
+    a summariser call, what a summary may cost, whether a pass gained anything —
+    and it runs short of the real tokenizer on JSON-heavy and non-Latin text.
+    Measured against the provider's own count of the very prompt it was asked
+    to size, the factor makes those decisions in the provider's tokens. The
+    reported size covers the whole request, so the raw estimate it is compared
+    with does too: the messages as sent (system prompt included) and the tool
+    definitions. Moves are damped, and a change too small to matter is not
+    written, so the estimate cache is not invalidated on every call.
+    """
+    rc = engine.config.rc
+    if not rc.token_estimate_calibration_enabled or observed <= 0:
+        return
+    uncalibrated = rc.model_copy(update={"token_estimate_calibration": 1.0})
+    raw = estimate_history_tokens(list(request.messages), uncalibrated)
+    for tool in request.tools:
+        dump = getattr(tool, "model_dump_json", None)
+        raw += estimate_tokens(dump() if dump is not None else str(tool), uncalibrated)
+    if raw <= 0:
+        return
+    measured = min(max(observed / raw, 1.0), 4.0)
+    current = rc.token_estimate_calibration
+    smoothed = round(current + (measured - current) * 0.5, 3)
+    if abs(smoothed - current) < 0.02:
+        return
+    calibrated = rc.model_copy(update={"token_estimate_calibration": smoothed})
+    engine.config = replace(engine.config, rc=calibrated)
+    engine.context_manager.update_rc(calibrated)
 
 
 async def _handle_context_window_exceeded(

@@ -65,6 +65,46 @@ class LoopConstants(BaseModel):
         le=1.0,
         description="Cliff: above this fraction, emergency clear runs unconditionally.",
     )
+    compaction_min_gain_ratio: float = Field(
+        default=0.03,
+        ge=0.0,
+        le=0.5,
+        description=(
+            "A routine compaction that frees less than this fraction of the prompt "
+            "achieved nothing the next iteration will not undo; the per-iteration "
+            "gate then stands down for compaction_no_gain_backoff_iterations "
+            "iterations instead of paying for the same empty pass every time. "
+            "The emergency cliff is not subject to the backoff."
+        ),
+    )
+    compaction_no_gain_backoff_iterations: int = Field(
+        default=6,
+        ge=0,
+        description=(
+            "Iterations the per-iteration compaction gate skips after a pass that "
+            "freed less than compaction_min_gain_ratio. 0 disables the backoff."
+        ),
+    )
+    token_estimate_calibration: float = Field(
+        default=1.0,
+        ge=1.0,
+        le=4.0,
+        description=(
+            "Multiplier applied to every character-based token estimate. The "
+            "heuristic runs short of a real tokenizer on JSON-heavy and non-Latin "
+            "text, by a factor that depends on the content; when a provider reports "
+            "the true size of a prompt, the loop sets this so that the tiers size "
+            "units, budgets and gains in the provider's tokens rather than in an "
+            "undercount that leaves them nothing to shrink. 1.0 = uncalibrated."
+        ),
+    )
+    token_estimate_calibration_enabled: bool = Field(
+        default=True,
+        description=(
+            "Whether the loop updates token_estimate_calibration from the prompt "
+            "sizes providers report. Off, the estimate stays at its configured factor."
+        ),
+    )
     compaction_per_iteration_enabled: bool = Field(
         default=True,
         description=(

@@ -121,6 +121,8 @@ class ITurnState(Protocol):
     history: list[Message]
     #: Where the run is in its lifecycle.
     state: LoopState
+    #: Iterations the per-iteration compaction gate still stands down for, after a pass that freed nothing.
+    compaction_backoff_left: int
 
     @property
     def rc(self) -> LoopConstants:

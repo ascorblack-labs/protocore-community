@@ -25,7 +25,7 @@ from protocore.contracts.turn_policy import (
     TurnDirective,
 )
 from protocore.contracts.types import Message, StopReason
-from protocore.runtime.events import TurnEvent
+from protocore.runtime.events import EventType, TurnEvent
 from protocore.runtime.loop_state import LoopState
 from protocore.runtime.turn_policies import HistoryAppender
 
@@ -69,8 +69,14 @@ class PerIterationCompactionPolicy:
             rc.compaction_emergency_proactive_enabled
             and engine.needs_emergency_compaction()
         )
+        if not emergency and engine.compaction_backoff_left > 0:
+            # The last routine pass changed nothing the next one could improve on;
+            # paying for it every iteration is the crawl the backoff exists to stop.
+            engine.compaction_backoff_left -= 1
+            return
         if not emergency and not engine.needs_compaction():
             return
+        before = after = 0
         async for event in self._compact(
             engine,
             force=emergency,
@@ -81,7 +87,12 @@ class PerIterationCompactionPolicy:
             ),
             protect_tail_from_index=self._protect_index(engine.history),
         ):
+            if event.type is EventType.COMPACTION_COMPLETED:
+                before = int(event.payload.get("tokens_before") or 0)
+                after = int(event.payload.get("tokens_after") or 0)
             yield event
+        if not emergency and before > 0 and (before - after) < rc.compaction_min_gain_ratio * before:
+            engine.compaction_backoff_left = rc.compaction_no_gain_backoff_iterations
         if engine.state is not LoopState.FAILED:
             return
         # Compaction ran out of room. Pair any dangling tool_use first, or the
